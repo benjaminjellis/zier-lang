@@ -52,11 +52,14 @@ pub enum TokenKind {
     #[regex(r#""([^"\\]|\\.)*""#, allow_greedy = true)]
     String,
 
+    #[regex(r"[0-9]+\.[0-9]+")] // Matches 3.14, 0.5, etc.
+    Float,
+
     #[regex(r"[0-9]+")]
     Int,
 
-    #[token("true")]
-    #[token("false")]
+    #[token("True")]
+    #[token("False")]
     Bool,
 
     // Operators
@@ -69,7 +72,71 @@ pub enum TokenKind {
 mod tests {
     use logos::Logos;
 
-    use crate::lexer::TokenKind;
+    use crate::lexer::{TokenKind, TokenKind::*};
+
+    #[test]
+    fn bool() {
+        let expected_tokens = [LParen, Let, Ident, LBracket, RBracket, Bool, RParen];
+
+        let source = r#"
+            (let falsey []
+                False )
+        "#;
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+        assert_eq!(tokens, expected_tokens);
+    }
+
+    #[test]
+    fn string() {
+        let expected_tokens = [
+            LParen, Let, Ident, LBracket, Ident, RBracket, LParen, Ident, String, Ident, RParen,
+            RParen,
+        ];
+
+        let source = r#"
+            (let say_hello [name]
+                (str "Hello" name))
+        "#;
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(tokens, expected_tokens);
+    }
+
+    #[test]
+    fn int() {
+        let expected_tokens = [
+            LParen, Let, Ident, LBracket, Ident, RBracket, LParen, Operator, Int, Ident, RParen,
+            RParen,
+        ];
+
+        let source = r#"
+            (let double [input]
+                (* 2 input))
+        "#;
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(tokens, expected_tokens);
+    }
+
+    #[test]
+    fn float() {
+        let expected_tokens = [
+            LParen, Let, Ident, LBracket, Ident, RBracket, LParen, Operator, Float, Ident, RParen,
+            RParen,
+        ];
+
+        let source = r#"
+            (let half [input]
+                (* 0.5 input))
+        "#;
+        let lexer = TokenKind::lexer(source);
+        let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(tokens, expected_tokens);
+    }
 
     #[test]
     fn simple_test() {
