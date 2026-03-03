@@ -1,0 +1,6 @@
+[package]
+name = "opal-lsp"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
