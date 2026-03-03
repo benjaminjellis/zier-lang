@@ -1,0 +1,7 @@
+[package]
+name = "opal-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+logos = { workspace = true }
