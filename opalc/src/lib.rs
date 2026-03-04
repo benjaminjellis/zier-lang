@@ -1,5 +1,5 @@
-mod ast;
+pub mod ast;
 pub mod lexer;
-mod lower;
-mod sexpr;
-mod typecheck;
+pub mod lower;
+pub mod sexpr;
+pub mod typecheck;

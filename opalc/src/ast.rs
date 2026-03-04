@@ -10,18 +10,18 @@ pub enum Declaration {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDecl {
-    /// (type MyType ( (field ~ Type) ... ))
+    /// (type MyType ( (:field ~ Type) ... ))
     Record {
         name: String,
-        params: Vec<String>,           // ["e", "a"]
-        fields: Vec<(String, String)>, // (Field Name, Type Name)
+        params: Vec<String>,              // ["'e", "'a"]
+        fields: Vec<(String, TypeUsage)>, // (field_name, type)
         span: Range<usize>,
     },
-    /// (type ['e 'a] Result (Error ~ 'e) (Ok ~ 'a))
+    /// (type ['e 'a] Result ( (Error ~ 'e) (Ok ~ 'a) ))
     Variant {
         name: String,
-        params: Vec<String>,                         // ["e", "a"]
-        constructors: Vec<(String, Option<String>)>, // (Name, TypePayload)
+        params: Vec<String>,                          // ["'e", "'a"]
+        constructors: Vec<(String, Option<TypeUsage>)>, // (name, payload type)
         span: Range<usize>,
     },
 }
@@ -31,11 +31,11 @@ pub enum Expr {
     Literal(Literal, Range<usize>),
     Variable(String, Range<usize>),
     Array(Vec<Expr>, Range<usize>),
-    // (let [name value ...] body) or (let rec name [args] body)
+    /// (let [name value ...] body) or (let [rec] name {args} body)
     Let {
         name: String,
         is_rec: bool,
-        args: Vec<String>, // empty for non-functions
+        args: Vec<String>,
         value: Box<Expr>,
         body: Box<Expr>,
         span: Range<usize>,
@@ -56,18 +56,22 @@ pub enum Expr {
         arms: Vec<(Pattern, Expr)>,
         span: Range<usize>,
     },
+    FieldAccess {
+        field: String,
+        record: Box<Expr>,
+        span: Range<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
-    /// Matches anything and does not bind a name: `_`
+    /// Matches anything, no binding: `_`
     Any(Range<usize>),
-    /// Matches anything and binds it to a name: `x`
+    /// Matches anything, binds to name: `x`
     Variable(String, Range<usize>),
-    /// Matches a specific constant value: `42`, `true`, `"hello"`
+    /// Matches a constant: `42`, `true`, `"hello"`
     Literal(Literal, Range<usize>),
-    /// Matches a constructor/enum variant: `(Some x)` or `(None)`
-    /// String is the constructor name, Vec<Pattern> are the nested arguments.
+    /// Matches a constructor: `(Some x)` or `None`
     Constructor(String, Vec<Pattern>, Range<usize>),
 }
 
@@ -80,32 +84,10 @@ pub enum Literal {
     Unit,
 }
 
-#[derive(Debug, Clone)]
-pub enum TypeDef {
-    // (type ['a] Result (Error ~ 'a) ...)
-    Variant {
-        name: String,
-        params: Vec<String>,
-        cases: Vec<VariantCase>,
-        span: Range<usize>,
-    },
-    // (type MyType ((field ~ Type) ...))
-    Record {
-        name: String,
-        fields: Vec<(String, TypeUsage)>,
-        span: Range<usize>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct VariantCase {
-    pub name: String,
-    pub payload: Option<TypeUsage>,
-}
-
-#[derive(Debug, Clone)]
+/// A reference to a type in source code
+#[derive(Debug, Clone, PartialEq)]
 pub enum TypeUsage {
-    Named(String), // Int
-    Generic(String), // 'a
-                   // Higher kinded or complex types can be added here later
+    Named(String),   // e.g. Int, String, MyType
+    Generic(String), // e.g. 'a, 't
+    App(String, Vec<TypeUsage>),  // e.g. App("Option", [Generic("'a")])
 }

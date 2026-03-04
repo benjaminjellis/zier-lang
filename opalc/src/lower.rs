@@ -4,11 +4,10 @@ use codespan_reporting::{
 };
 
 use crate::{
-    ast::*,
+    ast::{Declaration, Expr, Literal, Pattern, TypeDecl, TypeUsage},
     lexer::{Token, TokenKind},
     sexpr::SExpr,
 };
-use core::panic;
 use std::ops::Range;
 
 pub struct Lowerer {
@@ -17,6 +16,10 @@ pub struct Lowerer {
 }
 
 impl Lowerer {
+    pub fn new() -> Self {
+        Self { files: SimpleFiles::new(), diagnostics: Vec::new() }
+    }
+
     fn error(&mut self, diagnostic: Diagnostic<usize>) {
         self.diagnostics.push(diagnostic);
     }
@@ -98,16 +101,18 @@ impl Lowerer {
                             panic!("missing tilde")
                         };
 
-                        let SExpr::Atom(field_type) = &inner[2] else {
+                        let SExpr::Atom(type_token) = &inner[2] else {
                             panic!()
                         };
 
-                        // let Some(SExpr::Round(exprs, ))= inner[0];
-                        // Expect: (:field_name ~ TypeName)
-                        let field_type = self
-                            .source_at(file_id, field_type.span.to_owned())
+                        let type_str = self
+                            .source_at(file_id, type_token.span.clone())
                             .to_string();
-                        fields.push((field_name.clone(), field_type));
+                        let type_usage = match type_token.kind {
+                            TokenKind::Generic => TypeUsage::Generic(type_str),
+                            _ => TypeUsage::Named(type_str),
+                        };
+                        fields.push((field_name.clone(), type_usage));
                     }
                 }
             }
@@ -128,8 +133,17 @@ impl Lowerer {
                     // Case: (Some ~ 'a) or (Error ~ 'e)
                     SExpr::Round(inner, _) => {
                         let c_name = self.source_at(file_id, inner[0].span()).to_string();
-                        let c_type = Some(self.source_at(file_id, inner[2].span()).to_string());
-                        constructors.push((c_name, c_type));
+                        let SExpr::Atom(type_token) = &inner[2] else {
+                            panic!("expected type token in variant constructor")
+                        };
+                        let type_str = self
+                            .source_at(file_id, type_token.span.clone())
+                            .to_string();
+                        let type_usage = match type_token.kind {
+                            TokenKind::Generic => TypeUsage::Generic(type_str),
+                            _ => TypeUsage::Named(type_str),
+                        };
+                        constructors.push((c_name, Some(type_usage)));
                     }
                     // Case: None (Constant constructor with no payload)
                     SExpr::Atom(t) => {
@@ -177,7 +191,9 @@ impl Lowerer {
                 }
 
                 _ => {
-                    todo!()
+                    if let Ok(e) = self.lower_expr(file_id, sexpr) {
+                        lowered_declarations.push(Declaration::Expression(e));
+                    }
                 }
             }
         }
@@ -196,15 +212,34 @@ impl Lowerer {
 
     fn lower_atom(&mut self, file_id: usize, token: &Token) -> Result<Expr, ()> {
         match &token.kind {
-            // If your lexer already identified it as an Integer
             TokenKind::Int(val) => Ok(Expr::Literal(Literal::Int(*val), token.span.clone())),
-
+            TokenKind::Float(val) => Ok(Expr::Literal(Literal::Float(*val), token.span.clone())),
             TokenKind::Bool(val) => Ok(Expr::Literal(Literal::Bool(*val), token.span.clone())),
+            TokenKind::String => {
+                let raw = self.source_at(file_id, token.span.clone());
+                // Strip surrounding double quotes
+                let s = raw[1..raw.len() - 1].to_string();
+                Ok(Expr::Literal(Literal::String(s), token.span.clone()))
+            }
 
-            // If it's a generic word (Identifier)
+            // Identifier or operator used as a variable / function reference
             TokenKind::Ident | TokenKind::Operator => {
                 let name = self.source_at(file_id, token.span.clone());
                 Ok(Expr::Variable(name.to_string(), token.span.clone()))
+            }
+
+            // Field accessor used as a bare atom, not wrapped in parens
+            TokenKind::NamedField(name) => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message(format!(
+                            "field accessor ':{name}' must be used as '(:{name} record)'"
+                        ))
+                        .with_labels(vec![Label::primary(file_id, token.span.clone())
+                            .with_message("field accessors cannot be used standalone")])
+                        .with_notes(vec![format!("hint: use (:{name} <record>) to access a field")]),
+                );
+                Err(())
             }
 
             // Catch keywords that wandered into the wrong place
@@ -290,10 +325,11 @@ impl Lowerer {
 
                 // Peek at the first item to see if it's a Keyword or a Call
                 if let SExpr::Atom(token) = &items[0] {
-                    match token.kind {
+                    match &token.kind {
                         TokenKind::Let => return self.lower_let(file_id, items, span.clone()),
                         TokenKind::If => return self.lower_if(file_id, items, span.clone()),
                         TokenKind::Match => return self.lower_match(file_id, items, span.clone()),
+                        TokenKind::NamedField(_) => return self.lower_field_access(file_id, items, span.clone()),
                         _ => {} // Fall through to function call
                     }
                 }
@@ -607,6 +643,41 @@ impl Lowerer {
         }
     }
 
+    fn lower_field_access(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Result<Expr, ()> {
+        // items[0] is the NamedField token, items[1..] are the args
+        let field_token = match &items[0] {
+            SExpr::Atom(t) => t,
+            _ => unreachable!("lower_field_access called without NamedField token"),
+        };
+        let field = match &field_token.kind {
+            TokenKind::NamedField(name) => name.clone(),
+            _ => unreachable!("lower_field_access called without NamedField token"),
+        };
+
+        let args = &items[1..];
+        if args.len() != 1 {
+            self.error(
+                Diagnostic::error()
+                    .with_message(format!(
+                        "field accessor ':{field}' expects exactly 1 argument, found {}",
+                        args.len()
+                    ))
+                    .with_labels(vec![Label::primary(file_id, span.clone())
+                        .with_message("expected (:{field} record)")])
+                    .with_notes(vec![format!("syntax: (:{field} <record>)")]),
+            );
+            return Err(());
+        }
+
+        let record = Box::new(self.lower_expr(file_id, &args[0])?);
+        Ok(Expr::FieldAccess { field, record, span })
+    }
+
     fn lower_call(
         &mut self,
         file_id: usize,
@@ -631,17 +702,11 @@ impl Lowerer {
 #[cfg(test)]
 mod tests {
 
-    use core::panic;
-    use std::env::set_current_dir;
-
     use super::*;
 
     // Helper to setup the lowerer with a string
     fn setup(source: &str) -> (Lowerer, usize, Vec<SExpr>) {
-        let mut lowerer = Lowerer {
-            files: SimpleFiles::new(),
-            diagnostics: Vec::new(),
-        };
+        let mut lowerer = Lowerer::new();
 
         let tokens = crate::lexer::Lexer::new(source).lex();
         let file_id = lowerer.add_file("test.opal".to_string(), source.to_string());
@@ -677,8 +742,19 @@ mod tests {
         );
 
         let exprs = lowerer.lower_file(file_id, &sexprs);
-        dbg!(exprs);
-        panic!();
+        if let Declaration::Type(TypeDecl::Record { name, params, fields, .. }) = &exprs[0] {
+            assert_eq!(name, "MyGenericType");
+            assert_eq!(params, &vec!["'t".to_string()]);
+            assert_eq!(
+                fields,
+                &vec![
+                    ("name".into(), TypeUsage::Named("String".into())),
+                    ("data".into(), TypeUsage::Generic("'t".into())),
+                ]
+            );
+        } else {
+            panic!("expected a generic record type");
+        }
     }
 
     #[test]
@@ -692,16 +768,17 @@ mod tests {
         );
 
         let exprs = lowerer.lower_file(file_id, &sexprs);
-        if let Declaration::Type(TypeDecl::Record {
-            name,
-            params,
-            fields,
-            span,
-        }) = &exprs[0]
-        {
+        if let Declaration::Type(TypeDecl::Record { name, params, fields, .. }) = &exprs[0] {
             assert_eq!(name, "MyType");
             assert_eq!(*params, Vec::<String>::new());
-            panic!()
+            assert_eq!(
+                fields,
+                &vec![
+                    ("field_one".into(), TypeUsage::Named("String".into())),
+                    ("field_two".into(), TypeUsage::Named("Int".into())),
+                    ("field_three".into(), TypeUsage::Named("Bool".into())),
+                ]
+            );
         } else {
             panic!("expected a type not an expression")
         }
