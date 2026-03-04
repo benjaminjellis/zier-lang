@@ -57,8 +57,6 @@ pub enum TokenKind {
     Type,
     #[token("let")]
     Let,
-    #[token("rec")]
-    Rec,
     #[token("if")]
     If,
     #[token("match")]
@@ -102,6 +100,37 @@ pub enum TokenKind {
 
     #[token("error")]
     Error,
+}
+
+impl TokenKind {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            TokenKind::LRound => "opening bracket '('",
+            TokenKind::RRound => "closing bracket ')'",
+            TokenKind::LSquare => "opening bracket '['",
+            TokenKind::RSquare => "closing bracket ']'",
+            TokenKind::Tilde => "tilde '~'",
+            TokenKind::HashLSquare => "array prefix '#['",
+            TokenKind::LCurly => "opening bracket '{'",
+            TokenKind::RCurly => "closing bracket '}'",
+            TokenKind::Type => "keyword 'type'",
+            TokenKind::Let => "keyword 'let'",
+            TokenKind::If => "keyword 'if'",
+            TokenKind::Match => "keyword 'match'",
+            TokenKind::Or => "operator 'or'",
+            TokenKind::And => "operator 'and'",
+            TokenKind::Arrow => "arrow '~>'",
+            TokenKind::NamedField(_) => "field name (e.g. :name)",
+            TokenKind::Float(_) => "float literal",
+            TokenKind::Int(_) => "integer literal",
+            TokenKind::Generic => "generic type variable (e.g. 'a)",
+            TokenKind::Ident => "identifier",
+            TokenKind::String => "string literal",
+            TokenKind::Bool(_) => "boolean literal",
+            TokenKind::Operator => "operator",
+            TokenKind::Error => "invalid token",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +376,92 @@ mod tests {
         let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
 
         assert_eq!(tokens, expected_tokens);
+    }
+
+    #[test]
+    fn empty_input() {
+        let lexer = TokenKind::lexer("");
+        let tokens: Vec<_> = lexer.into_iter().collect();
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn comments_are_stripped() {
+        let source = r#"
+            ;; this is a comment
+            42
+            ;; another comment
+        "#;
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![Int(42)]);
+    }
+
+    #[test]
+    fn inline_comment_after_token() {
+        let source = "True ;; rest of line ignored\nFalse";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![Bool(true), Bool(false)]);
+    }
+
+    #[test]
+    fn generic_type_vars() {
+        let source = "'a 'b 'my_type 'z";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![Generic, Generic, Generic, Generic]);
+    }
+
+    #[test]
+    fn keywords_or_and_rec() {
+        let source = "or and";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![Or, And]);
+    }
+
+    #[test]
+    fn arrow_and_tilde_tokens() {
+        let source = "~> ~";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![Arrow, Tilde]);
+    }
+
+    #[test]
+    fn comparison_operators() {
+        // All operator tokens — they're all TokenKind::Operator
+        let source = "= != < > <= >=";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(
+            tokens,
+            vec![Operator, Operator, Operator, Operator, Operator, Operator]
+        );
+    }
+
+    #[test]
+    fn named_field_strips_colon() {
+        // :field_name should lex as NamedField("field_name") — colon stripped
+        let source = ":foo :bar_baz";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(
+            tokens,
+            vec![
+                NamedField("foo".to_string()),
+                NamedField("bar_baz".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_square_bracket() {
+        let source = "#[";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![HashLSquare]);
     }
 
     #[test]

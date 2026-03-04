@@ -6,16 +6,16 @@ use std::{
 use crate::ast::{Expr, Literal, Pattern, TypeDecl, TypeUsage};
 
 // ---------------------------------------------------------------------------
-// Types
+// Internal Type Representation
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// Curried function: arg -> ret
     Fun(Rc<Type>, Rc<Type>),
-    /// Named type constructor: Int, Bool, Option<a>, Array<Int>, user types
+    /// Named type constructor: Int, Bool, Option<'a>, Result<'e, 'a>
     Con(String, Vec<Rc<Type>>),
-    /// Unification variable
+    /// Unification variable (T0, T1, ...)
     Var(u64),
 }
 
@@ -57,7 +57,7 @@ pub type Substitution = HashMap<u64, Rc<Type>>;
 pub type TypeEnv = HashMap<String, Scheme>;
 
 // ---------------------------------------------------------------------------
-// Type errors
+// Error Handling
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -67,22 +67,8 @@ pub enum TypeError {
     UnboundVariable(String),
 }
 
-impl std::fmt::Display for TypeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TypeError::OccursCheck { var, ty } => {
-                write!(f, "occurs check failed: t{var} occurs in {ty:?}")
-            }
-            TypeError::Mismatch { expected, found } => {
-                write!(f, "type mismatch: expected {expected:?}, found {found:?}")
-            }
-            TypeError::UnboundVariable(name) => write!(f, "unbound variable: {name}"),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Substitution helpers
+// Substitution Logic (The "Notebook")
 // ---------------------------------------------------------------------------
 
 pub fn apply_subst(subst: &Substitution, ty: &Rc<Type>) -> Rc<Type> {
@@ -100,7 +86,6 @@ pub fn apply_subst(subst: &Substitution, ty: &Rc<Type>) -> Rc<Type> {
 }
 
 fn apply_subst_scheme(subst: &Substitution, scheme: &Scheme) -> Scheme {
-    // Don't substitute over bound variables
     let reduced: Substitution = subst
         .iter()
         .filter(|(k, _)| !scheme.vars.contains(k))
@@ -118,7 +103,6 @@ pub fn apply_subst_env(subst: &Substitution, env: &TypeEnv) -> TypeEnv {
         .collect()
 }
 
-/// compose_subst(s_later, s_earlier): apply s_earlier first, then s_later
 pub fn compose_subst(s_later: &Substitution, s_earlier: &Substitution) -> Substitution {
     let mut result: Substitution = s_earlier
         .iter()
@@ -131,7 +115,7 @@ pub fn compose_subst(s_later: &Substitution, s_earlier: &Substitution) -> Substi
 }
 
 // ---------------------------------------------------------------------------
-// Free type variables
+// Generalization & Instantiation
 // ---------------------------------------------------------------------------
 
 fn free_vars(ty: &Type) -> HashSet<u64> {
@@ -146,23 +130,30 @@ fn free_vars(ty: &Type) -> HashSet<u64> {
     }
 }
 
-fn free_vars_scheme(scheme: &Scheme) -> HashSet<u64> {
-    let bound: HashSet<u64> = scheme.vars.iter().cloned().collect();
-    free_vars(&scheme.ty).difference(&bound).cloned().collect()
-}
-
-fn free_vars_env(env: &TypeEnv) -> HashSet<u64> {
-    env.values().flat_map(free_vars_scheme).collect()
-}
-
-// ---------------------------------------------------------------------------
-// Generalization and instantiation
-// ---------------------------------------------------------------------------
-
 fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
-    let env_fv = free_vars_env(env);
-    let mut vars: Vec<u64> = free_vars(ty).difference(&env_fv).cloned().collect();
-    vars.sort(); // deterministic ordering
+    // 1. Get all variables currently free in the environment
+    let env_fv: HashSet<u64> = env
+        .values()
+        .flat_map(|s| {
+            let fv = free_vars(&s.ty);
+            let bound: HashSet<u64> = s.vars.iter().cloned().collect();
+            // We need to collect the difference immediately to avoid reference errors
+            fv.into_iter()
+                .filter(|id| !bound.contains(id))
+                .collect::<Vec<u64>>()
+        })
+        .collect();
+
+    // 2. Get variables in the current type
+    let ty_fv = free_vars(ty);
+
+    // 3. Any variable in the type that is NOT in the environment can be generalized
+    let mut vars: Vec<u64> = ty_fv
+        .into_iter()
+        .filter(|id| !env_fv.contains(id))
+        .collect();
+
+    vars.sort(); // Keep ordering deterministic
     Scheme {
         vars,
         ty: ty.clone(),
@@ -173,20 +164,24 @@ fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
 // Unification
 // ---------------------------------------------------------------------------
 
-fn occurs(id: u64, ty: &Type) -> bool {
-    free_vars(ty).contains(&id)
-}
-
 pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
     match (t1.as_ref(), t2.as_ref()) {
         _ if t1 == t2 => Ok(HashMap::new()),
-
+        (Type::Var(id), _) => {
+            if free_vars(t2).contains(id) {
+                return Err(TypeError::OccursCheck {
+                    var: *id,
+                    ty: t2.clone(),
+                });
+            }
+            Ok(HashMap::from([(*id, t2.clone())]))
+        }
+        (_, Type::Var(_)) => unify(t2, t1),
         (Type::Fun(a1, r1), Type::Fun(a2, r2)) => {
             let s1 = unify(a1, a2)?;
             let s2 = unify(&apply_subst(&s1, r1), &apply_subst(&s1, r2))?;
             Ok(compose_subst(&s2, &s1))
         }
-
         (Type::Con(n1, args1), Type::Con(n2, args2)) if n1 == n2 && args1.len() == args2.len() => {
             args1
                 .iter()
@@ -196,27 +191,6 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
                     Ok(compose_subst(&s, &acc))
                 })
         }
-
-        (Type::Var(id), _) => {
-            if occurs(*id, t2) {
-                return Err(TypeError::OccursCheck {
-                    var: *id,
-                    ty: t2.clone(),
-                });
-            }
-            Ok(HashMap::from([(*id, t2.clone())]))
-        }
-
-        (_, Type::Var(id)) => {
-            if occurs(*id, t1) {
-                return Err(TypeError::OccursCheck {
-                    var: *id,
-                    ty: t1.clone(),
-                });
-            }
-            Ok(HashMap::from([(*id, t1.clone())]))
-        }
-
         _ => Err(TypeError::Mismatch {
             expected: t1.clone(),
             found: t2.clone(),
@@ -225,20 +199,16 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
 }
 
 // ---------------------------------------------------------------------------
-// Type checker (Algorithm W)
+// TypeChecker Implementation
 // ---------------------------------------------------------------------------
 
 pub struct TypeChecker {
     counter: u64,
-    pub errors: Vec<TypeError>,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
-        Self {
-            counter: 0,
-            errors: Vec::new(),
-        }
+        Self { counter: 0 }
     }
 
     fn fresh(&mut self) -> Rc<Type> {
@@ -252,17 +222,12 @@ impl TypeChecker {
         apply_subst(&subst, &scheme.ty)
     }
 
-    /// Infer the type of `expr` in environment `env`.
-    /// Returns `(substitution, type)` on success.
     pub fn infer(
         &mut self,
         env: &TypeEnv,
         expr: &Expr,
     ) -> Result<(Substitution, Rc<Type>), TypeError> {
         match expr {
-            // ---------------------------------------------------------------
-            // Literals
-            // ---------------------------------------------------------------
             Expr::Literal(lit, _) => {
                 let ty = match lit {
                     Literal::Int(_) => Type::int(),
@@ -274,9 +239,6 @@ impl TypeChecker {
                 Ok((HashMap::new(), ty))
             }
 
-            // ---------------------------------------------------------------
-            // Variables — instantiate the polymorphic scheme
-            // ---------------------------------------------------------------
             Expr::Variable(name, _) => {
                 let scheme = env
                     .get(name)
@@ -284,24 +246,17 @@ impl TypeChecker {
                 Ok((HashMap::new(), self.instantiate(scheme)))
             }
 
-            // ---------------------------------------------------------------
-            // Array literals — all elements must have the same type
-            // ---------------------------------------------------------------
             Expr::Array(items, _) => {
                 let elem_ty = self.fresh();
-                let mut subst: Substitution = HashMap::new();
+                let mut subst = HashMap::new();
                 for item in items {
                     let (s, t) = self.infer(&apply_subst_env(&subst, env), item)?;
                     let s_unify = unify(&apply_subst(&s, &elem_ty), &t)?;
                     subst = compose_subst(&compose_subst(&s_unify, &s), &subst);
                 }
-                let array_ty = Type::array(apply_subst(&subst, &elem_ty));
-                Ok((subst, array_ty))
+                Ok((subst.clone(), Type::array(apply_subst(&subst, &elem_ty))))
             }
 
-            // ---------------------------------------------------------------
-            // If — cond : Bool, branches must agree
-            // ---------------------------------------------------------------
             Expr::If {
                 cond, then, els, ..
             } => {
@@ -315,14 +270,11 @@ impl TypeChecker {
                 let (s3, t_els) = self.infer(&apply_subst_env(&s12, env), els)?;
                 let s123 = compose_subst(&s3, &s12);
 
-                let s_branches = unify(&apply_subst(&s123, &t_then), &apply_subst(&s123, &t_els))?;
-                let s_final = compose_subst(&s_branches, &s123);
-                Ok((s_final.clone(), apply_subst(&s_final, &t_then)))
+                let s_final = unify(&apply_subst(&s123, &t_then), &apply_subst(&s123, &t_els))?;
+                let s_res = compose_subst(&s_final, &s123);
+                Ok((s_res.clone(), apply_subst(&s_res, &t_then)))
             }
 
-            // ---------------------------------------------------------------
-            // Function calls — chain curried application
-            // ---------------------------------------------------------------
             Expr::Call { func, args, .. } => {
                 let (s0, mut t_func) = self.infer(env, func)?;
                 let mut subst = s0;
@@ -333,19 +285,23 @@ impl TypeChecker {
                     t_func = apply_subst(&subst, &t_func);
 
                     let ret = self.fresh();
-                    let expected_fun = Type::fun(t_arg, ret.clone());
-                    let s_unify = unify(&t_func, &expected_fun)?;
+                    let s_unify = unify(&t_func, &Type::fun(t_arg, ret.clone()))?;
                     subst = compose_subst(&s_unify, &subst);
                     t_func = apply_subst(&subst, &ret);
                 }
-
                 Ok((subst, t_func))
             }
 
-            // ---------------------------------------------------------------
-            // Let bindings (variable, function, recursive)
-            // ---------------------------------------------------------------
-            Expr::Let {
+            // Mapped Unified Let Arm
+            Expr::LetLocal {
+                name,
+                is_rec,
+                args,
+                value,
+                body,
+                ..
+            }
+            | Expr::LetFunc {
                 name,
                 is_rec,
                 args,
@@ -353,18 +309,13 @@ impl TypeChecker {
                 body,
                 ..
             } => {
-                // Fresh type vars for every argument
                 let arg_tys: Vec<Rc<Type>> = args.iter().map(|_| self.fresh()).collect();
-                // Fresh return type (used as the whole type for non-functions too)
                 let ret_ty = self.fresh();
-
-                // Build the curried function type: T_a -> T_b -> ... -> T_ret
                 let fun_ty = arg_tys
                     .iter()
                     .rev()
                     .fold(ret_ty.clone(), |acc, a| Type::fun(a.clone(), acc));
 
-                // Extend inner env with argument types
                 let mut inner_env = env.clone();
                 for (arg, ty) in args.iter().zip(&arg_tys) {
                     inner_env.insert(
@@ -375,8 +326,7 @@ impl TypeChecker {
                         },
                     );
                 }
-                // For recursive functions, add the function itself to the inner env
-                if *is_rec && !args.is_empty() {
+                if *is_rec {
                     inner_env.insert(
                         name.clone(),
                         Scheme {
@@ -386,44 +336,32 @@ impl TypeChecker {
                     );
                 }
 
-                // Infer the value/function body
                 let (s1, t_val) = self.infer(&inner_env, value)?;
-
-                // Unify the expected return type with the actual body type
                 let s2 = unify(&apply_subst(&s1, &ret_ty), &t_val)?;
                 let s12 = compose_subst(&s2, &s1);
 
-                // The full binding type (possibly a function type)
                 let binding_ty = apply_subst(&s12, &fun_ty);
+                let scheme = generalize(&apply_subst_env(&s12, env), &binding_ty);
 
-                // Generalize over variables not free in the outer env
-                let env_s12 = apply_subst_env(&s12, env);
-                let scheme = generalize(&env_s12, &binding_ty);
-
-                // Infer body with the new binding in scope
-                let mut body_env = env_s12;
+                let mut body_env = apply_subst_env(&s12, env);
                 body_env.insert(name.clone(), scheme);
                 let (s3, t_body) = self.infer(&body_env, body)?;
 
                 Ok((compose_subst(&s3, &s12), t_body))
             }
 
-            // ---------------------------------------------------------------
-            // Match expressions — all arms must produce the same type
-            // ---------------------------------------------------------------
             Expr::Match { target, arms, .. } => {
                 let (s0, t_target) = self.infer(env, target)?;
                 let mut subst = s0;
                 let result_ty = self.fresh();
 
                 for (pat, body) in arms {
-                    let current_env = apply_subst_env(&subst, env);
                     let t_target_s = apply_subst(&subst, &t_target);
-
-                    let (s_pat, pat_env) = self.infer_pattern(&current_env, pat, &t_target_s)?;
+                    let (s_pat, pat_env) =
+                        self.infer_pattern(&apply_subst_env(&subst, env), pat, &t_target_s)?;
                     subst = compose_subst(&s_pat, &subst);
 
-                    let (s_body, t_body) = self.infer(&apply_subst_env(&subst, &pat_env), body)?;
+                    let (s_body, t_body) = self.infer(&pat_env, body)?;
                     subst = compose_subst(&s_body, &subst);
 
                     let s_unify = unify(
@@ -432,15 +370,10 @@ impl TypeChecker {
                     )?;
                     subst = compose_subst(&s_unify, &subst);
                 }
-
                 Ok((subst.clone(), apply_subst(&subst, &result_ty)))
             }
 
-            // ---------------------------------------------------------------
-            // Field access — look up ":field_name" accessor in env
-            // ---------------------------------------------------------------
             Expr::FieldAccess { field, record, .. } => {
-                // Look up the field accessor function, stored as ":field_name"
                 let accessor_name = format!(":{field}");
                 let scheme = env
                     .get(&accessor_name)
@@ -449,8 +382,10 @@ impl TypeChecker {
 
                 let (s1, t_record) = self.infer(env, record)?;
                 let ret_ty = self.fresh();
-                let expected = Type::fun(t_record, ret_ty.clone());
-                let s2 = unify(&apply_subst(&s1, &accessor_ty), &expected)?;
+                let s2 = unify(
+                    &apply_subst(&s1, &accessor_ty),
+                    &Type::fun(t_record, ret_ty.clone()),
+                )?;
                 let s12 = compose_subst(&s2, &s1);
 
                 Ok((s12.clone(), apply_subst(&s12, &ret_ty)))
@@ -458,8 +393,6 @@ impl TypeChecker {
         }
     }
 
-    /// Infer bindings introduced by a pattern, unifying against `expected`.
-    /// Returns a substitution and the extended env with pattern-bound names.
     fn infer_pattern(
         &mut self,
         env: &TypeEnv,
@@ -468,7 +401,6 @@ impl TypeChecker {
     ) -> Result<(Substitution, TypeEnv), TypeError> {
         match pat {
             Pattern::Any(_) => Ok((HashMap::new(), env.clone())),
-
             Pattern::Variable(name, _) => {
                 let mut new_env = env.clone();
                 new_env.insert(
@@ -480,52 +412,40 @@ impl TypeChecker {
                 );
                 Ok((HashMap::new(), new_env))
             }
-
             Pattern::Literal(lit, _) => {
-                let ty: Rc<Type> = match lit {
+                let ty = match lit {
                     Literal::Int(_) => Type::int(),
                     Literal::Float(_) => Type::float(),
                     Literal::Bool(_) => Type::bool(),
                     Literal::String(_) => Type::string(),
                     Literal::Unit => Type::unit(),
                 };
-                let subst = unify(expected, &ty)?;
-                Ok((subst, env.clone()))
+                Ok((unify(expected, &ty)?, env.clone()))
             }
-
             Pattern::Constructor(name, arg_pats, _) => {
-                // The constructor must be in scope as a function type
                 let scheme = env
                     .get(name)
                     .ok_or_else(|| TypeError::UnboundVariable(name.clone()))?;
                 let mut con_ty = self.instantiate(scheme);
-                let mut subst: Substitution = HashMap::new();
+                let mut subst = HashMap::new();
                 let mut pat_env = env.clone();
 
-                // Walk through the curried constructor type, matching sub-patterns
                 for arg_pat in arg_pats {
-                    match con_ty.as_ref() {
-                        Type::Fun(arg_ty, ret_ty) => {
-                            let arg_ty_s = apply_subst(&subst, arg_ty);
-                            let (s_arg, new_env) =
-                                self.infer_pattern(&pat_env, arg_pat, &arg_ty_s)?;
-                            subst = compose_subst(&s_arg, &subst);
-                            con_ty = apply_subst(&subst, ret_ty);
-                            pat_env = new_env;
-                        }
-                        _ => {
-                            return Err(TypeError::Mismatch {
-                                expected: Type::fun(self.fresh(), self.fresh()),
-                                found: con_ty.clone(),
-                            });
-                        }
+                    if let Type::Fun(arg_ty, ret_ty) = con_ty.as_ref() {
+                        let (s_arg, new_env) =
+                            self.infer_pattern(&pat_env, arg_pat, &apply_subst(&subst, arg_ty))?;
+                        subst = compose_subst(&s_arg, &subst);
+                        con_ty = apply_subst(&subst, ret_ty);
+                        pat_env = new_env;
+                    } else {
+                        return Err(TypeError::Mismatch {
+                            expected: Type::fun(self.fresh(), self.fresh()),
+                            found: con_ty.clone(),
+                        });
                     }
                 }
-
-                // Unify the constructor's result type with the expected pattern type
                 let s_unify = unify(&apply_subst(&subst, &con_ty), expected)?;
-                subst = compose_subst(&s_unify, &subst);
-                Ok((subst, pat_env))
+                Ok((compose_subst(&s_unify, &subst), pat_env))
             }
         }
     }
@@ -741,11 +661,13 @@ mod tests {
 
     fn check(src: &str) -> Result<Rc<Type>, TypeError> {
         let tokens = crate::lexer::Lexer::new(src).lex();
-        let sexprs = crate::sexpr::SExprParser::new(tokens)
+        let mut lowerer = crate::lower::Lowerer::new();
+
+        let file_id = lowerer.add_file("test.opal".into(), src.into());
+
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
             .parse()
             .expect("parse failed");
-        let mut lowerer = crate::lower::Lowerer::new();
-        let file_id = lowerer.add_file("test.opal".into(), src.into());
         let decls = lowerer.lower_file(file_id, &sexprs);
 
         let mut checker = TypeChecker::new();
@@ -816,9 +738,12 @@ mod tests {
     #[test]
     fn unbound_variable_error() {
         let tokens = crate::lexer::Lexer::new("x").lex();
-        let sexprs = crate::sexpr::SExprParser::new(tokens).parse().unwrap();
+
         let mut lowerer = crate::lower::Lowerer::new();
         let file_id = lowerer.add_file("test.opal".into(), "x".into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .unwrap();
         let decls = lowerer.lower_file(file_id, &sexprs);
 
         let mut checker = TypeChecker::new();
@@ -835,9 +760,12 @@ mod tests {
     fn type_mismatch_error() {
         // (+ True 1) should fail
         let tokens = crate::lexer::Lexer::new("(+ True 1)").lex();
-        let sexprs = crate::sexpr::SExprParser::new(tokens).parse().unwrap();
+
         let mut lowerer = crate::lower::Lowerer::new();
         let file_id = lowerer.add_file("test.opal".into(), "(+ True 1)".into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .unwrap();
         let decls = lowerer.lower_file(file_id, &sexprs);
 
         let mut checker = TypeChecker::new();
@@ -964,6 +892,165 @@ mod tests {
         "#;
         let result = check(src);
         assert!(result.is_err(), "expected type error, got {:?}", result);
+    }
+
+    #[test]
+    fn infer_float_literal() {
+        let ty = check("3.14").unwrap();
+        assert_eq!(ty, Type::float());
+    }
+
+    #[test]
+    fn infer_string_literal() {
+        let ty = check(r#""hello world""#).unwrap();
+        assert_eq!(ty, Type::string());
+    }
+
+    #[test]
+    fn infer_float_arithmetic() {
+        let ty = check("(+. 1.5 2.5)").unwrap();
+        assert_eq!(ty, Type::float());
+    }
+
+    #[test]
+    fn infer_array_of_ints() {
+        let ty = check("#[1 2 3]").unwrap();
+        assert_eq!(ty, Type::array(Type::int()));
+    }
+
+    #[test]
+    fn infer_empty_array() {
+        let ty = check("#[]").unwrap();
+        // empty array has a polymorphic element type var
+        match ty.as_ref() {
+            Type::Con(name, args) => {
+                assert_eq!(name, "Array");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0].as_ref(), Type::Var(_)));
+            }
+            _ => panic!("expected Array type, got {:?}", ty),
+        }
+    }
+
+    #[test]
+    fn infer_array_type_mismatch() {
+        // Int and Bool in the same array must fail
+        let result = check("#[1 True]");
+        assert!(result.is_err(), "expected type error, got {:?}", result);
+    }
+
+    #[test]
+    fn infer_boolean_and() {
+        let ty = check("(and True False)").unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
+    fn infer_not() {
+        let ty = check("(not True)").unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
+    fn infer_comparison_lt() {
+        let ty = check("(< 1 2)").unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
+    fn infer_equality_polymorphic() {
+        // = works on Int
+        let ty = check("(= 1 1)").unwrap();
+        assert_eq!(ty, Type::bool());
+        // = also works on Bool
+        let ty2 = check("(= True False)").unwrap();
+        assert_eq!(ty2, Type::bool());
+    }
+
+    #[test]
+    fn infer_string_concat() {
+        let ty = check(r#"(str "hello" " world")"#).unwrap();
+        assert_eq!(ty, Type::string());
+    }
+
+    #[test]
+    fn infer_if_non_bool_condition() {
+        // Condition must be Bool; Int should fail
+        let result = check("(if 1 2 3)");
+        assert!(result.is_err(), "expected type error, got {:?}", result);
+        assert!(
+            matches!(result, Err(TypeError::Mismatch { .. })),
+            "expected Mismatch"
+        );
+    }
+
+    #[test]
+    fn infer_if_branch_type_mismatch() {
+        // then=Int, else=Bool → branches must agree
+        let result = check("(if True 1 True)");
+        assert!(result.is_err(), "expected type error, got {:?}", result);
+    }
+
+    #[test]
+    fn infer_multi_arg_function() {
+        let ty = check("(let add {a b} (+ a b) (add 1 2))").unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_wildcard_pattern() {
+        let src = r#"
+            (type ['a] Option (None (Some ~ 'a)))
+            (let is_some {opt}
+              (match opt
+                None ~> False
+                _ ~> True)
+              (is_some (Some 1)))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
+    fn infer_literal_pattern_in_match() {
+        // Match on integer literals
+        let src = "(let classify {n} (match n 0 ~> True _ ~> False) (classify 0))";
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
+    fn infer_occurs_check() {
+        // (let rec f {x} (f f)) — calling f with itself causes a -> b = a, infinite type
+        let result = check("(let rec f {x} (f f))");
+        assert!(
+            result.is_err(),
+            "expected type error for infinite type, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn infer_higher_order_function() {
+        // apply : (a -> b) -> a -> b applied to double
+        let src = r#"
+            (let apply {f x} (f x)
+              (let double {n} (* 2 n)
+                (apply double 5)))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_chained_field_access() {
+        // Accessing a field of a record bound in a let
+        let src = r#"
+            (type Point ((:x ~ Int) (:y ~ Int)))
+            (let [p (Point 3 4)] (+ (:x p) (:y p)))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::int());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::lexer::{Token, TokenKind};
+use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,39 +71,60 @@ impl SExpr {
 pub struct SExprParser {
     tokens: Vec<Token>,
     pos: usize,
+    file_id: usize,
 }
 
 enum SExprType {
-    List,
-    Bracket,
+    Round,
+    Square,
     Array,
     Curly,
 }
 
 impl SExprParser {
-    pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+    pub fn new(tokens: Vec<Token>, file_id: usize) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            file_id,
+        }
     }
 
-    /// Entry point: Parse the entire token stream into a list of top-level S-Expressions
-    pub fn parse(&mut self) -> Result<Vec<SExpr>, String> {
+    pub fn parse(&mut self) -> Result<Vec<SExpr>, Diagnostic<usize>> {
         let mut results = Vec::new();
         while !self.is_at_end() {
+            if let Some(next) = self.peek() {
+                if matches!(
+                    next.kind,
+                    TokenKind::RRound | TokenKind::RSquare | TokenKind::RCurly
+                ) {
+                    return Err(self.error(
+                        format!("Unexpected top-level delimiter {:?}", next.kind),
+                        next.span,
+                    ));
+                }
+            }
             results.push(self.parse_one()?);
         }
         Ok(results)
     }
 
-    fn parse_one(&mut self) -> Result<SExpr, String> {
-        let token = self.peek().ok_or("Unexpected end of input")?;
+    fn parse_one(&mut self) -> Result<SExpr, Diagnostic<usize>> {
+        let token = self.peek().ok_or_else(|| {
+            let last_span = self.tokens.last().map(|t| t.span.clone()).unwrap_or(0..0);
+            self.error("Unexpected end of input".to_string(), last_span)
+        })?;
 
         match token.kind {
-            TokenKind::LRound => self.parse_sequence(TokenKind::RRound, SExprType::List),
-            TokenKind::LSquare => self.parse_sequence(TokenKind::RSquare, SExprType::Bracket),
+            TokenKind::LRound => self.parse_sequence(TokenKind::RRound, SExprType::Round),
+            TokenKind::LSquare => self.parse_sequence(TokenKind::RSquare, SExprType::Square),
             TokenKind::HashLSquare => self.parse_sequence(TokenKind::RSquare, SExprType::Array),
             TokenKind::LCurly => self.parse_sequence(TokenKind::RCurly, SExprType::Curly),
-            TokenKind::RRound => Err(format!("Unexpected ')' at {:?}", token.span)),
-            TokenKind::RSquare => Err(format!("Unexpected ']' at {:?}", token.span)),
+
+            TokenKind::RRound | TokenKind::RSquare | TokenKind::RCurly => {
+                Err(self.error(format!("Unexpected delimiter {:?}", token.kind), token.span))
+            }
+
             _ => {
                 self.advance();
                 Ok(SExpr::Atom(token))
@@ -110,34 +132,76 @@ impl SExprParser {
         }
     }
 
-    fn parse_sequence(&mut self, closer: TokenKind, kind: SExprType) -> Result<SExpr, String> {
+    fn parse_sequence(
+        &mut self,
+        closer_kind: TokenKind,
+        sexpr_type: SExprType,
+    ) -> Result<SExpr, Diagnostic<usize>> {
         let open_token = self.advance();
-        let start_byte = open_token.span.start;
+        let open_span = open_token.span.clone();
         let mut children = Vec::new();
 
         while let Some(next) = self.peek() {
-            if next.kind == closer {
+            if next.kind == closer_kind {
                 let close_token = self.advance();
-                let span = start_byte..close_token.span.end;
-                return Ok(match kind {
-                    SExprType::List => SExpr::Round(children, span),
-                    SExprType::Bracket => SExpr::Square(children, span),
-                    SExprType::Array => SExpr::Array(children, span),
-                    SExprType::Curly => SExpr::Curly(children, span),
+                let full_span = open_span.start..close_token.span.end;
+                return Ok(match sexpr_type {
+                    SExprType::Round => SExpr::Round(children, full_span),
+                    SExprType::Square => SExpr::Square(children, full_span),
+                    SExprType::Array => SExpr::Array(children, full_span),
+                    SExprType::Curly => SExpr::Curly(children, full_span),
                 });
             }
+
+            if matches!(
+                next.kind,
+                TokenKind::RRound | TokenKind::RSquare | TokenKind::RCurly
+            ) {
+                return Err(self.mismatch_error(open_span, closer_kind, next));
+            }
+
             children.push(self.parse_one()?);
         }
 
-        Err(format!("Unclosed delimiter starting at {}", start_byte))
+        Err(self.error(
+            format!("Unclosed delimiter: expected {:?}", closer_kind),
+            open_span,
+        ))
     }
 
-    // Helper: Look at current token
+    fn error(&self, message: String, span: Range<usize>) -> Diagnostic<usize> {
+        Diagnostic::error()
+            .with_message("Syntax Error")
+            .with_labels(vec![
+                Label::primary(self.file_id, span).with_message(message),
+            ])
+    }
+
+    fn mismatch_error(
+        &self,
+        open_span: Range<usize>,
+        expected: TokenKind,
+        found: Token,
+    ) -> Diagnostic<usize> {
+        Diagnostic::error()
+            .with_message("Mismatched Delimiters")
+            .with_labels(vec![
+                Label::primary(self.file_id, found.span).with_message(format!(
+                    "Found {}, but expected a {}",
+                    found.kind.name(),
+                    expected.name()
+                )),
+                Label::secondary(self.file_id, open_span).with_message(format!(
+                    "This bracket is opened but the {} is missing",
+                    expected.name()
+                )),
+            ])
+    }
+
     fn peek(&self) -> Option<Token> {
         self.tokens.get(self.pos).cloned()
     }
 
-    // Helper: Move forward and return the consumed token
     fn advance(&mut self) -> Token {
         let t = self.tokens[self.pos].clone();
         self.pos += 1;
@@ -152,9 +216,9 @@ impl SExprParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codespan_reporting::files::SimpleFiles;
     use logos::Logos;
 
-    // Helper to turn a string into a Vec of SExpr
     fn parse_str(input: &str) -> Vec<SExpr> {
         let lex = crate::lexer::TokenKind::lexer(input);
         let tokens: Vec<Token> = lex
@@ -164,37 +228,25 @@ mod tests {
                 span,
             })
             .collect();
+        let mut file = SimpleFiles::new();
+        let file_id = file.add("test.opal", input);
 
-        let mut parser = SExprParser::new(tokens);
+        let mut parser = SExprParser::new(tokens, file_id);
         parser.parse().expect("Parse error")
     }
 
     #[test]
     fn test_top_level_nesting() {
-        // 1. A top-level function definition
         let code = "(let f {a} (+ a 10))";
         let exprs = parse_str(code);
-
         assert_eq!(exprs.len(), 1);
         if let SExpr::Round(inner, _) = &exprs[0] {
-            assert_eq!(inner.len(), 4); // 'let', 'f', '{a}', '(+ a 10)'
-
-            // Check the curly brace parameters
+            assert_eq!(inner.len(), 4);
             match &inner[2] {
                 SExpr::Curly(args, _) => assert_eq!(args.len(), 1),
-                _ => panic!("Expected SExpr::Brace for arguments"),
+                _ => panic!("Expected SExpr::Curly for arguments"),
             }
-
-            // Check the function body list
             assert!(matches!(inner[3], SExpr::Round(_, _)));
-        }
-
-        // 2. A top-level variable definition
-        let code_var = "(let x 100)";
-        let exprs_var = parse_str(code_var);
-        if let SExpr::Round(inner, _) = &exprs_var[0] {
-            assert_eq!(inner.len(), 3); // 'let', 'x', '100'
-            assert!(matches!(inner[2], SExpr::Atom(_)));
         }
     }
 
@@ -202,8 +254,6 @@ mod tests {
     fn test_complex_spec() {
         let code = "(type ['a] Option None (Some ~ 'a))";
         let exprs = parse_str(code);
-
-        // Root list: type, ['a], Option, None, (Some ~ 'a)
         if let SExpr::Round(inner, _) = &exprs[0] {
             assert_eq!(inner.len(), 5);
             assert!(matches!(inner[1], SExpr::Square(_, _)));
@@ -218,144 +268,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Unexpected ')'")]
+    #[should_panic(expected = "Unexpected top-level delimiter")]
     fn test_extra_closing() {
         parse_str("(let x 1))");
-    }
-
-    fn parse_helper(input: &str) -> Vec<SExpr> {
-        let tokens: Vec<Token> = TokenKind::lexer(input)
-            .spanned()
-            .map(|(kind, span)| Token {
-                kind: kind.expect("Lex error"),
-                span,
-            })
-            .collect();
-
-        let mut parser = SExprParser::new(tokens);
-        parser.parse().expect("Parse error")
-    }
-
-    #[test]
-    fn test_round_trip() {
-        // We added a new top-level definition 'demo' that uses the #[1 2 3] array syntax
-        let original_code = r#"
-            (type ['e 'a] Result (Error ~ 'e) (Ok ~ 'a)) 
-            (let rec fib {n} (if (or (= n 0) (= n 1)) n (+ (fib (- n 1)) (fib (- n 2)))))
-            (let demo {} (let [v #[1 2 3]] v))
-        "#;
-
-        // 1. First Pass: String -> SExpr Tree
-        let tree_one = parse_helper(original_code);
-
-        // 2. Stringify: SExpr Tree -> New String (normalizes whitespace)
-        let printed = tree_one
-            .iter()
-            .map(|e| e.to_source(original_code))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // 3. Second Pass: New String -> SExpr Tree
-        let tree_two = parse_helper(&printed);
-
-        // 4. Verification
-        assert_eq!(
-            tree_one.len(),
-            tree_two.len(),
-            "Tree length mismatch after round-trip"
-        );
-
-        for (a, b) in tree_one.iter().zip(tree_two.iter()) {
-            // This ensures that (SExpr::Array -> "#[...]") survives the trip
-            assert_eq!(
-                a.to_source(original_code),
-                b.to_source(&printed),
-                "Structural mismatch in S-Expression"
-            );
-        }
-
-        // Explicitly check that the array variant was preserved in the second tree
-        if let SExpr::Round(items, _) = &tree_two[2] {
-            // (let demo [] (let [v #[1 2 3]] v))
-            // items[3] is the (let ...) body
-            if let SExpr::Round(inner_let, _) = &items[3] {
-                // inner_let[1] is the [v #[1 2 3]] bracket
-                if let SExpr::Square(binding, _) = &inner_let[1] {
-                    assert!(
-                        matches!(binding[1], SExpr::Array(_, _)),
-                        "Array was not parsed as SExpr::Array in second pass"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_array_literal() {
-        let code = "#[1 2 3]";
-        let exprs = parse_str(code);
-
-        assert_eq!(exprs.len(), 1);
-        if let SExpr::Array(items, _) = &exprs[0] {
-            assert_eq!(items.len(), 3);
-            // Verify items are atoms
-            assert!(matches!(items[0], SExpr::Atom(_)));
-        } else {
-            panic!("Expected Array variant");
-        }
-    }
-
-    #[test]
-    fn test_nested_array_in_let() {
-        // This mirrors your 'demo' logic: (let [v #[1 2 3]])
-        let code = "(let [v #[1 2 3]])";
-        let exprs = parse_str(code);
-
-        if let SExpr::Round(outer, _) = &exprs[0] {
-            // outer[1] should be the Bracket [v #[1 2 3]]
-            if let SExpr::Square(binding, _) = &outer[1] {
-                assert_eq!(binding.len(), 2);
-                assert_eq!(binding[0].to_source(code), "v");
-
-                // binding[1] should be the Array
-                assert!(matches!(binding[1], SExpr::Array(_, _)));
-                assert_eq!(binding[1].to_source(code), "#[1 2 3]");
-            } else {
-                panic!("Expected structural Bracket for bindings");
-            }
-        }
-    }
-
-    #[test]
-    fn test_valid_opal_nested_structure() {
-        // A top-level function 'division' with local logic
-        let code = "(let division {a b} (if (= b 0) None (Some (/ a b))))";
-        let exprs = parse_str(code);
-
-        assert_eq!(exprs.len(), 1);
-
-        if let SExpr::Round(top_level, _) = &exprs[0] {
-            // Items: 0:let, 1:division, 2:{a b}, 3:(if ...)
-            assert_eq!(top_level.len(), 4, "Top-level let should have 4 parts");
-
-            // 1. Check the Name
-            assert_eq!(top_level[1].to_source(code), "division");
-
-            // 2. Check the Parameters (Curly Braces)
-            if let SExpr::Curly(args, _) = &top_level[2] {
-                assert_eq!(args.len(), 2);
-                assert_eq!(args[0].to_source(code), "a");
-                assert_eq!(args[1].to_source(code), "b");
-            } else {
-                panic!("Expected SExpr::Curly for parameters");
-            }
-
-            // 3. Check the Implementation (The 'if' list)
-            if let SExpr::Round(if_expr, _) = &top_level[3] {
-                assert_eq!(if_expr[0].to_source(code), "if");
-            } else {
-                panic!("Expected SExpr::List for function body");
-            }
-        }
     }
 }

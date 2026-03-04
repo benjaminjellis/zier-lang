@@ -20,7 +20,7 @@ pub enum TypeDecl {
     /// (type ['e 'a] Result ( (Error ~ 'e) (Ok ~ 'a) ))
     Variant {
         name: String,
-        params: Vec<String>,                          // ["'e", "'a"]
+        params: Vec<String>,                            // ["'e", "'a"]
         constructors: Vec<(String, Option<TypeUsage>)>, // (name, payload type)
         span: Range<usize>,
     },
@@ -32,7 +32,7 @@ pub enum Expr {
     Variable(String, Range<usize>),
     Array(Vec<Expr>, Range<usize>),
     /// (let [name value ...] body) or (let [rec] name {args} body)
-    Let {
+    LetFunc {
         name: String,
         is_rec: bool,
         args: Vec<String>,
@@ -40,6 +40,15 @@ pub enum Expr {
         body: Box<Expr>,
         span: Range<usize>,
     },
+    LetLocal {
+        name: String,
+        is_rec: bool,
+        args: Vec<String>,
+        value: Box<Expr>,
+        body: Box<Expr>,
+        span: Range<usize>,
+    },
+
     If {
         cond: Box<Expr>,
         then: Box<Expr>,
@@ -87,7 +96,7 @@ pub enum Literal {
 /// A reference to a type in source code
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeUsage {
-    Named(String),   // e.g. Int, String, MyType
-    Generic(String), // e.g. 'a, 't
-    App(String, Vec<TypeUsage>),  // e.g. App("Option", [Generic("'a")])
+    Named(String),               // e.g. Int, String, MyType
+    Generic(String),             // e.g. 'a, 't
+    App(String, Vec<TypeUsage>), // e.g. App("Option", [Generic("'a")])
 }

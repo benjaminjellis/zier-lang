@@ -17,7 +17,10 @@ pub struct Lowerer {
 
 impl Lowerer {
     pub fn new() -> Self {
-        Self { files: SimpleFiles::new(), diagnostics: Vec::new() }
+        Self {
+            files: SimpleFiles::new(),
+            diagnostics: Vec::new(),
+        }
     }
 
     fn error(&mut self, diagnostic: Diagnostic<usize>) {
@@ -105,9 +108,7 @@ impl Lowerer {
                             panic!()
                         };
 
-                        let type_str = self
-                            .source_at(file_id, type_token.span.clone())
-                            .to_string();
+                        let type_str = self.source_at(file_id, type_token.span.clone()).to_string();
                         let type_usage = match type_token.kind {
                             TokenKind::Generic => TypeUsage::Generic(type_str),
                             _ => TypeUsage::Named(type_str),
@@ -136,9 +137,7 @@ impl Lowerer {
                         let SExpr::Atom(type_token) = &inner[2] else {
                             panic!("expected type token in variant constructor")
                         };
-                        let type_str = self
-                            .source_at(file_id, type_token.span.clone())
-                            .to_string();
+                        let type_str = self.source_at(file_id, type_token.span.clone()).to_string();
                         let type_usage = match type_token.kind {
                             TokenKind::Generic => TypeUsage::Generic(type_str),
                             _ => TypeUsage::Named(type_str),
@@ -235,9 +234,13 @@ impl Lowerer {
                         .with_message(format!(
                             "field accessor ':{name}' must be used as '(:{name} record)'"
                         ))
-                        .with_labels(vec![Label::primary(file_id, token.span.clone())
-                            .with_message("field accessors cannot be used standalone")])
-                        .with_notes(vec![format!("hint: use (:{name} <record>) to access a field")]),
+                        .with_labels(vec![
+                            Label::primary(file_id, token.span.clone())
+                                .with_message("field accessors cannot be used standalone"),
+                        ])
+                        .with_notes(vec![format!(
+                            "hint: use (:{name} <record>) to access a field"
+                        )]),
                 );
                 Err(())
             }
@@ -329,7 +332,9 @@ impl Lowerer {
                         TokenKind::Let => return self.lower_let(file_id, items, span.clone()),
                         TokenKind::If => return self.lower_if(file_id, items, span.clone()),
                         TokenKind::Match => return self.lower_match(file_id, items, span.clone()),
-                        TokenKind::NamedField(_) => return self.lower_field_access(file_id, items, span.clone()),
+                        TokenKind::NamedField(_) => {
+                            return self.lower_field_access(file_id, items, span.clone());
+                        }
                         _ => {} // Fall through to function call
                     }
                 }
@@ -528,7 +533,7 @@ impl Lowerer {
         })
     }
 
-    fn lower_let(
+    pub fn lower_let(
         &mut self,
         file_id: usize,
         items: &[SExpr],
@@ -538,15 +543,15 @@ impl Lowerer {
 
         // 1. Check for 'rec' keyword
         let mut is_rec = false;
-        if let Some(SExpr::Atom(token)) = items.get(cursor)
-            && matches!(token.kind, TokenKind::Rec)
-        {
-            is_rec = true;
-            cursor += 1;
+        if let Some(SExpr::Atom(token)) = items.get(cursor) {
+            if self.source_at(file_id, token.span.clone()) == "rec" {
+                is_rec = true;
+                cursor += 1;
+            }
         }
 
         match items.get(cursor) {
-            // CASE A: Sequential Variable Bindings -> (let [a 10 b 20] body)
+            // CASE A: Sequential Variable Bindings -> (let [x 10 y 20] body)
             Some(SExpr::Square(bindings, b_span)) => {
                 if bindings.len() % 2 != 0 {
                     self.error(
@@ -560,14 +565,17 @@ impl Lowerer {
                     return Err(());
                 }
 
-                // In Opal, if there's no expression after the bracket, it's a top-level binding
-                // We use Unit as the "body" placeholder for top-level definitions
-                let mut current_expr = if let Some(next_sexpr) = items.get(cursor + 1) {
+                cursor += 1;
+
+                // The body is the expression following the square brackets
+                let mut current_expr = if let Some(next_sexpr) = items.get(cursor) {
                     self.lower_expr(file_id, next_sexpr)?
                 } else {
+                    // If no body, default to Unit (e.g. top-level definitions)
                     Expr::Literal(Literal::Unit, span.clone())
                 };
 
+                // We fold the bindings backwards to create nested LetLocal expressions
                 for chunk in bindings.chunks(2).rev() {
                     let name = match &chunk[0] {
                         SExpr::Atom(t) => self.source_at(file_id, t.span.clone()).to_string(),
@@ -583,7 +591,7 @@ impl Lowerer {
 
                     let value = self.lower_expr(file_id, &chunk[1])?;
 
-                    current_expr = Expr::Let {
+                    current_expr = Expr::LetLocal {
                         name,
                         is_rec,
                         args: vec![],
@@ -595,35 +603,50 @@ impl Lowerer {
                 Ok(current_expr)
             }
 
+            // CASE B: Function Definition -> (let f {a b} body)
             Some(SExpr::Atom(name_token)) => {
                 let name = self.source_at(file_id, name_token.span.clone()).to_string();
                 cursor += 1;
 
-                // 1. Lower args {a b}
-                let mut args = Vec::new();
-                if let Some(SExpr::Curly(params, _)) = items.get(cursor) {
+                // STRICT ENFORCEMENT: The next item MUST be Curly brackets {}
+                let args = if let Some(SExpr::Curly(params, _)) = items.get(cursor) {
+                    let mut arg_names = Vec::new();
                     for p in params {
                         if let SExpr::Atom(t) = p {
-                            args.push(self.source_at(file_id, t.span.clone()).to_string());
+                            arg_names.push(self.source_at(file_id, t.span.clone()).to_string());
                         }
                     }
                     cursor += 1;
-                }
+                    arg_names
+                } else {
+                    // This catches (let x 42 ...) and rejects it.
+                    let err_span = items.get(cursor).map(|s| s.span()).unwrap_or(span.clone());
+                    self.error(
+                    Diagnostic::error()
+                        .with_message("invalid let syntax")
+                        .with_labels(vec![
+                            Label::primary(file_id, err_span)
+                                .with_message("expected '{args}' for function definition or '[' for variable bindings")
+                        ]),
+                );
+                    return Err(());
+                };
 
-                // 2. Lower the function body (the "value")
+                // The function value/body (e.g. (+ a b))
                 let value_sexpr = items.get(cursor).ok_or_else(|| {
                     self.error(Diagnostic::error().with_message("missing function body"));
                 })?;
                 let value = self.lower_expr(file_id, value_sexpr)?;
                 cursor += 1;
 
+                // The 'in' body (the expression that uses the function)
                 let body = if let Some(next_item) = items.get(cursor) {
                     self.lower_expr(file_id, next_item)?
                 } else {
                     Expr::Literal(Literal::Unit, span.clone())
                 };
 
-                Ok(Expr::Let {
+                Ok(Expr::LetFunc {
                     name,
                     is_rec,
                     args,
@@ -632,11 +655,15 @@ impl Lowerer {
                     span,
                 })
             }
+
             _ => {
                 self.error(
                     Diagnostic::error()
                         .with_message("invalid let syntax")
-                        .with_labels(vec![Label::primary(file_id, span.clone())]),
+                        .with_labels(vec![Label::primary(file_id, span.clone())])
+                        .with_notes(vec![
+                            "valid forms: (let [x 1] ...) or (let f {x} ...)".to_string(),
+                        ]),
                 );
                 Err(())
             }
@@ -667,15 +694,21 @@ impl Lowerer {
                         "field accessor ':{field}' expects exactly 1 argument, found {}",
                         args.len()
                     ))
-                    .with_labels(vec![Label::primary(file_id, span.clone())
-                        .with_message("expected (:{field} record)")])
+                    .with_labels(vec![
+                        Label::primary(file_id, span.clone())
+                            .with_message("expected (:{field} record)"),
+                    ])
                     .with_notes(vec![format!("syntax: (:{field} <record>)")]),
             );
             return Err(());
         }
 
         let record = Box::new(self.lower_expr(file_id, &args[0])?);
-        Ok(Expr::FieldAccess { field, record, span })
+        Ok(Expr::FieldAccess {
+            field,
+            record,
+            span,
+        })
     }
 
     fn lower_call(
@@ -702,6 +735,11 @@ impl Lowerer {
 #[cfg(test)]
 mod tests {
 
+    use codespan_reporting::term::{
+        self,
+        termcolor::{ColorChoice, StandardStream},
+    };
+
     use super::*;
 
     // Helper to setup the lowerer with a string
@@ -712,7 +750,7 @@ mod tests {
         let file_id = lowerer.add_file("test.opal".to_string(), source.to_string());
 
         // This assumes your Parser returns a Vec<SExpr>
-        let sexprs = crate::sexpr::SExprParser::new(tokens)
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
             .parse()
             .expect("S-Expr parse failed");
 
@@ -728,7 +766,7 @@ mod tests {
                     "#,
         );
 
-        let exprs = lowerer.lower_file(file_id, &sexprs);
+        let _exprs = lowerer.lower_file(file_id, &sexprs);
     }
 
     #[test]
@@ -742,7 +780,13 @@ mod tests {
         );
 
         let exprs = lowerer.lower_file(file_id, &sexprs);
-        if let Declaration::Type(TypeDecl::Record { name, params, fields, .. }) = &exprs[0] {
+        if let Declaration::Type(TypeDecl::Record {
+            name,
+            params,
+            fields,
+            ..
+        }) = &exprs[0]
+        {
             assert_eq!(name, "MyGenericType");
             assert_eq!(params, &vec!["'t".to_string()]);
             assert_eq!(
@@ -768,7 +812,13 @@ mod tests {
         );
 
         let exprs = lowerer.lower_file(file_id, &sexprs);
-        if let Declaration::Type(TypeDecl::Record { name, params, fields, .. }) = &exprs[0] {
+        if let Declaration::Type(TypeDecl::Record {
+            name,
+            params,
+            fields,
+            ..
+        }) = &exprs[0]
+        {
             assert_eq!(name, "MyType");
             assert_eq!(*params, Vec::<String>::new());
             assert_eq!(
@@ -789,7 +839,7 @@ mod tests {
         let (mut lowerer, file_id, sexprs) = setup("(let f {a} (+ a 10))");
         let exprs = lowerer.lower_file(file_id, &sexprs);
 
-        if let Declaration::Expression(Expr::Let {
+        if let Declaration::Expression(Expr::LetFunc {
             name,
             args,
             value,
@@ -837,7 +887,7 @@ mod tests {
         let exprs = lowerer.lower_file(file_id, &sexprs);
 
         // This should produce: Let(a, 10, Let(b, 20, Var(a)))
-        if let Declaration::Expression(Expr::Let {
+        if let Declaration::Expression(Expr::LetLocal {
             name,
             value: _,
             body,
@@ -845,7 +895,7 @@ mod tests {
         }) = &exprs[0]
         {
             assert_eq!(name, "a");
-            if let Expr::Let { name: name2, .. } = &**body {
+            if let Expr::LetLocal { name: name2, .. } = &**body {
                 assert_eq!(name2, "b");
             } else {
                 panic!("Expected nested let for 'b'");
@@ -903,6 +953,215 @@ mod tests {
             lowerer.diagnostics[0].message,
             "wrong number of arguments for 'if'"
         );
+    }
+
+    #[test]
+    fn test_float_literal() {
+        let (mut lowerer, file_id, sexprs) = setup("6.14");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::Literal(Literal::Float(f), _)) = &exprs[0] {
+            assert!((*f - 6.14).abs() < 1e-10);
+        } else {
+            panic!("expected Float literal");
+        }
+    }
+
+    #[test]
+    fn test_string_literal() {
+        let (mut lowerer, file_id, sexprs) = setup(r#""hello world""#);
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::Literal(Literal::String(s), _)) = &exprs[0] {
+            assert_eq!(s, "hello world");
+        } else {
+            panic!("expected String literal");
+        }
+    }
+
+    #[test]
+    fn test_unit_literal() {
+        let (mut lowerer, file_id, sexprs) = setup("()");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        assert!(matches!(
+            &exprs[0],
+            Declaration::Expression(Expr::Literal(Literal::Unit, _))
+        ));
+    }
+
+    #[test]
+    fn test_array_literal_lowering() {
+        let (mut lowerer, file_id, sexprs) = setup("#[1 2 3]");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::Array(items, _)) = &exprs[0] {
+            assert_eq!(items.len(), 3);
+            assert!(matches!(items[0], Expr::Literal(Literal::Int(1), _)));
+            assert!(matches!(items[1], Expr::Literal(Literal::Int(2), _)));
+            assert!(matches!(items[2], Expr::Literal(Literal::Int(3), _)));
+        } else {
+            panic!("expected Array expression");
+        }
+    }
+
+    #[test]
+    fn test_field_access_lowering() {
+        let (mut lowerer, file_id, sexprs) = setup("(:my_field some_record)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::FieldAccess { field, record, .. }) = &exprs[0] {
+            assert_eq!(field, "my_field");
+            assert!(matches!(record.as_ref(), Expr::Variable(n, _) if n == "some_record"));
+        } else {
+            panic!("expected FieldAccess");
+        }
+    }
+
+    #[test]
+    fn test_field_access_too_many_args() {
+        let (mut lowerer, file_id, sexprs) = setup("(:x p q)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty());
+        assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_field_access_zero_args() {
+        let (mut lowerer, file_id, sexprs) = setup("(:x)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty());
+        assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_bare_field_accessor_error() {
+        // :field used as a standalone atom (not inside parens) should error
+        let (mut lowerer, file_id, sexprs) = setup("(let f {r} :my_field)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        // The :my_field as a bare value in position should produce a diagnostic
+        assert!(exprs.is_empty() || !lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_recursive_let() {
+        let (mut lowerer, file_id, sexprs) =
+            setup("(let rec countdown {n} (if (= n 0) 0 (countdown (- n 1))))");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::LetFunc {
+            name, is_rec, args, ..
+        }) = &exprs[0]
+        {
+            assert_eq!(name, "countdown");
+            assert!(*is_rec, "expected is_rec = true");
+            assert_eq!(args, &vec!["n".to_string()]);
+        } else {
+            panic!("expected Let");
+        }
+    }
+
+    #[test]
+    fn test_non_recursive() {
+        let (mut lowerer, file_id, sexprs) = setup(
+            "(let fib {n}
+  (if (or (= n 0) (= n 1))
+    n
+    (+ (fib (- n 1)) (fib (- n 2)))))
+",
+        );
+
+        let a = lowerer.lower_file(file_id, &sexprs);
+
+        dbg!(&lowerer.diagnostics);
+        let writer = StandardStream::stderr(ColorChoice::Always);
+        let config = codespan_reporting::term::Config::default();
+
+        // 4. PRINT IT
+        term::emit(
+            &mut writer.lock(),
+            &config,
+            &lowerer.files,
+            lowerer.diagnostics.first().unwrap(),
+        )
+        .unwrap();
+        assert!(lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_let_with_continuation_fails() {
+        // (let x 42 x) is an invalid let binding
+        let (mut lowerer, file_id, sexprs) = setup("(let x 42 x)");
+        let _ = lowerer.lower_file(file_id, &sexprs);
+        let diag = &lowerer.diagnostics[0];
+        assert_eq!(diag.message, "invalid let syntax")
+    }
+
+    #[test]
+    fn test_match_wildcard_pattern() {
+        let (mut lowerer, file_id, sexprs) = setup("(match x _ ~> 0)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::Match { arms, .. }) = &exprs[0] {
+            assert_eq!(arms.len(), 1);
+            assert!(matches!(arms[0].0, Pattern::Any(_)), "expected Any pattern");
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn test_match_literal_pattern() {
+        let (mut lowerer, file_id, sexprs) = setup("(match x 0 ~> True 1 ~> False _ ~> False)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Expression(Expr::Match { arms, .. }) = &exprs[0] {
+            assert_eq!(arms.len(), 3);
+            assert!(matches!(arms[0].0, Pattern::Literal(Literal::Int(0), _)));
+            assert!(matches!(arms[1].0, Pattern::Literal(Literal::Int(1), _)));
+            assert!(matches!(arms[2].0, Pattern::Any(_)));
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn test_if_too_many_args() {
+        let (mut lowerer, file_id, sexprs) = setup("(if True 1 2 3)");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty());
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "wrong number of arguments for 'if'"
+        );
+    }
+
+    #[test]
+    fn test_variant_type_multiple_constructors() {
+        let (mut lowerer, file_id, sexprs) =
+            setup("(type ['e 'a] Result ((Ok ~ 'a) (Error ~ 'e)))");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        if let Declaration::Type(TypeDecl::Variant {
+            name,
+            params,
+            constructors,
+            ..
+        }) = &exprs[0]
+        {
+            assert_eq!(name, "Result");
+            assert_eq!(params, &vec!["'e".to_string(), "'a".to_string()]);
+            assert_eq!(constructors.len(), 2);
+            let (ok_name, ok_payload) = &constructors[0];
+            assert_eq!(ok_name, "Ok");
+            assert!(ok_payload.is_some());
+            let (err_name, err_payload) = &constructors[1];
+            assert_eq!(err_name, "Error");
+            assert!(err_payload.is_some());
+        } else {
+            panic!("expected Variant type declaration");
+        }
     }
 
     #[test]
