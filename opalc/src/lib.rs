@@ -1,6 +1,5 @@
 mod ast;
-mod lexer;
+pub mod lexer;
 mod lower;
 mod sexpr;
 mod typecheck;
-

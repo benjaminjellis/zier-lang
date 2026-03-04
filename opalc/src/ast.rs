@@ -1,10 +1,35 @@
-use crate::lexer::Token;
 use std::ops::Range;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Declaration {
+    /// For (type MyType ...)
+    Type(TypeDecl),
+    /// For (let f {a} ...)
+    Expression(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeDecl {
+    /// (type MyType ( (field ~ Type) ... ))
+    Record {
+        name: String,
+        fields: Vec<(String, String)>, // (Field Name, Type Name)
+        span: Range<usize>,
+    },
+    /// (type ['e 'a] Result (Error ~ 'e) (Ok ~ 'a))
+    Variant {
+        name: String,
+        params: Vec<String>,                         // ["e", "a"]
+        constructors: Vec<(String, Option<String>)>, // (Name, TypePayload)
+        span: Range<usize>,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal, Range<usize>),
     Variable(String, Range<usize>),
+    Array(Vec<Expr>, Range<usize>),
     // (let [name value ...] body) or (let rec name [args] body)
     Let {
         name: String,
@@ -33,19 +58,25 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Literal {
-    Int(i64),
-    Bool(bool),
-    String(String),
+pub enum Pattern {
+    /// Matches anything and does not bind a name: `_`
+    Any(Range<usize>),
+    /// Matches anything and binds it to a name: `x`
+    Variable(String, Range<usize>),
+    /// Matches a specific constant value: `42`, `true`, `"hello"`
+    Literal(Literal, Range<usize>),
+    /// Matches a constructor/enum variant: `(Some x)` or `(None)`
+    /// String is the constructor name, Vec<Pattern> are the nested arguments.
+    Constructor(String, Vec<Pattern>, Range<usize>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
-    Any(Range<usize>),              // _
-    Variable(String, Range<usize>), // x
-    Literal(Literal, Range<usize>), // 42
-    // (Constructor arg1 arg2)
-    Constructor(String, Vec<Pattern>, Range<usize>),
+pub enum Literal {
+    Int(i64),
+    Bool(bool),
+    Float(f64),
+    String(String),
+    Unit,
 }
 
 #[derive(Debug, Clone)]
