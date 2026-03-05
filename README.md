@@ -62,6 +62,3 @@ Below is a sample program
       "missing")))
 ```
 
-
-TODO list 
-[ ] parser (recursive descent)

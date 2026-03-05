@@ -1,7 +1,0 @@
-[package]
-name = "opal-cli"
-edition.workspace = true
-version.workspace = true
-
-[dependencies]
-opalc = {path = "../opalc"}

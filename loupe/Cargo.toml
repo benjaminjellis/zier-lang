@@ -1,0 +1,12 @@
+[package]
+name = "loupe"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+clap = { workspace = true , features = ["derive"] }
+eyre = { workspace = true }
+opalc = { path = "../opalc" }
+toml = { workspace = true }
+serde = { workspace = true }
+semver = { workspace = true, features = [ "serde" ] }

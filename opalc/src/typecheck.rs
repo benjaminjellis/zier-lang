@@ -36,7 +36,7 @@ impl Type {
         Rc::new(Type::Con("Unit".into(), vec![]))
     }
     pub fn array(elem: Rc<Self>) -> Rc<Self> {
-        Rc::new(Type::Con("Array".into(), vec![elem]))
+        Rc::new(Type::Con("List".into(), vec![elem]))
     }
     pub fn fun(arg: Rc<Self>, ret: Rc<Self>) -> Rc<Self> {
         Rc::new(Type::Fun(arg, ret))
@@ -82,17 +82,24 @@ pub enum TypeError {
     ConditionNotBool {
         found: Rc<Type>,
     },
+    UnknownField {
+        field: String,
+        record_ty: Rc<Type>,
+        field_span: std::ops::Range<usize>,
+        /// The file and span of the type definition, if known
+        def: Option<(usize, std::ops::Range<usize>)>,
+    },
     UnboundVariable(String),
 }
 
 impl TypeError {
     /// Render this type error as a codespan `Diagnostic`.
     /// `span` should cover the expression where the error was detected.
-    pub fn to_diagnostic(
+    pub fn to_diagnostics(
         &self,
         file_id: usize,
         span: std::ops::Range<usize>,
-    ) -> codespan_reporting::diagnostic::Diagnostic<usize> {
+    ) -> Vec<codespan_reporting::diagnostic::Diagnostic<usize>> {
         use codespan_reporting::diagnostic::{Diagnostic, Label};
         match self {
             TypeError::Mismatch { expected, found } => {
@@ -120,23 +127,29 @@ impl TypeError {
                         "hint: integer operators have no suffix — `+` `-` `*` `/` `<` `>`".into(),
                     );
                 }
-                Diagnostic::error()
-                    .with_message(format!(
-                        "type mismatch: expected `{expected_s}`, found `{found_s}`"
-                    ))
-                    .with_labels(vec![
-                        Label::primary(file_id, span).with_message("type error originates here"),
-                    ])
-                    .with_notes(notes)
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!(
+                            "type mismatch: expected `{expected_s}`, found `{found_s}`"
+                        ))
+                        .with_labels(vec![
+                            Label::primary(file_id, span)
+                                .with_message("type error originates here"),
+                        ])
+                        .with_notes(notes),
+                ]
             }
             TypeError::ConditionNotBool { found } => {
                 let found_s = type_display(found);
-                Diagnostic::error()
-                    .with_message(format!("if condition must be `Bool`, found `{found_s}`"))
-                    .with_labels(vec![
-                        Label::primary(file_id, span)
-                            .with_message(format!("this has type `{found_s}`, expected `Bool`")),
-                    ])
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!("if condition must be `Bool`, found `{found_s}`"))
+                        .with_labels(vec![
+                            Label::primary(file_id, span).with_message(format!(
+                                "this has type `{found_s}`, expected `Bool`"
+                            )),
+                        ]),
+                ]
             }
             TypeError::ArmMismatch {
                 arm,
@@ -148,47 +161,79 @@ impl TypeError {
                 let found_s = type_display_inner(found, &mut var_names);
                 // arm is 0-indexed; arm 0 sets the expected type, conflict is at arm N
                 let conflicting = arm + 1;
-                Diagnostic::error()
-                    .with_message("match arms have incompatible types")
-                    .with_labels(vec![
-                        Label::primary(file_id, span)
-                            .with_message("arms must all return the same type"),
-                    ])
-                    .with_notes(vec![
-                        format!("  arm 1 returns: `{expected_s}`"),
-                        format!("  arm {conflicting} returns: `{found_s}`"),
-                    ])
+                vec![
+                    Diagnostic::error()
+                        .with_message("match arms have incompatible types")
+                        .with_labels(vec![
+                            Label::primary(file_id, span)
+                                .with_message("arms must all return the same type"),
+                        ])
+                        .with_notes(vec![
+                            format!("  arm 1 returns: `{expected_s}`"),
+                            format!("  arm {conflicting} returns: `{found_s}`"),
+                        ]),
+                ]
             }
             TypeError::BranchMismatch { then_ty, else_ty } => {
                 let mut var_names = std::collections::HashMap::new();
                 let then_s = type_display_inner(then_ty, &mut var_names);
                 let else_s = type_display_inner(else_ty, &mut var_names);
+                vec![
+                    Diagnostic::error()
+                        .with_message("if/else branches have incompatible types")
+                        .with_labels(vec![
+                            Label::primary(file_id, span)
+                                .with_message("branches must return the same type"),
+                        ])
+                        .with_notes(vec![
+                            format!("  then branch: `{then_s}`"),
+                            format!("  else branch: `{else_s}`"),
+                        ]),
+                ]
+            }
+            TypeError::UnknownField {
+                field,
+                record_ty,
+                field_span,
+                def,
+            } => {
+                let ty_s = type_display(record_ty);
+                let mut diags = vec![
+                    Diagnostic::error()
+                        .with_message(format!("`{field}` is not a field of `{ty_s}`"))
+                        .with_labels(vec![
+                            Label::primary(file_id, field_span.clone())
+                                .with_message(format!("`{ty_s}` has no field `{field}`")),
+                        ]),
+                ];
+                if let Some((def_file_id, def_span)) = def {
+                    diags.push(
+                        Diagnostic::help()
+                            .with_message(format!("`{ty_s}` is defined here"))
+                            .with_labels(vec![Label::primary(*def_file_id, def_span.clone())]),
+                    );
+                }
+                diags
+            }
+            TypeError::UnboundVariable(name) => vec![
                 Diagnostic::error()
-                    .with_message("if/else branches have incompatible types")
+                    .with_message(format!("unbound variable `{name}`"))
                     .with_labels(vec![
                         Label::primary(file_id, span)
-                            .with_message("branches must return the same type"),
-                    ])
+                            .with_message(format!("`{name}` is not defined in this scope")),
+                    ]),
+            ],
+            TypeError::OccursCheck { ty, .. } => vec![
+                Diagnostic::error()
+                    .with_message("infinite type")
+                    .with_labels(vec![Label::primary(file_id, span).with_message(format!(
+                        "this expression would have the infinite type `{}`",
+                        type_display(ty)
+                    ))])
                     .with_notes(vec![
-                        format!("  then branch: `{then_s}`"),
-                        format!("  else branch: `{else_s}`"),
-                    ])
-            }
-            TypeError::UnboundVariable(name) => Diagnostic::error()
-                .with_message(format!("unbound variable `{name}`"))
-                .with_labels(vec![
-                    Label::primary(file_id, span)
-                        .with_message(format!("`{name}` is not defined in this scope")),
-                ]),
-            TypeError::OccursCheck { ty, .. } => Diagnostic::error()
-                .with_message("infinite type")
-                .with_labels(vec![Label::primary(file_id, span).with_message(format!(
-                    "this expression would have the infinite type `{}`",
-                    type_display(ty)
-                ))])
-                .with_notes(vec![
-                    "hint: this usually means a function is being applied to itself".into(),
-                ]),
+                        "hint: this usually means a function is being applied to itself".into(),
+                    ]),
+            ],
         }
     }
 }
@@ -370,11 +415,16 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
 #[derive(Default)]
 pub struct TypeChecker {
     counter: u64,
+    /// Maps type name → (file_id, definition span) for error reporting
+    type_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
 }
 
 impl TypeChecker {
     pub fn new() -> Self {
-        Self { counter: 0 }
+        Self {
+            counter: 0,
+            type_def_spans: HashMap::new(),
+        }
     }
 
     fn fresh(&mut self) -> Rc<Type> {
@@ -412,7 +462,7 @@ impl TypeChecker {
                 Ok((HashMap::new(), self.instantiate(scheme)))
             }
 
-            Expr::Array(items, _) => {
+            Expr::List(items, _) => {
                 let elem_ty = self.fresh();
                 let mut subst = HashMap::new();
                 for item in items {
@@ -526,16 +576,25 @@ impl TypeChecker {
                 Ok((compose_subst(&s2, &s1), t_body))
             }
 
-            Expr::Match { target, arms, .. } => {
-                let (s0, t_target) = self.infer(env, target)?;
-                let mut subst = s0;
+            Expr::Match { targets, arms, .. } => {
+                let mut subst = HashMap::new();
+                let mut target_types = Vec::new();
+                for target in targets {
+                    let (s, t) = self.infer(env, target)?;
+                    subst = compose_subst(&s, &subst);
+                    target_types.push(t);
+                }
+
                 let result_ty = self.fresh();
 
-                for (arm_index, (pat, body)) in arms.iter().enumerate() {
-                    let t_target_s = apply_subst(&subst, &t_target);
-                    let (s_pat, pat_env) =
-                        self.infer_pattern(&apply_subst_env(&subst, env), pat, &t_target_s)?;
-                    subst = compose_subst(&s_pat, &subst);
+                for (arm_index, (pats, body)) in arms.iter().enumerate() {
+                    let mut pat_env = apply_subst_env(&subst, env);
+                    for (pat, t_target) in pats.iter().zip(target_types.iter()) {
+                        let t_target_s = apply_subst(&subst, t_target);
+                        let (s_pat, new_env) = self.infer_pattern(&pat_env, pat, &t_target_s)?;
+                        subst = compose_subst(&s_pat, &subst);
+                        pat_env = new_env;
+                    }
 
                     let (s_body, t_body) = self.infer(&pat_env, body)?;
                     subst = compose_subst(&s_body, &subst);
@@ -552,14 +611,32 @@ impl TypeChecker {
                 Ok((subst.clone(), apply_subst(&subst, &result_ty)))
             }
 
-            Expr::FieldAccess { field, record, .. } => {
+            Expr::FieldAccess {
+                field,
+                record,
+                span,
+            } => {
+                // Infer the record type first so we can name it in the error if the field
+                // doesn't exist.
+                let (s1, t_record) = self.infer(env, record)?;
+
                 let accessor_name = format!(":{field}");
-                let scheme = env
-                    .get(&accessor_name)
-                    .ok_or_else(|| TypeError::UnboundVariable(accessor_name.clone()))?;
+                let scheme = env.get(&accessor_name).ok_or_else(|| {
+                    let resolved = apply_subst(&s1, &t_record);
+                    let def = if let Type::Con(type_name, _) = resolved.as_ref() {
+                        self.type_def_spans.get(type_name).cloned()
+                    } else {
+                        None
+                    };
+                    TypeError::UnknownField {
+                        field: field.clone(),
+                        record_ty: resolved,
+                        field_span: span.clone(),
+                        def,
+                    }
+                })?;
                 let accessor_ty = self.instantiate(scheme);
 
-                let (s1, t_record) = self.infer(env, record)?;
                 let ret_ty = self.fresh();
                 let s2 = unify(
                     &apply_subst(&s1, &accessor_ty),
@@ -568,6 +645,80 @@ impl TypeChecker {
                 let s12 = compose_subst(&s2, &s1);
 
                 Ok((s12.clone(), apply_subst(&s12, &ret_ty)))
+            }
+
+            Expr::Lambda { args, body, .. } => {
+                let mut inner_env = env.clone();
+                let mut arg_tys = Vec::new();
+
+                for arg in args {
+                    let tv = self.fresh();
+                    inner_env.insert(
+                        arg.clone(),
+                        Scheme {
+                            vars: vec![],
+                            ty: tv.clone(),
+                        },
+                    );
+                    arg_tys.push(tv);
+                }
+
+                let (s, t_body) = self.infer(&inner_env, body)?;
+
+                // Apply substitution to arg types, then build curried Fun type
+                let ty = arg_tys
+                    .iter()
+                    .rev()
+                    .fold(apply_subst(&s, &t_body), |acc, arg_ty| {
+                        Type::fun(apply_subst(&s, arg_ty), acc)
+                    });
+
+                Ok((s, ty))
+            }
+
+            Expr::RecordConstruct { fields, .. } => {
+                // For each :field val pair, look up the field accessor in the env.
+                // Accessor type is `RecordType -> FieldType`.
+                // Unify all accessor record-sides against a single result_ty so the
+                // record type is determined by the fields provided.
+                let result_ty = self.fresh();
+                let mut subst = HashMap::new();
+
+                for (field_name, value_expr) in fields {
+                    let accessor_name = format!(":{field_name}");
+                    let scheme = env
+                        .get(&accessor_name)
+                        .ok_or_else(|| TypeError::UnboundVariable(accessor_name.clone()))?;
+                    let accessor_ty = self.instantiate(scheme);
+
+                    // accessor_ty = RecordType -> FieldType; unify record-side with result_ty
+                    let field_ty = self.fresh();
+                    let s_acc = unify(
+                        &apply_subst(&subst, &accessor_ty),
+                        &Type::fun(apply_subst(&subst, &result_ty), field_ty.clone()),
+                    )?;
+                    subst = compose_subst(&s_acc, &subst);
+
+                    let (s_val, t_val) = self.infer(&apply_subst_env(&subst, env), value_expr)?;
+                    subst = compose_subst(&s_val, &subst);
+
+                    let s_field = unify(
+                        &apply_subst(&subst, &field_ty),
+                        &apply_subst(&subst, &t_val),
+                    )?;
+                    subst = compose_subst(&s_field, &subst);
+                }
+
+                Ok((subst.clone(), apply_subst(&subst, &result_ty)))
+            }
+
+            // Cross-module call: validate the function exists, return polymorphic type.
+            Expr::QualifiedCall { module, function, .. } => {
+                let key = format!("{module}/{function}");
+                match env.get(&key) {
+                    Some(_) => Ok((HashMap::new(), self.fresh())),
+                    None => Err(TypeError::UnboundVariable(format!("{module}/{function}"))),
+                }
             }
         }
     }
@@ -626,6 +777,19 @@ impl TypeChecker {
                 let s_unify = unify(&apply_subst(&subst, &con_ty), expected)?;
                 Ok((compose_subst(&s_unify, &subst), pat_env))
             }
+            Pattern::Or(pats, _) => {
+                // Each alternative must type-check against the expected type.
+                // Apply accumulated substitution before each check so alternatives
+                // are constrained to the same concrete type.
+                // Or-patterns don't introduce variable bindings.
+                let mut combined_subst = HashMap::new();
+                for pat in pats {
+                    let refined = apply_subst(&combined_subst, expected);
+                    let (s, _) = self.infer_pattern(env, pat, &refined)?;
+                    combined_subst = compose_subst(&s, &combined_subst);
+                }
+                Ok((combined_subst, env.clone()))
+            }
         }
     }
 }
@@ -654,7 +818,8 @@ impl TypeChecker {
         &mut self,
         env: &mut TypeEnv,
         decls: &[crate::ast::Declaration],
-    ) -> Result<Rc<Type>, (TypeError, crate::ast::Expr)> {
+        file_id: usize,
+    ) -> Result<Rc<Type>, Box<(TypeError, crate::ast::Expr)>> {
         use crate::ast::{Declaration, Expr};
 
         let mut last_ty = Type::unit();
@@ -662,6 +827,12 @@ impl TypeChecker {
         for decl in decls {
             match decl {
                 Declaration::Type(type_decl) => {
+                    let (type_name, type_span) = match type_decl {
+                        crate::ast::TypeDecl::Record { name, span, .. } => (name, span),
+                        crate::ast::TypeDecl::Variant { name, span, .. } => (name, span),
+                    };
+                    self.type_def_spans
+                        .insert(type_name.clone(), (file_id, type_span.clone()));
                     env.extend(constructor_schemes(type_decl));
                 }
                 Declaration::Expression(expr) => {
@@ -675,8 +846,21 @@ impl TypeChecker {
                             }
                             last_ty = ty;
                         }
-                        Err(error) => return Err((error, expr.clone())),
+                        Err(error) => return Err(Box::new((error, expr.clone()))),
                     }
+                }
+                Declaration::ExternLet { name, is_nullary, ty, .. } => {
+                    let resolved = type_sig_to_type(ty);
+                    let final_ty = if *is_nullary {
+                        // {} means 0-arity Erlang function: wrap as Unit -> ReturnType
+                        Rc::new(Type::Fun(Type::unit(), resolved))
+                    } else {
+                        resolved
+                    };
+                    env.insert(name.clone(), Scheme { vars: vec![], ty: final_ty });
+                }
+                Declaration::ExternType { .. } | Declaration::Use { .. } => {
+                    // Not yet handled by the typechecker.
                 }
             }
         }
@@ -688,6 +872,19 @@ impl TypeChecker {
 // ---------------------------------------------------------------------------
 // Primitive environment
 // ---------------------------------------------------------------------------
+
+/// Build a `TypeEnv` seeded with imported function names as fully polymorphic types.
+/// This allows the typechecker to accept calls to functions from other modules
+/// without knowing their concrete types.
+pub fn import_env(names: &[String]) -> TypeEnv {
+    let mut env = TypeEnv::new();
+    for (i, name) in names.iter().enumerate() {
+        // Use high IDs that never collide with inference vars (which start at 0)
+        let id = u64::MAX - 8192 - i as u64;
+        env.insert(name.clone(), Scheme { vars: vec![id], ty: Rc::new(Type::Var(id)) });
+    }
+    env
+}
 
 /// Build a `TypeEnv` with built-in operator and function types.
 /// Constructors for user-defined types must be added separately.
@@ -760,12 +957,35 @@ pub fn primitive_env() -> TypeEnv {
         fun2(Type::string(), Type::string(), Type::string()),
     );
 
+    // IO
+    env.insert(
+        "println".to_string(),
+        Scheme {
+            vars: vec![],
+            ty: Type::fun(Type::string(), Type::unit()),
+        },
+    );
+
     env
 }
 
 // ---------------------------------------------------------------------------
 // TypeUsage → Type conversion
 // ---------------------------------------------------------------------------
+
+/// Convert a `TypeSig` (from an `extern` declaration) to a `Type`.
+/// Generic variables in externs are monomorphic — they're not quantified.
+fn type_sig_to_type(sig: &crate::ast::TypeSig) -> Rc<Type> {
+    use crate::ast::TypeSig;
+    match sig {
+        TypeSig::Named(name) => Type::con(name, vec![]),
+        TypeSig::Generic(name) => Type::con(name, vec![]),
+        TypeSig::App(head, args) => {
+            Type::con(head, args.iter().map(type_sig_to_type).collect())
+        }
+        TypeSig::Fun(a, b) => Type::fun(type_sig_to_type(a), type_sig_to_type(b)),
+    }
+}
 
 fn type_usage_to_type(usage: &TypeUsage, params: &HashMap<String, Rc<Type>>) -> Rc<Type> {
     match usage {
@@ -915,7 +1135,9 @@ mod tests {
         let mut checker = TypeChecker::new();
         let mut env = primitive_env();
 
-        checker.check_program(&mut env, &decls).map_err(|(e, _)| e)
+        checker
+            .check_program(&mut env, &decls, file_id)
+            .map_err(|err| err.0)
     }
 
     fn check_expr(src: &str) -> Result<Rc<Type>, TypeError> {
@@ -1063,11 +1285,83 @@ mod tests {
     fn infer_record_construction() {
         let src = r#"
             (type Point ((:x ~ Int) (:y ~ Int)))
-            (let test {p} (+ 1 2))
-            (let main {} (test (Point 0 0)))
+            (let main {} (Point :x 0 :y 0))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::con("Point", vec![]));
+    }
+
+    #[test]
+    fn infer_generic_record_construction() {
+        let src = r#"
+            (type ['t] Box ((:value ~ 't)))
+            (let main {} (Box :value 42))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::con("Box", vec![Type::int()]));
+    }
+
+    #[test]
+    fn infer_record_construction_field_type_error() {
+        let src = r#"
+            (type Point ((:x ~ Int) (:y ~ Int)))
+            (let main {} (Point :x True :y 0))
+        "#;
+        assert!(
+            check(src).is_err(),
+            "expected type error: Bool used for Int field"
+        );
+    }
+
+    #[test]
+    fn infer_lambda_identity() {
+        let ty = check_expr("(fn {x} x)").unwrap();
+        // Should be 'a -> 'a
+        match ty.as_ref() {
+            Type::Fun(a, b) => assert_eq!(a, b),
+            _ => panic!("expected Fun type, got {ty:?}"),
+        }
+    }
+
+    #[test]
+    fn infer_lambda_applied() {
+        // Immediately apply a lambda
+        let ty = check_expr("((fn {x} (+ x 1)) 5)").unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_lambda_as_arg() {
+        let src = r#"
+            (let apply {f x} (f x))
+            (let main {} (apply (fn {n} (* n 2)) 3))
         "#;
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_let_bind() {
+        // let? desugars to bind; define a Result bind and use it
+        let src = r#"
+            (type ['e 'a] Result (
+                (Ok ~ 'a)
+                (Error ~ 'e)))
+            (let bind {m f}
+                (match m
+                    (Ok x) ~> (f x)
+                    (Error e) ~> (Error e)))
+            (let safe_inc {r}
+                (let? [x r]
+                    (Ok (+ x 1))))
+            (let main {} (safe_inc (Ok 41)))
+        "#;
+        let ty = check(src).unwrap();
+        // Error type is polymorphic (never constrained); only check the success type
+        match ty.as_ref() {
+            Type::Con(name, args) if name == "Result" => assert_eq!(args[1], Type::int()),
+            _ => panic!("expected Result type, got {ty:?}"),
+        }
     }
 
     #[test]
@@ -1075,7 +1369,7 @@ mod tests {
         let src = r#"
             (type Point ((:x ~ Int) (:y ~ Int)))
             (let get_x {p} (:x p))
-            (let main {} (get_x (Point 5 10)))
+            (let main {} (get_x (Point :x 5 :y 10)))
         "#;
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
@@ -1086,7 +1380,7 @@ mod tests {
         let src = r#"
             (type ['t] Box ((:value ~ 't)))
             (let get_val {b} (:value b))
-            (let main {} (get_val (Box 42)))
+            (let main {} (get_val (Box :value 42)))
         "#;
         let ty = check(src).unwrap();
         assert_eq!(ty, Type::int());
@@ -1156,29 +1450,29 @@ mod tests {
     }
 
     #[test]
-    fn infer_array_of_ints() {
-        let ty = check_expr("#[1 2 3]").unwrap();
+    fn infer_list_of_ints() {
+        let ty = check_expr("[1 2 3]").unwrap();
         assert_eq!(ty, Type::array(Type::int()));
     }
 
     #[test]
-    fn infer_empty_array() {
-        let ty = check_expr("#[]").unwrap();
-        // empty array has a polymorphic element type var
+    fn infer_empty_list() {
+        let ty = check_expr("[]").unwrap();
+        // empty list has a polymorphic element type var
         match ty.as_ref() {
             Type::Con(name, args) => {
-                assert_eq!(name, "Array");
+                assert_eq!(name, "List");
                 assert_eq!(args.len(), 1);
                 assert!(matches!(args[0].as_ref(), Type::Var(_)));
             }
-            _ => panic!("expected Array type, got {:?}", ty),
+            _ => panic!("expected List type, got {:?}", ty),
         }
     }
 
     #[test]
-    fn infer_array_type_mismatch() {
-        // Int and Bool in the same array must fail
-        let result = check_expr("#[1 True]");
+    fn infer_list_type_mismatch() {
+        // Int and Bool in the same list must fail
+        let result = check_expr("[1 True]");
         assert!(result.is_err(), "expected type error, got {:?}", result);
     }
 
@@ -1404,14 +1698,14 @@ mod tests {
     }
 
     #[test]
-    fn infer_array_of_bools() {
-        let ty = check_expr("#[True False True]").unwrap();
+    fn infer_list_of_bools() {
+        let ty = check_expr("[True False True]").unwrap();
         assert_eq!(ty, Type::array(Type::bool()));
     }
 
     #[test]
-    fn infer_array_of_floats() {
-        let ty = check_expr("#[1.0 2.5 3.14]").unwrap();
+    fn infer_list_of_floats() {
+        let ty = check_expr("[1.0 2.5 3.14]").unwrap();
         assert_eq!(ty, Type::array(Type::float()));
     }
 
@@ -1555,6 +1849,57 @@ mod tests {
     }
 
     #[test]
+    fn extern_declaration_adds_to_env() {
+        // extern makes the name available with the declared type
+        let src = r#"
+            (extern let my_print ~ (String -> Unit) io/format)
+            (let main {} (my_print "hello"))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::unit());
+    }
+
+    #[test]
+    fn extern_wrong_arg_type_is_rejected() {
+        let src = r#"
+            (extern let my_print ~ (String -> Unit) io/format)
+            (let main {} (my_print 42))
+        "#;
+        assert!(check(src).is_err());
+    }
+
+    #[test]
+    fn infer_string_literal_pattern() {
+        let src = r#"(let greet {s} (match s "hello" ~> "hi!" _ ~> "?"))
+(let main {} (greet "hello"))"#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::string());
+    }
+
+    #[test]
+    fn infer_or_pattern_match() {
+        // All alternatives are Int literals; result is Bool
+        let src = "(let f {x} (match x 1 or 2 or 3 ~> True _ ~> False))\n(let main {} (f 1))";
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
+    fn reject_or_pattern_type_mismatch() {
+        // or-pattern alternatives must agree with the target type; 1 is Int, True is Bool
+        let result = check("(let f {x} (match x 1 or True ~> 0 _ ~> 1))\n(let main {} (f 1))");
+        assert!(result.is_err(), "expected type error: Int vs Bool in or-pattern");
+    }
+
+    #[test]
+    fn infer_multi_target_match() {
+        // Two targets, two patterns per arm; both arms return Bool
+        let src = "(let f {x y} (match x y 1 1 ~> True _ _ ~> False))\n(let main {} (f 1 1))";
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::bool());
+    }
+
+    #[test]
     fn reject_let_binding_type_error_in_sequence() {
         // x is Bool, but (+ x 1) requires Int
         let result = check("(let f {dummy} (let [x True y (+ x 1)] y))");
@@ -1601,8 +1946,8 @@ mod tests {
         "#;
         let result = check(src);
         assert!(
-            matches!(result, Err(TypeError::UnboundVariable(_))),
-            "expected UnboundVariable for unknown field :z"
+            matches!(result, Err(TypeError::UnknownField { .. })),
+            "expected UnknownField for unknown field :z"
         );
     }
 

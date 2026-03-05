@@ -45,8 +45,6 @@ pub enum TokenKind {
     RSquare,
     #[token("~")]
     Tilde,
-    #[token("#[")]
-    HashLSquare,
     #[token("{")]
     LCurly,
     #[token("}")]
@@ -55,10 +53,16 @@ pub enum TokenKind {
     // Keywords
     #[token("pub")]
     Pub,
+    #[token("opaque")]
+    Opaque,
     #[token("type")]
     Type,
+    #[token("let?")]
+    LetBind,
     #[token("let")]
     Let,
+    #[token("fn")]
+    Fn,
     #[token("if")]
     If,
     #[token("match")]
@@ -69,6 +73,12 @@ pub enum TokenKind {
     And,
     #[token("~>")]
     Arrow,
+    #[token("->")]
+    ThinArrow,
+    #[token("extern")]
+    Extern,
+    #[token("use")]
+    Use,
     #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
     NamedField(String),
 
@@ -81,6 +91,15 @@ pub enum TokenKind {
     // Generics (e.g., 'a, 'e)
     #[regex(r"'[a-z][a-zA-Z0-9_]*")]
     Generic,
+
+    // Qualified identifier: module/function or module/Type
+    // Module is always lowercase; must be matched before plain Ident (longer match wins)
+    #[regex(r"[a-z][a-zA-Z0-9_]*/[a-zA-Z_][a-zA-Z0-9_]*", |lex| {
+        let s = lex.slice();
+        let slash = s.find('/').unwrap();
+        (s[..slash].to_string(), s[slash + 1..].to_string())
+    })]
+    QualifiedIdent((String, String)),
 
     // Identifiers (Variables, Type names, Variants)
     // This regex allows for standard camelCase or snake_case
@@ -112,21 +131,27 @@ impl TokenKind {
             TokenKind::LSquare => "opening bracket '['",
             TokenKind::RSquare => "closing bracket ']'",
             TokenKind::Tilde => "tilde '~'",
-            TokenKind::HashLSquare => "array prefix '#['",
             TokenKind::LCurly => "opening bracket '{'",
             TokenKind::RCurly => "closing bracket '}'",
             TokenKind::Pub => "keyword 'pub'",
+            TokenKind::Opaque => "keyword 'opaque'",
             TokenKind::Type => "keyword 'type'",
+            TokenKind::LetBind => "keyword 'let?'",
             TokenKind::Let => "keyword 'let'",
+            TokenKind::Fn => "keyword 'fn'",
             TokenKind::If => "keyword 'if'",
             TokenKind::Match => "keyword 'match'",
             TokenKind::Or => "operator 'or'",
             TokenKind::And => "operator 'and'",
             TokenKind::Arrow => "arrow '~>'",
+            TokenKind::ThinArrow => "arrow '->'",
+            TokenKind::Extern => "keyword 'extern'",
+            TokenKind::Use => "keyword 'use'",
             TokenKind::NamedField(_) => "field name (e.g. :name)",
             TokenKind::Float(_) => "float literal",
             TokenKind::Int(_) => "integer literal",
             TokenKind::Generic => "generic type variable (e.g. 'a)",
+            TokenKind::QualifiedIdent(_) => "qualified identifier (e.g. math/add)",
             TokenKind::Ident => "identifier",
             TokenKind::String => "string literal",
             TokenKind::Bool(_) => "boolean literal",
@@ -143,14 +168,14 @@ mod tests {
     use crate::lexer::{TokenKind, TokenKind::*};
 
     #[test]
-    fn vector_literal() {
+    fn list_literal() {
         let expected_tokens = [
             LRound,
             Let,
             Ident,
             LCurly,
             RCurly,
-            HashLSquare,
+            LSquare,
             Int(1),
             Int(2),
             Int(3),
@@ -159,8 +184,8 @@ mod tests {
             RRound,
         ];
         let source = r#"
-            (let vec_literal {}
-                #[1 2 3 4] )
+            (let list_literal {}
+                [1 2 3 4] )
             "#;
         let lexer = TokenKind::lexer(source);
         let tokens = lexer.into_iter().map(|t| t.unwrap()).collect::<Vec<_>>();
@@ -425,6 +450,27 @@ mod tests {
     }
 
     #[test]
+    fn qualified_ident() {
+        let source = "math/add collections/map math/MyType";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![
+            QualifiedIdent(("math".into(), "add".into())),
+            QualifiedIdent(("collections".into(), "map".into())),
+            QualifiedIdent(("math".into(), "MyType".into())),
+        ]);
+    }
+
+    #[test]
+    fn qualified_ident_does_not_consume_division() {
+        // (/ a b) — the / here is an operator, not a qualified ident
+        let source = "/ a b";
+        let lexer = TokenKind::lexer(source);
+        let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
+        assert_eq!(tokens, vec![Operator, Ident, Ident]);
+    }
+
+    #[test]
     fn arrow_and_tilde_tokens() {
         let source = "~> ~";
         let lexer = TokenKind::lexer(source);
@@ -460,11 +506,11 @@ mod tests {
     }
 
     #[test]
-    fn hash_square_bracket() {
-        let source = "#[";
+    fn square_bracket() {
+        let source = "[";
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
-        assert_eq!(tokens, vec![HashLSquare]);
+        assert_eq!(tokens, vec![LSquare]);
     }
 
     #[test]

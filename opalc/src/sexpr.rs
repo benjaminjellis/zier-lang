@@ -12,8 +12,6 @@ pub enum SExpr {
     Square(Vec<SExpr>, Range<usize>),
     /// A curly bracket arg list: { ... }
     Curly(Vec<SExpr>, Range<usize>),
-    /// A hash bracket array literal #[ ... ]
-    Array(Vec<SExpr>, Range<usize>),
 }
 
 impl SExpr {
@@ -22,7 +20,6 @@ impl SExpr {
             SExpr::Atom(t) => t.span.clone(),
             SExpr::Round(_, s) => s.clone(),
             SExpr::Square(_, s) => s.clone(),
-            SExpr::Array(_, s) => s.clone(),
             SExpr::Curly(_, s) => s.clone(),
         }
     }
@@ -48,14 +45,6 @@ impl SExpr {
                     .join(" ");
                 format!("[{}]", inner)
             }
-            SExpr::Array(items, _) => {
-                let inner = items
-                    .iter()
-                    .map(|e| e.to_source(source))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                format!("#[{}]", inner)
-            }
             SExpr::Curly(items, _) => {
                 let inner = items
                     .iter()
@@ -77,7 +66,6 @@ pub struct SExprParser {
 enum SExprType {
     Round,
     Square,
-    Array,
     Curly,
 }
 
@@ -118,7 +106,6 @@ impl SExprParser {
         match token.kind {
             TokenKind::LRound => self.parse_sequence(TokenKind::RRound, SExprType::Round),
             TokenKind::LSquare => self.parse_sequence(TokenKind::RSquare, SExprType::Square),
-            TokenKind::HashLSquare => self.parse_sequence(TokenKind::RSquare, SExprType::Array),
             TokenKind::LCurly => self.parse_sequence(TokenKind::RCurly, SExprType::Curly),
 
             TokenKind::RRound | TokenKind::RSquare | TokenKind::RCurly => {
@@ -148,7 +135,6 @@ impl SExprParser {
                 return Ok(match sexpr_type {
                     SExprType::Round => SExpr::Round(children, full_span),
                     SExprType::Square => SExpr::Square(children, full_span),
-                    SExprType::Array => SExpr::Array(children, full_span),
                     SExprType::Curly => SExpr::Curly(children, full_span),
                 });
             }

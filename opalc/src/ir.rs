@@ -1,78 +1,66 @@
-use crate::ast::{Literal, Pattern};
+/// Erlang IR — a simplified Erlang AST we emit to `.erl` source.
+/// All Opal functions are fully curried: every function takes exactly one param.
 
-/// A complete program after name resolution and lambda lifting.
-/// All nested functions have been hoisted to the top level.
 #[derive(Debug, Clone)]
-pub struct Program {
-    pub functions: Vec<FlatFunc>,
+pub struct Module {
+    pub name: String,
+    pub functions: Vec<Function>,
 }
 
-/// A top-level function or lifted closure.
-///
-/// - `free_vars.is_empty()` → true top-level function (no environment needed)
-/// - `!free_vars.is_empty()` → lifted closure (codegen must pass an env struct)
+/// A top-level Erlang function with a single parameter (curried).
 #[derive(Debug, Clone)]
-pub struct FlatFunc {
-    /// Unique symbol name (e.g. "fib", "inner_0").
+pub struct Function {
     pub name: String,
-    /// Explicit parameters in source order.
-    pub params: Vec<String>,
-    /// Variables captured from enclosing scopes, in deterministic order.
-    /// For codegen: these are packed into an `env` pointer passed as an extra first argument.
-    pub free_vars: Vec<String>,
+    pub param: String,
     pub body: Expr,
 }
 
-/// Resolved, lambda-lifted expression.
 #[derive(Debug, Clone)]
 pub enum Expr {
-    /// A literal value.
-    Lit(Literal),
+    /// Erlang atom: `none`, `ok`, `unit`, `true`, `false`
+    Atom(String),
+    Int(i64),
+    Float(f64),
+    /// Erlang binary string: `<<"hello"/utf8>>`
+    Str(String),
+    /// Uppercase local variable: `X`, `My_var`
+    Var(String),
+    /// `fun f/1` — reference to a local top-level function
+    FunRef(String),
+    /// `fun module:f/1` — reference to a remote function
+    RemoteFunRef(String, String),
+    /// `{a, b, c}` — tuple, used for variant values and records
+    Tuple(Vec<Expr>),
+    /// `[1, 2, 3]` — Erlang list
+    List(Vec<Expr>),
+    /// `fun(Param) -> Body end`
+    Fun(String, Box<Expr>),
+    /// `F(Arg)` — single-arg call (curried)
+    Call(Box<Expr>, Box<Expr>),
+    /// `name(Arg)` — known local function call (avoids fun-ref wrapping)
+    LocalCall(String, Box<Expr>),
+    /// `module:function(arg1, arg2, ...)` — remote (FFI) call
+    RemoteCall(String, String, Vec<Expr>),
+    /// `Left op Right` — binary operator
+    BinOp(String, Box<Expr>, Box<Expr>),
+    /// `op Expr` — unary operator (`not`)
+    UnOp(String, Box<Expr>),
+    /// `Var = Val, Body` — sequential let binding
+    Let(String, Box<Expr>, Box<Expr>),
+    /// `case Expr of Pat -> Body; ... end`
+    Case(Box<Expr>, Vec<(Pattern, Expr)>),
+}
 
-    /// A variable bound locally in the current function (argument or let-binding).
-    Local(String),
-
-    /// A variable captured from an enclosing scope.
-    /// `index` is the position in this function's `free_vars` list / env struct.
-    Capture { index: usize, name: String },
-
-    /// A reference to a top-level symbol (function or constructor).
-    /// For codegen: becomes a direct function reference / Cranelift FuncRef.
-    Global(String),
-
-    /// Allocate a closure: pair the named lifted function with its captured values.
-    /// Produced when a nested function has non-empty free_vars.
-    MakeClosure { func: String, captures: Vec<Expr> },
-
-    /// Array literal.
-    Array(Vec<Expr>),
-
-    /// Local binding (variable or the closure-ref slot for a nested function).
-    Let {
-        name: String,
-        value: Box<Expr>,
-        body: Box<Expr>,
-    },
-
-    /// Conditional expression.
-    If {
-        cond: Box<Expr>,
-        then: Box<Expr>,
-        els: Box<Expr>,
-    },
-
-    /// Function application.
-    /// Callee classification for codegen:
-    ///   Global(name)  → direct call to a known symbol
-    ///   _             → indirect call through a closure (fn_ptr + env_ptr)
-    Call { func: Box<Expr>, args: Vec<Expr> },
-
-    /// Pattern match.
-    Match {
-        target: Box<Expr>,
-        arms: Vec<(Pattern, Expr)>,
-    },
-
-    /// Record field access. Resolved via field accessor functions.
-    FieldAccess { field: String, record: Box<Expr> },
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    Any,
+    Var(String),
+    Atom(String),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    /// `{tag, P1, P2}` — tuple pattern for variants/records
+    Tuple(Vec<Pattern>),
+    /// `[P1, P2, P3]` — list pattern
+    List(Vec<Pattern>),
 }

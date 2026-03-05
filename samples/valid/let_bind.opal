@@ -1,0 +1,22 @@
+(pub type ['e 'a] Result (
+  (Ok ~ 'a)
+  (Error ~ 'e)))
+
+;; bnd for let?
+(pub let bind {m f}
+  (match m
+    (Ok x)    ~> (f x)
+    (Error e) ~> (Error e)))
+
+(let safe_div {a b}
+  (if (= b 0)
+    (Error "division by zero")
+    (Ok (/ a b))))
+
+(let compute {x y z}
+  (let? [a (safe_div x y)
+         b (safe_div a z)]
+    (Ok b)))
+
+(let main {}
+  (compute 100 5 4))

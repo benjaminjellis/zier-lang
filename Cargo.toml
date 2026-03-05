@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["opal-cli","opalc", "opal-lsp"]
+members = ["opalc", "opal-lsp", "loupe"]
 
 [workspace.package]
 edition = "2024"
@@ -8,4 +8,9 @@ version = "0.1.0"
 
 [workspace.dependencies]
 codespan-reporting = "0.13"
+clap = "4.5.60"
+eyre = "0.6.12"
 logos = "0.16"
+toml = "1.0"
+serde = { version = "1", features = ["derive"] }
+semver = "1.0.27"

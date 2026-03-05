@@ -4,7 +4,7 @@ use codespan_reporting::{
 };
 
 use crate::{
-    ast::{Declaration, Expr, Literal, Pattern, TypeDecl, TypeUsage},
+    ast::{Declaration, Expr, Literal, Pattern, TypeDecl, TypeSig, TypeUsage},
     lexer::{Token, TokenKind},
     sexpr::SExpr,
 };
@@ -39,8 +39,16 @@ impl Lowerer {
         items: &[SExpr],
         span: Range<usize>,
         is_pub: bool,
+        is_opaque: bool,
     ) -> Option<TypeDecl> {
-        let mut cursor = 1; // Skip the "type" atom
+        // items[0] is either `type` or `opaque` — skip to find `type` then the rest
+        let mut cursor = 1; // Skip the leading keyword (type or opaque)
+        // If items[0] is `opaque`, items[1] must be `type` — skip it too
+        if let Some(SExpr::Atom(t)) = items.first()
+            && matches!(t.kind, TokenKind::Opaque)
+        {
+            cursor = 2; // skip both `opaque` and `type`
+        }
 
         // 1. Parse optional generics: ['t] or ['e 'a]
         let mut params = Vec::new();
@@ -165,6 +173,7 @@ impl Lowerer {
             }
             Some(TypeDecl::Record {
                 is_pub,
+                is_opaque,
                 name,
                 params,
                 fields,
@@ -289,6 +298,7 @@ impl Lowerer {
             }
             Some(TypeDecl::Variant {
                 is_pub,
+                is_opaque,
                 name,
                 params,
                 constructors,
@@ -322,8 +332,38 @@ impl Lowerer {
                                     effective_items,
                                     span.clone(),
                                     is_pub,
+                                    false,
                                 ) {
                                     lowered_declarations.push(Declaration::Type(t));
+                                }
+                            }
+                            TokenKind::Opaque => {
+                                // (pub opaque type [...] Name (...))
+                                if let Some(t) = self.lower_type_decl(
+                                    file_id,
+                                    effective_items,
+                                    span.clone(),
+                                    is_pub,
+                                    true,
+                                ) {
+                                    lowered_declarations.push(Declaration::Type(t));
+                                }
+                            }
+                            TokenKind::Extern => {
+                                if let Some(d) = self.lower_extern_dispatch(
+                                    file_id,
+                                    effective_items,
+                                    span.clone(),
+                                    is_pub,
+                                ) {
+                                    lowered_declarations.push(d);
+                                }
+                            }
+                            TokenKind::Use => {
+                                if let Some(d) =
+                                    self.lower_use(file_id, effective_items, span.clone(), is_pub)
+                                {
+                                    lowered_declarations.push(d);
                                 }
                             }
                             TokenKind::Let => {
@@ -414,6 +454,14 @@ impl Lowerer {
                 Some(Expr::Variable(name.to_string(), token.span.clone()))
             }
 
+            // Qualified ident in value position — zero-arg cross-module call
+            TokenKind::QualifiedIdent((module, function)) => Some(Expr::QualifiedCall {
+                module: module.clone(),
+                function: function.clone(),
+                args: vec![],
+                span: token.span.clone(),
+            }),
+
             // Field accessor used as a bare atom, not wrapped in parens
             TokenKind::NamedField(name) => {
                 self.error(
@@ -461,27 +509,18 @@ impl Lowerer {
         }
     }
 
-    fn lower_array(
-        &mut self,
-        file_id: usize,
-        items: &Vec<SExpr>,
-        span: Range<usize>,
-    ) -> Option<Expr> {
-        let mut lowered_items = Vec::with_capacity(items.len());
-
-        for item in items {
-            // Recursively lower each element.
-            let expr = self.lower_expr(file_id, item)?;
-            lowered_items.push(expr);
-        }
-
-        Some(Expr::Array(lowered_items, span))
+    fn lower_list(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
+        let lowered_items = items
+            .iter()
+            .map(|item| self.lower_expr(file_id, item))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Expr::List(lowered_items, span))
     }
 
     pub fn lower_expr(&mut self, file_id: usize, sexpr: &SExpr) -> Option<Expr> {
         match sexpr {
             SExpr::Atom(token) => self.lower_atom(file_id, token),
-            SExpr::Array(items, span) => self.lower_array(file_id, items, span.to_owned()),
+            SExpr::Square(items, span) => self.lower_list(file_id, items, span.to_owned()),
             SExpr::Curly(_, span) => {
                 self.error(Diagnostic {
                     severity: Severity::Error,
@@ -490,22 +529,6 @@ impl Lowerer {
                     labels: vec![Label{ style: LabelStyle::Primary, file_id, range : span.to_owned(), message: "".to_string() }],
                     notes: vec![],
                  });
-                None
-            }
-            SExpr::Square(_, span) => {
-                self.error(Diagnostic {
-                    severity: Severity::Error,
-                    code: Some("E002".to_string()),
-                    message: "Square brackets are used to in local let bindings".to_string(),
-                    labels: vec![Label {
-                        style: LabelStyle::Primary,
-                        file_id,
-                        range: span.to_owned(),
-                        message: "".to_string(),
-                    }],
-                    notes: vec![],
-                });
-
                 None
             }
             SExpr::Round(items, span) => {
@@ -519,10 +542,37 @@ impl Lowerer {
                         TokenKind::Let => {
                             return self.lower_let(file_id, items, span.clone(), false);
                         }
+                        TokenKind::LetBind => {
+                            return self.lower_let_bind(file_id, items, span.clone());
+                        }
+                        TokenKind::Fn => {
+                            return self.lower_lambda(file_id, items, span.clone());
+                        }
                         TokenKind::If => return self.lower_if(file_id, items, span.clone()),
                         TokenKind::Match => return self.lower_match(file_id, items, span.clone()),
                         TokenKind::NamedField(_) => {
                             return self.lower_field_access(file_id, items, span.clone());
+                        }
+                        TokenKind::Ident => {
+                            // (TypeName :field val ...) — named-field record construction
+                            // Detect: capitalised ident followed by a NamedField token
+                            let name = self.source_at(file_id, token.span.clone());
+                            if name.starts_with(|c: char| c.is_uppercase())
+                                && let Some(SExpr::Atom(t2)) = items.get(1)
+                                && matches!(t2.kind, TokenKind::NamedField(_))
+                            {
+                                return self.lower_record_construct(file_id, items, span.clone());
+                            }
+                        }
+                        // Cross-module call: (module/function arg1 arg2)
+                        TokenKind::QualifiedIdent((module, function)) => {
+                            let module = module.clone();
+                            let function = function.clone();
+                            let args = items[1..]
+                                .iter()
+                                .map(|s| self.lower_expr(file_id, s))
+                                .collect::<Option<Vec<_>>>()?;
+                            return Some(Expr::QualifiedCall { module, function, args, span: span.clone() });
                         }
                         _ => {} // Fall through to function call
                     }
@@ -534,9 +584,569 @@ impl Lowerer {
         }
     }
 
+    fn lower_lambda(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Option<Expr> {
+        // (fn {x y} body)
+        // items[0] = fn, items[1] = {args}, items[2] = body
+        if items.len() != 3 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid anonymous function syntax")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec!["syntax: (fn {arg1 arg2} body)".into()]),
+            );
+            return None;
+        }
+
+        let args = match &items[1] {
+            SExpr::Curly(params, _) => params
+                .iter()
+                .filter_map(|p| {
+                    if let SExpr::Atom(t) = p {
+                        Some(self.source_at(file_id, t.span.clone()).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected `{args}` in anonymous function")
+                        .with_labels(vec![
+                            Label::primary(file_id, items[1].span())
+                                .with_message("expected curly braces here"),
+                        ])
+                        .with_notes(vec!["syntax: (fn {arg1 arg2} body)".into()]),
+                );
+                return None;
+            }
+        };
+
+        let body = self.lower_expr(file_id, &items[2])?;
+        Some(Expr::Lambda {
+            args,
+            body: Box::new(body),
+            span,
+        })
+    }
+
+    fn lower_let_bind(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Option<Expr> {
+        // (let? [a expr1 b expr2] body)
+        // items[0] = let?, items[1] = Square([name val ...]), items[2] = body
+        if items.len() != 3 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid let? syntax")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec!["syntax: (let? [name expr ...] body)".into()]),
+            );
+            return None;
+        }
+
+        let (bindings, b_span) = match &items[1] {
+            SExpr::Square(b, s) => (b, s.clone()),
+            _ => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected `[bindings]` in let?")
+                        .with_labels(vec![
+                            Label::primary(file_id, items[1].span())
+                                .with_message("expected square brackets here"),
+                        ])
+                        .with_notes(vec!["syntax: (let? [name expr ...] body)".into()]),
+                );
+                return None;
+            }
+        };
+
+        if bindings.len() % 2 != 0 || bindings.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message("let? bindings must be non-empty pairs of name and expression")
+                    .with_labels(vec![Label::primary(file_id, b_span)])
+                    .with_notes(vec!["syntax: (let? [name expr ...] body)".into()]),
+            );
+            return None;
+        }
+
+        let body = self.lower_expr(file_id, &items[2])?;
+
+        // Desugar right-to-left into nested (bind expr (fn {name} ...))
+        let mut pairs: Vec<(String, Expr)> = Vec::new();
+        for chunk in bindings.chunks(2) {
+            let name = match &chunk[0] {
+                SExpr::Atom(t) => self.source_at(file_id, t.span.clone()).to_string(),
+                other => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected identifier in let? binding")
+                            .with_labels(vec![Label::primary(file_id, other.span())]),
+                    );
+                    return None;
+                }
+            };
+            let val = self.lower_expr(file_id, &chunk[1])?;
+            pairs.push((name, val));
+        }
+
+        // Fold right: innermost binding wraps the body
+        let result = pairs.into_iter().rev().fold(body, |inner, (name, val)| {
+            let lambda = Expr::Lambda {
+                args: vec![name],
+                body: Box::new(inner),
+                span: span.clone(),
+            };
+            Expr::Call {
+                func: Box::new(Expr::Variable("bind".to_string(), span.clone())),
+                args: vec![val, lambda],
+                span: span.clone(),
+            }
+        });
+
+        Some(result)
+    }
+
+    fn lower_record_construct(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Option<Expr> {
+        // items[0] = TypeName (Ident), items[1..] = :field val pairs
+        let name = match &items[0] {
+            SExpr::Atom(t) => self.source_at(file_id, t.span.clone()).to_string(),
+            _ => unreachable!("record construct name must be an atom"),
+        };
+
+        let mut fields = Vec::new();
+        let mut cursor = 1;
+
+        while cursor < items.len() {
+            // Expect a NamedField token
+            let field_name = match items.get(cursor) {
+                Some(SExpr::Atom(t)) => match &t.kind {
+                    TokenKind::NamedField(f) => f.clone(),
+                    _ => {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message("expected a field name")
+                                .with_labels(vec![
+                                    Label::primary(file_id, t.span.clone())
+                                        .with_message("expected `:field_name` here"),
+                                ])
+                                .with_notes(vec![
+                                    "syntax: (TypeName :field1 val1 :field2 val2)".into(),
+                                ]),
+                        );
+                        return None;
+                    }
+                },
+                Some(other) => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected a field name")
+                            .with_labels(vec![
+                                Label::primary(file_id, other.span())
+                                    .with_message("expected `:field_name` here"),
+                            ])
+                            .with_notes(vec![
+                                "syntax: (TypeName :field1 val1 :field2 val2)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+                None => break,
+            };
+            cursor += 1;
+
+            // Expect a value expression
+            let value = match items.get(cursor) {
+                Some(sexpr) => self.lower_expr(file_id, sexpr)?,
+                None => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message(format!("missing value for field `:{field_name}`"))
+                            .with_labels(vec![Label::primary(file_id, span.clone())])
+                            .with_notes(vec![
+                                "syntax: (TypeName :field1 val1 :field2 val2)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+            };
+            cursor += 1;
+
+            fields.push((field_name, value));
+        }
+
+        if fields.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message(format!("record construction of `{name}` has no fields"))
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec!["syntax: (TypeName :field1 val1 :field2 val2)".into()]),
+            );
+            return None;
+        }
+
+        Some(Expr::RecordConstruct { name, fields, span })
+    }
+
+    /// Parse a type signature used inside `extern` declarations.
+    /// Syntax: a single atom (Int, String, 'a, ...) or a parenthesised (A -> B -> C).
+    fn lower_type_sig(&mut self, file_id: usize, sexpr: &SExpr) -> Option<TypeSig> {
+        match sexpr {
+            SExpr::Atom(token) => {
+                let text = self.source_at(file_id, token.span.clone()).to_string();
+                match &token.kind {
+                    TokenKind::Generic => Some(TypeSig::Generic(text)),
+                    TokenKind::Ident => Some(TypeSig::Named(text)),
+                    _ => {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message("expected a type name")
+                                .with_labels(vec![
+                                    Label::primary(file_id, token.span.clone())
+                                        .with_message("expected a type like Int, String, or 'a"),
+                                ]),
+                        );
+                        None
+                    }
+                }
+            }
+            SExpr::Round(items, span) => {
+                // Parenthesised type: (A -> B -> C) parsed right-associatively.
+                // items is a flat list: [A, ->, B, ->, C]
+                if items.is_empty() {
+                    return Some(TypeSig::Named("Unit".to_string()));
+                }
+                // Collect segments separated by ThinArrow
+                let mut segments: Vec<&SExpr> = Vec::new();
+                let mut cursor = 0;
+                while cursor < items.len() {
+                    if let SExpr::Atom(t) = &items[cursor]
+                        && matches!(t.kind, TokenKind::ThinArrow)
+                    {
+                        cursor += 1;
+                        continue;
+                    }
+                    segments.push(&items[cursor]);
+                    cursor += 1;
+                }
+                if segments.is_empty() {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("empty type signature")
+                            .with_labels(vec![Label::primary(file_id, span.clone())]),
+                    );
+                    return None;
+                }
+                // Lower each segment, then fold right into Fun chain
+                let mut lowered: Vec<TypeSig> = segments
+                    .iter()
+                    .map(|s| self.lower_type_sig(file_id, s))
+                    .collect::<Option<Vec<_>>>()?;
+                let last = lowered.pop().unwrap();
+                Some(
+                    lowered
+                        .into_iter()
+                        .rev()
+                        .fold(last, |acc, seg| TypeSig::Fun(Box::new(seg), Box::new(acc))),
+                )
+            }
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("invalid type in extern signature")
+                        .with_labels(vec![Label::primary(file_id, other.span())]),
+                );
+                None
+            }
+        }
+    }
+
+    /// Dispatch between `extern let` and `extern type`.
+    fn lower_extern_dispatch(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+        is_pub: bool,
+    ) -> Option<Declaration> {
+        match items.get(1) {
+            Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::Let) => {
+                self.lower_extern_let(file_id, items, span)
+            }
+            Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::Type) => {
+                self.lower_extern_type(file_id, items, span, is_pub)
+            }
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected 'let' or 'type' after 'extern'")
+                        .with_labels(vec![Label::primary(
+                            file_id,
+                            other.map(|s| s.span()).unwrap_or(span),
+                        )])
+                        .with_notes(vec![
+                            "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
+                            "syntax: (extern type ['k 'v] Name module/type)".into(),
+                        ]),
+                );
+                None
+            }
+        }
+    }
+
+    /// Lower an `extern let` declaration.
+    /// Syntax: (extern let name ~ (TypeSig) module/function)
+    ///      or (extern let name {} ~ ReturnType module/function)  -- nullary
+    fn lower_extern_let(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Option<Declaration> {
+        // items[0]=extern, items[1]=let, items[2]=name, then either:
+        //   nullary: items[3]={}, items[4]=~, items[5]=ReturnType, items[6]=target  (len=7)
+        //   normal:  items[3]=~, items[4]=TypeSig, items[5]=target                  (len=6)
+
+        let name = match &items[2] {
+            SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
+                self.source_at(file_id, t.span.clone()).to_string()
+            }
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected a function name in extern let")
+                        .with_labels(vec![Label::primary(file_id, other.span())]),
+                );
+                return None;
+            }
+        };
+
+        // Detect nullary: items[3] is an empty Curly {}
+        let is_nullary = matches!(items.get(3), Some(SExpr::Curly(args, _)) if args.is_empty());
+        let (tilde_idx, type_idx, target_idx, expected_len) = if is_nullary {
+            (4, 5, 6, 7)
+        } else {
+            (3, 4, 5, 6)
+        };
+
+        if items.len() != expected_len {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid extern let declaration")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec![
+                        "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
+                        "syntax: (extern let name {} ~ ReturnType module/function)".into(),
+                    ]),
+            );
+            return None;
+        }
+
+        match &items[tilde_idx] {
+            SExpr::Atom(t) if matches!(t.kind, TokenKind::Tilde) => {}
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected '~' after extern let name")
+                        .with_labels(vec![Label::primary(file_id, other.span())])
+                        .with_notes(vec![
+                            "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
+                        ]),
+                );
+                return None;
+            }
+        }
+
+        let ty = self.lower_type_sig(file_id, &items[type_idx])?;
+
+        let erlang_target = match &items[target_idx] {
+            SExpr::Atom(t) => match &t.kind {
+                TokenKind::QualifiedIdent((module, func)) => (module.clone(), func.clone()),
+                _ => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected an Erlang target as module/function")
+                            .with_labels(vec![
+                                Label::primary(file_id, t.span.clone())
+                                    .with_message("expected e.g. io/format"),
+                            ])
+                            .with_notes(vec![
+                                "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+            },
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected an Erlang target as module/function")
+                        .with_labels(vec![Label::primary(file_id, other.span())]),
+                );
+                return None;
+            }
+        };
+
+        Some(Declaration::ExternLet {
+            name,
+            is_nullary,
+            ty,
+            erlang_target,
+            span,
+        })
+    }
+
+    /// Lower an `extern type` declaration.
+    /// Syntax: (extern type ['k 'v] Name module/type)
+    fn lower_extern_type(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+        is_pub: bool,
+    ) -> Option<Declaration> {
+        // items[0]=extern, items[1]=type, then optional ['k 'v], then Name, then module/type
+        let mut cursor = 2;
+
+        let mut params = Vec::new();
+        if let Some(SExpr::Square(gen_items, _)) = items.get(cursor) {
+            for s in gen_items {
+                if let SExpr::Atom(t) = s {
+                    params.push(self.source_at(file_id, t.span.clone()).to_string());
+                }
+            }
+            cursor += 1;
+        }
+
+        let name = match items.get(cursor) {
+            Some(SExpr::Atom(t)) => self.source_at(file_id, t.span.clone()).to_string(),
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected a type name in extern type")
+                        .with_labels(vec![Label::primary(
+                            file_id,
+                            other.map(|s| s.span()).unwrap_or(span.clone()),
+                        )]),
+                );
+                return None;
+            }
+        };
+        cursor += 1;
+
+        let erlang_target = match items.get(cursor) {
+            Some(SExpr::Atom(t)) => match &t.kind {
+                TokenKind::QualifiedIdent((module, ty)) => (module.clone(), ty.clone()),
+                _ => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected an Erlang target as module/type")
+                            .with_labels(vec![
+                                Label::primary(file_id, t.span.clone())
+                                    .with_message("expected e.g. erlang/map"),
+                            ])
+                            .with_notes(vec![
+                                "syntax: (extern type ['k 'v] Name module/type)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+            },
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected an Erlang target as module/type")
+                        .with_labels(vec![Label::primary(
+                            file_id,
+                            other.map(|s| s.span()).unwrap_or(span.clone()),
+                        )]),
+                );
+                return None;
+            }
+        };
+
+        Some(Declaration::ExternType {
+            is_pub,
+            name,
+            params,
+            erlang_target,
+            span,
+        })
+    }
+
+    /// Lower a `use` declaration.
+    /// Syntax: (use std/dict)
+    fn lower_use(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+        is_pub: bool,
+    ) -> Option<Declaration> {
+        if items.len() != 2 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid use declaration")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec!["syntax: (use std/dict)".into()]),
+            );
+            return None;
+        }
+
+        let path = match &items[1] {
+            SExpr::Atom(t) => match &t.kind {
+                // (use std/io) — namespaced module
+                TokenKind::QualifiedIdent((namespace, module)) => {
+                    (namespace.clone(), module.clone())
+                }
+                // (use math) — local project module
+                TokenKind::Ident => {
+                    let name = self.source_at(file_id, t.span.clone()).to_string();
+                    (String::new(), name)
+                }
+                _ => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected a module path in use")
+                            .with_labels(vec![
+                                Label::primary(file_id, t.span.clone())
+                                    .with_message("expected e.g. std/io or math"),
+                            ])
+                            .with_notes(vec!["syntax: (use std/io) or (use math)".into()]),
+                    );
+                    return None;
+                }
+            },
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected a module path in use")
+                        .with_labels(vec![Label::primary(file_id, other.span())]),
+                );
+                return None;
+            }
+        };
+
+        Some(Declaration::Use { is_pub, path, span })
+    }
+
     fn lower_match(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
-        // 1. Initial validation: (match target ...)
-        // Minimum valid: (match x pat ~> res) = 5 items
+        // items[0] = match keyword; items[1..] = targets followed by arms.
+        // Minimum valid: (match x pat ~> res) = 5 items.
         if items.len() < 5 {
             self.error(
                 Diagnostic::error()
@@ -549,20 +1159,109 @@ impl Lowerer {
             return None;
         }
 
-        // 2. Lower the target
-        let target = Box::new(self.lower_expr(file_id, &items[1])?);
+        // Find the position of the first '~>' arrow in items[1..].
+        let first_arrow = items[1..]
+            .iter()
+            .position(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Arrow)));
+        let Some(first_arrow) = first_arrow else {
+            self.error(
+                Diagnostic::error()
+                    .with_message("match expression has no arms")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec![
+                        "syntax: (match <target> <pattern> ~> <expr> ...)".into(),
+                    ]),
+            );
+            return None;
+        };
+        // first_arrow is index within items[1..], so absolute index = first_arrow + 1.
+        let first_arrow_abs = first_arrow + 1;
 
-        // 3. Lower the arms (triplets: Pattern, Arrow, Result)
+        // items[1..first_arrow_abs] are targets + first-arm patterns.
+        // Detect or-patterns: if any 'or' token appears before the first arrow, single-target mode.
+        let has_or = items[1..first_arrow_abs]
+            .iter()
+            .any(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Or)));
+
+        let n_targets = if has_or {
+            1
+        } else {
+            let n_items = first_arrow_abs - 1; // items between 'match' and first arrow
+            if n_items == 0 || n_items % 2 != 0 {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("match has an unequal number of targets and patterns")
+                        .with_labels(vec![Label::primary(file_id, span.clone())])
+                        .with_notes(vec![
+                            "each arm must have the same number of patterns as there are targets"
+                                .into(),
+                        ]),
+                );
+                return None;
+            }
+            n_items / 2
+        };
+
+        // Parse targets.
+        let mut targets = Vec::with_capacity(n_targets);
+        for i in 0..n_targets {
+            targets.push(self.lower_expr(file_id, &items[1 + i])?);
+        }
+
+        // Parse arms. cursor starts just after the targets.
+        let mut cursor = 1 + n_targets;
         let mut arms = Vec::new();
-        let mut cursor = 2;
 
         while cursor < items.len() {
-            // A. Lower the Pattern
-            let pattern_sexpr = &items[cursor];
-            let pattern = self.lower_pattern(file_id, pattern_sexpr)?;
-            cursor += 1;
+            let mut arm_patterns = Vec::with_capacity(n_targets);
 
-            // B. Expect and consume the arrow '~>'
+            for _i in 0..n_targets {
+                if cursor >= items.len() {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("incomplete match arm: missing pattern")
+                            .with_labels(vec![Label::primary(file_id, span.clone())]),
+                    );
+                    return None;
+                }
+
+                let pat = self.lower_pattern(file_id, &items[cursor])?;
+                cursor += 1;
+
+                // In single-target mode, collect 'or'-separated alternatives.
+                let final_pat = if n_targets == 1 {
+                    let mut or_pats = vec![pat];
+                    while let Some(SExpr::Atom(t)) = items.get(cursor) {
+                        if matches!(t.kind, TokenKind::Or) {
+                            cursor += 1; // consume 'or'
+                            if cursor >= items.len() {
+                                self.error(
+                                    Diagnostic::error()
+                                        .with_message("expected a pattern after 'or'")
+                                        .with_labels(vec![Label::primary(file_id, t.span.clone())]),
+                                );
+                                return None;
+                            }
+                            let next = self.lower_pattern(file_id, &items[cursor])?;
+                            cursor += 1;
+                            or_pats.push(next);
+                        } else {
+                            break;
+                        }
+                    }
+                    if or_pats.len() == 1 {
+                        or_pats.remove(0)
+                    } else {
+                        Pattern::Or(or_pats, span.clone())
+                    }
+                } else {
+                    pat
+                };
+
+                arm_patterns.push(final_pat);
+            }
+
+            // Expect and consume '~>'.
             match items.get(cursor) {
                 Some(SExpr::Atom(token)) if matches!(token.kind, TokenKind::Arrow) => {
                     cursor += 1;
@@ -574,28 +1273,35 @@ impl Lowerer {
                                 "match arms must use '~>' to separate the pattern and result",
                             )
                             .with_notes(vec!["help: write `pattern ~> expression`".to_string()])
-                            .with_labels(vec![Label::primary(file_id, span)]),
+                            .with_labels(vec![Label::primary(file_id, span.clone())]),
                     );
                     return None;
                 }
             }
 
-            // C. Lower the Result expression
-            let result_sexpr = items.get(cursor).or_else(|| {
-                self.error(
-                    Diagnostic::error()
-                        .with_message("missing result expression after '~>'")
-                        .with_labels(vec![Label::primary(file_id, span.clone())]),
-                );
-                None
-            })?;
+            // Expect the result expression.
+            let result_sexpr = match items.get(cursor) {
+                Some(s) => s,
+                None => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("missing result expression after '~>'")
+                            .with_labels(vec![Label::primary(file_id, span.clone())]),
+                    );
+                    return None;
+                }
+            };
             let body = self.lower_expr(file_id, result_sexpr)?;
             cursor += 1;
 
-            arms.push((pattern, body));
+            arms.push((arm_patterns, body));
         }
 
-        Some(Expr::Match { target, arms, span })
+        Some(Expr::Match {
+            targets,
+            arms,
+            span,
+        })
     }
 
     fn lower_pattern(&mut self, file_id: usize, sexpr: &SExpr) -> Option<Pattern> {
@@ -620,6 +1326,11 @@ impl Lowerer {
                     TokenKind::Int(v) => Some(Pattern::Literal(Literal::Int(*v), span)),
                     TokenKind::Float(v) => Some(Pattern::Literal(Literal::Float(*v), span)),
                     TokenKind::Bool(v) => Some(Pattern::Literal(Literal::Bool(*v), span)),
+                    TokenKind::String => {
+                        let raw = self.source_at(file_id, token.span.clone());
+                        let s = raw[1..raw.len() - 1].to_string();
+                        Some(Pattern::Literal(Literal::String(s), span))
+                    }
 
                     _ => {
                         self.error(
@@ -765,12 +1476,29 @@ impl Lowerer {
 
                 cursor += 1;
 
-                // The body is the expression following the square brackets
-                let mut current_expr = if let Some(next_sexpr) = items.get(cursor) {
-                    self.lower_expr(file_id, next_sexpr)?
-                } else {
-                    // If no body, default to Unit (e.g. top-level definitions)
+                // Collect all body expressions — implicit sequencing in let body
+                let body_sexprs = &items[cursor..];
+                let mut current_expr = if body_sexprs.is_empty() {
                     Expr::Literal(Literal::Unit, span.clone())
+                } else {
+                    let mut body_exprs = body_sexprs
+                        .iter()
+                        .map(|s| self.lower_expr(file_id, s))
+                        .collect::<Option<Vec<_>>>()?;
+                    if body_exprs.len() == 1 {
+                        body_exprs.remove(0)
+                    } else {
+                        let last = body_exprs.pop().unwrap();
+                        body_exprs
+                            .into_iter()
+                            .rev()
+                            .fold(last, |body, expr| Expr::LetLocal {
+                                name: "_".to_string(),
+                                value: Box::new(expr),
+                                body: Box::new(body),
+                                span: span.clone(),
+                            })
+                    }
                 };
 
                 // We fold the bindings backwards to create nested LetLocal expressions
@@ -828,27 +1556,37 @@ impl Lowerer {
                     return None;
                 };
 
-                // The function value/body (e.g. (+ a b))
-                let value_sexpr = items.get(cursor).or_else(|| {
-                    self.error(Diagnostic::error().with_message("missing function body"));
-                    None
-                })?;
-                let value = self.lower_expr(file_id, value_sexpr)?;
-                cursor += 1;
-
-                // Top-level functions have no continuation — reject trailing expressions
-                if let Some(extra) = items.get(cursor) {
-                    let extra_span = extra.span();
+                // Collect all body expressions — implicit sequencing like Clojure
+                let body_sexprs = &items[cursor..];
+                if body_sexprs.is_empty() {
                     self.error(
                         Diagnostic::error()
-                            .with_message(
-                                "top-level function definitions cannot have a continuation",
-                            )
-                            .with_labels(vec![Label::primary(file_id, extra_span)])
-                            .with_notes(vec!["use separate top-level declarations instead".into()]),
+                            .with_message("missing function body")
+                            .with_labels(vec![Label::primary(file_id, span.clone())]),
                     );
                     return None;
                 }
+
+                let mut body_exprs = body_sexprs
+                    .iter()
+                    .map(|s| self.lower_expr(file_id, s))
+                    .collect::<Option<Vec<_>>>()?;
+
+                // Multiple expressions desugar to nested LetLocal with "_" bindings
+                let value = if body_exprs.len() == 1 {
+                    body_exprs.remove(0)
+                } else {
+                    let last = body_exprs.pop().unwrap();
+                    body_exprs
+                        .into_iter()
+                        .rev()
+                        .fold(last, |body, expr| Expr::LetLocal {
+                            name: "_".to_string(),
+                            value: Box::new(expr),
+                            body: Box::new(body),
+                            span: span.clone(),
+                        })
+                };
 
                 Some(Expr::LetFunc {
                     is_pub,
@@ -1168,18 +1906,18 @@ mod tests {
     }
 
     #[test]
-    fn test_array_literal_lowering() {
-        let (mut lowerer, file_id, sexprs) = setup("#[1 2 3]");
+    fn test_list_literal_lowering() {
+        let (mut lowerer, file_id, sexprs) = setup("[1 2 3]");
         let expr = lowerer
             .lower_expr(file_id, &sexprs[0])
             .expect("lowering failed");
-        if let Expr::Array(items, _) = expr {
+        if let Expr::List(items, _) = expr {
             assert_eq!(items.len(), 3);
             assert!(matches!(items[0], Expr::Literal(Literal::Int(1), _)));
             assert!(matches!(items[1], Expr::Literal(Literal::Int(2), _)));
             assert!(matches!(items[2], Expr::Literal(Literal::Int(3), _)));
         } else {
-            panic!("expected Array expression");
+            panic!("expected List expression");
         }
     }
 
@@ -1283,7 +2021,10 @@ mod tests {
             .expect("lowering failed");
         if let Expr::Match { arms, .. } = expr {
             assert_eq!(arms.len(), 1);
-            assert!(matches!(arms[0].0, Pattern::Any(_)), "expected Any pattern");
+            assert!(
+                matches!(arms[0].0[0], Pattern::Any(_)),
+                "expected Any pattern"
+            );
         } else {
             panic!("expected Match");
         }
@@ -1297,9 +2038,9 @@ mod tests {
             .expect("lowering failed");
         if let Expr::Match { arms, .. } = expr {
             assert_eq!(arms.len(), 3);
-            assert!(matches!(arms[0].0, Pattern::Literal(Literal::Int(0), _)));
-            assert!(matches!(arms[1].0, Pattern::Literal(Literal::Int(1), _)));
-            assert!(matches!(arms[2].0, Pattern::Any(_)));
+            assert!(matches!(arms[0].0[0], Pattern::Literal(Literal::Int(0), _)));
+            assert!(matches!(arms[1].0[0], Pattern::Literal(Literal::Int(1), _)));
+            assert!(matches!(arms[2].0[0], Pattern::Any(_)));
         } else {
             panic!("expected Match");
         }
@@ -1351,8 +2092,7 @@ mod tests {
             .expect("lowering failed");
 
         if let Expr::Match { arms, .. } = expr {
-            let (pattern, _body) = &arms[0];
-            if let Pattern::Constructor(name, args, _) = pattern {
+            if let Pattern::Constructor(name, args, _) = &arms[0].0[0] {
                 assert_eq!(name, "Some");
                 assert_eq!(args.len(), 1);
             } else {
@@ -1412,16 +2152,39 @@ mod tests {
     }
 
     #[test]
-    fn test_function_with_continuation_is_error() {
-        // Top-level functions cannot have a continuation — must use separate declarations
-        let src = "(let f {x} (+ x 1) (f 5))";
+    fn test_function_implicit_sequencing() {
+        // Multiple expressions in a function body desugar to nested LetLocal "_"
+        let src = "(let f {x} (+ x 1) (+ x 2))";
         let (mut lowerer, file_id, sexprs) = setup(src);
-        let _ = lowerer.lower_file(file_id, &sexprs);
-        assert!(!lowerer.diagnostics.is_empty());
-        assert_eq!(
-            lowerer.diagnostics[0].message,
-            "top-level function definitions cannot have a continuation"
-        );
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Declaration::Expression(Expr::LetFunc { value, .. }) = &decls[0] {
+            // Body should be LetLocal { name: "_", value: (+ x 1), body: (+ x 2) }
+            assert!(matches!(value.as_ref(), Expr::LetLocal { name, .. } if name == "_"));
+        } else {
+            panic!("expected LetFunc");
+        }
+    }
+
+    #[test]
+    fn test_let_body_implicit_sequencing() {
+        // Multiple expressions in a let body desugar to nested LetLocal "_"
+        let src = "(let f {} (let [x 1] (+ x 1) (+ x 2)))";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Declaration::Expression(Expr::LetFunc { value, .. }) = &decls[0] {
+            // Outer let [x 1] binds x, body is sequenced
+            if let Expr::LetLocal { name, body, .. } = value.as_ref() {
+                assert_eq!(name, "x");
+                // Body of x binding should be LetLocal "_" for the sequence
+                assert!(matches!(body.as_ref(), Expr::LetLocal { name, .. } if name == "_"));
+            } else {
+                panic!("expected LetLocal for x binding");
+            }
+        } else {
+            panic!("expected LetFunc");
+        }
     }
 
     #[test]
@@ -1459,7 +2222,7 @@ mod tests {
             .expect("lowering failed");
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
-            assert!(matches!(arms[0].0, Pattern::Variable(ref s, _) if s == "n"));
+            assert!(matches!(arms[0].0[0], Pattern::Variable(ref s, _) if s == "n"));
         } else {
             panic!("expected Match");
         }
@@ -1475,11 +2238,11 @@ mod tests {
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
             assert!(matches!(
-                arms[0].0,
+                arms[0].0[0],
                 Pattern::Literal(Literal::Bool(true), _)
             ));
             assert!(matches!(
-                arms[1].0,
+                arms[1].0[0],
                 Pattern::Literal(Literal::Bool(false), _)
             ));
         } else {
@@ -1498,11 +2261,60 @@ mod tests {
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
             assert!(
-                matches!(&arms[0].0, Pattern::Constructor(name, args, _) if name == "None" && args.is_empty())
+                matches!(&arms[0].0[0], Pattern::Constructor(name, args, _) if name == "None" && args.is_empty())
             );
             assert!(
-                matches!(&arms[1].0, Pattern::Constructor(name, args, _) if name == "Some" && args.len() == 1)
+                matches!(&arms[1].0[0], Pattern::Constructor(name, args, _) if name == "Some" && args.len() == 1)
             );
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Or-pattern and multi-target match tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_or_pattern_lowers_to_pattern_or() {
+        let src = "(match x 1 or 2 or 3 ~> True _ ~> False)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty());
+        if let Expr::Match { targets, arms, .. } = expr {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(arms.len(), 2);
+            assert!(matches!(&arms[0].0[0], Pattern::Or(pats, _) if pats.len() == 3));
+            assert!(matches!(&arms[1].0[0], Pattern::Any(_)));
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn test_multi_target_match_lowers_two_targets() {
+        let src = "(match x y 1 1 ~> True _ _ ~> False)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty());
+        if let Expr::Match { targets, arms, .. } = expr {
+            assert_eq!(targets.len(), 2);
+            assert_eq!(arms.len(), 2);
+            assert_eq!(arms[0].0.len(), 2);
+            assert!(matches!(
+                &arms[0].0[0],
+                Pattern::Literal(Literal::Int(1), _)
+            ));
+            assert!(matches!(
+                &arms[0].0[1],
+                Pattern::Literal(Literal::Int(1), _)
+            ));
+            assert!(matches!(&arms[1].0[0], Pattern::Any(_)));
+            assert!(matches!(&arms[1].0[1], Pattern::Any(_)));
         } else {
             panic!("expected Match");
         }
@@ -1664,8 +2476,8 @@ mod tests {
     }
 
     #[test]
-    fn test_standalone_square_is_error() {
-        // [1 2 3] as an expression is invalid (must use #[...] for arrays)
+    fn test_list_literal_at_top_level_is_error() {
+        // [1 2 3] at top level is not a valid declaration
         let (mut lowerer, file_id, sexprs) = setup("[1 2 3]");
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty());
