@@ -53,6 +53,8 @@ pub enum TokenKind {
     RCurly,
 
     // Keywords
+    #[token("pub")]
+    Pub,
     #[token("type")]
     Type,
     #[token("let")]
@@ -94,8 +96,8 @@ pub enum TokenKind {
     Bool(bool),
 
     // Operators
-    // Supports multi-character ops like != or <= if you add them later
-    #[regex(r"[\+\-\*/=<>!&|]+")]
+    // Includes '.' so that float ops like +. -. *. /. lex as a single token
+    #[regex(r"[\+\-\*/=<>!&|\.]+")]
     Operator,
 
     #[token("error")]
@@ -113,6 +115,7 @@ impl TokenKind {
             TokenKind::HashLSquare => "array prefix '#['",
             TokenKind::LCurly => "opening bracket '{'",
             TokenKind::RCurly => "closing bracket '}'",
+            TokenKind::Pub => "keyword 'pub'",
             TokenKind::Type => "keyword 'type'",
             TokenKind::Let => "keyword 'let'",
             TokenKind::If => "keyword 'if'",

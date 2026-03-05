@@ -18,7 +18,7 @@ Below is a sample program
 ))
 
 ;; custom variant / sum types
-(type ['e 'a] Result (
+(pub type ['e 'a] Result (
   (Error ~ 'e)
   (Ok ~ 'a)
 ))

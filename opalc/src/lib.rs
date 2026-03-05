@@ -26,9 +26,21 @@ pub fn dummy_compile(source: &str) {
         }
     };
 
-    let _ = lowerer.lower_file(file_id, &sexprs);
+    let decls = lowerer.lower_file(file_id, &sexprs);
 
     for diag in &lowerer.diagnostics {
         term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, diag).unwrap();
+    }
+    if !lowerer.diagnostics.is_empty() {
+        return;
+    }
+
+    // Type-check each declaration in order.
+    let mut checker = typecheck::TypeChecker::new();
+    let mut env = typecheck::primitive_env();
+
+    if let Err((type_error, expr)) = checker.check_program(&mut env, &decls) {
+        let diag = type_error.to_diagnostic(file_id, expr.span());
+        term::emit_to_write_style(&mut writer.lock(), &config, &lowerer.files, &diag).unwrap();
     }
 }

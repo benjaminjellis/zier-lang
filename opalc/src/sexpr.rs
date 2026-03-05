@@ -93,16 +93,16 @@ impl SExprParser {
     pub fn parse(&mut self) -> Result<Vec<SExpr>, Diagnostic<usize>> {
         let mut results = Vec::new();
         while !self.is_at_end() {
-            if let Some(next) = self.peek() {
-                if matches!(
+            if let Some(next) = self.peek()
+                && matches!(
                     next.kind,
                     TokenKind::RRound | TokenKind::RSquare | TokenKind::RCurly
-                ) {
-                    return Err(self.error(
-                        format!("Unexpected top-level delimiter {:?}", next.kind),
-                        next.span,
-                    ));
-                }
+                )
+            {
+                return Err(self.error(
+                    format!("Unexpected top-level delimiter {:?}", next.kind),
+                    next.span,
+                ));
             }
             results.push(self.parse_one()?);
         }

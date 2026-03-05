@@ -12,6 +12,7 @@ pub enum Declaration {
 pub enum TypeDecl {
     /// (type MyType ( (:field ~ Type) ... ))
     Record {
+        is_pub: bool,
         name: String,
         params: Vec<String>,              // ["'e", "'a"]
         fields: Vec<(String, TypeUsage)>, // (field_name, type)
@@ -19,6 +20,7 @@ pub enum TypeDecl {
     },
     /// (type ['e 'a] Result ( (Error ~ 'e) (Ok ~ 'a) ))
     Variant {
+        is_pub: bool,
         name: String,
         params: Vec<String>,                            // ["'e", "'a"]
         constructors: Vec<(String, Option<TypeUsage>)>, // (name, payload type)
@@ -31,19 +33,17 @@ pub enum Expr {
     Literal(Literal, Range<usize>),
     Variable(String, Range<usize>),
     Array(Vec<Expr>, Range<usize>),
-    /// (let [name value ...] body) or (let [rec] name {args} body)
+    /// (let name {args} body) — top-level named function, always self-recursive, no continuation
     LetFunc {
+        is_pub: bool,
         name: String,
-        is_rec: bool,
         args: Vec<String>,
         value: Box<Expr>,
-        body: Box<Expr>,
         span: Range<usize>,
     },
+    /// (let [name value ...] body) — sequential local bindings
     LetLocal {
         name: String,
-        is_rec: bool,
-        args: Vec<String>,
         value: Box<Expr>,
         body: Box<Expr>,
         span: Range<usize>,
@@ -91,6 +91,22 @@ pub enum Literal {
     Float(f64),
     String(String),
     Unit,
+}
+
+impl Expr {
+    pub fn span(&self) -> Range<usize> {
+        match self {
+            Expr::Literal(_, s) => s.clone(),
+            Expr::Variable(_, s) => s.clone(),
+            Expr::Array(_, s) => s.clone(),
+            Expr::LetFunc { span, .. } => span.clone(),
+            Expr::LetLocal { span, .. } => span.clone(),
+            Expr::If { span, .. } => span.clone(),
+            Expr::Call { span, .. } => span.clone(),
+            Expr::Match { span, .. } => span.clone(),
+            Expr::FieldAccess { span, .. } => span.clone(),
+        }
+    }
 }
 
 /// A reference to a type in source code
