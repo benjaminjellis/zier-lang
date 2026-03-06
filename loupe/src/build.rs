@@ -8,9 +8,9 @@ use crate::{BIN_ENTRY_POINT, LIB_ROOT, gitignore};
 use clap::builder::OsStr;
 use eyre::Context;
 
-use crate::{ProjectType, SOURCE_DIR, TARGET_DIR, manifest};
+use crate::{DEBUG_DIR, ProjectType, SOURCE_DIR, manifest, utils::find_opal_files};
 
-// opal-std is embedded at compile time — std ships with loupe, no filesystem discovery needed.
+// opal-std is embedded at compile time — std ships with loupe,
 use include_dir::{Dir, include_dir};
 static STD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../opal-std/src");
 
@@ -18,14 +18,18 @@ static STD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../opal-std/src");
 ///   - user_name:   the name users write in `(use std/io)` → "io"
 ///   - erlang_name: the compiled Erlang module name → "opal_io"
 ///     Prefixed with "opal_" to avoid shadowing Erlang/OTP built-in modules.
-fn std_modules() -> Vec<(String, String, String)> {
+pub(crate) fn std_modules() -> Vec<(String, String, String)> {
     let lib_src = STD_DIR
         .get_file("lib.opal")
         .and_then(|f| f.contents_utf8())
         .unwrap_or("");
 
     let mut result = Vec::new();
-    result.push(("std".to_string(), "opal_std".to_string(), lib_src.to_string()));
+    result.push((
+        "std".to_string(),
+        "opal_std".to_string(),
+        lib_src.to_string(),
+    ));
 
     for mod_name in opalc::pub_reexports(lib_src) {
         let file_name = format!("{mod_name}.opal");
@@ -37,37 +41,35 @@ fn std_modules() -> Vec<(String, String, String)> {
     result
 }
 
-pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
-    // Load manifest
+pub(crate) struct ErlSources {
+    pub erl_paths: Vec<PathBuf>,
+    pub manifest: manifest::LoupeManifest,
+    pub project_type: ProjectType,
+}
+
+/// Compile all Opal source files and write `.erl` output into `erl_dir`.
+/// Returns the generated file paths, the project manifest, and detected project type.
+/// Exits with code 1 on any compilation error.
+pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::Result<ErlSources> {
     let manifest = manifest::read_manifest(project_dir.into())?;
 
-    // Find all .opal source files in src/
     let src_dir = project_dir.join(SOURCE_DIR);
     let opal_files = find_opal_files(&src_dir);
 
     if opal_files.is_empty() {
-        return Err(eyre::eyre!("loupe found no .opal {}", src_dir.display()));
-    }
-
-    if let Some(project_type) = verify_project_type(&opal_files) {
-        if matches!(project_type, ProjectType::Lib) && run {
-            return Err(eyre::eyre!("loupe cannot run a library project"));
-        }
-    } else {
         return Err(eyre::eyre!(
-            "loupe failed to find one of {BIN_ENTRY_POINT} or {LIB_ROOT}"
+            "loupe found no .opal files in {}",
+            src_dir.display()
         ));
     }
 
-    // Create build directory
-    let build_dir = project_dir.join(TARGET_DIR);
-    std::fs::create_dir_all(&build_dir).context(format!("could not create {TARGET_DIR} dir"))?;
+    let project_type = verify_project_type(&opal_files).ok_or_else(|| {
+        eyre::eyre!("loupe failed to find one of {BIN_ENTRY_POINT} or {LIB_ROOT}")
+    })?;
 
-    // create a .gitignore
-    gitignore::write_gitignore(project_dir.into())?;
-
-    // Phase 1: scan each module's source to collect its exported function names
+    // Phase 1: scan each module's source to collect its exported function names and type decls
     let mut module_exports: HashMap<String, Vec<String>> = HashMap::new();
+    let mut module_type_decls: HashMap<String, Vec<opalc::ast::TypeDecl>> = HashMap::new();
     let mut module_sources: Vec<(String, String)> = Vec::new(); // (module_name, source)
 
     for opal_path in &opal_files {
@@ -83,28 +85,81 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         });
 
         let exports = opalc::exported_names(&source);
+        let type_decls = opalc::exported_type_decls(&source);
         module_exports.insert(module_name.clone(), exports);
+        module_type_decls.insert(module_name.clone(), type_decls);
         module_sources.push((module_name, source));
     }
 
     // Phase 1b: seed module_exports with embedded std modules so the compiler's
     // `use` validation and import building treats them identically to local modules.
-    // Keyed by user-facing name ("io"), compiled as Erlang name ("opal_io").
     let std_mods = std_modules();
     for (user_name, _, source) in &std_mods {
         let exports = opalc::exported_names(source);
+        let type_decls = opalc::exported_type_decls(source);
         module_exports.insert(user_name.clone(), exports);
+        module_type_decls.insert(user_name.clone(), type_decls);
     }
 
-    // Phase 2: compile each file with its resolved import map
+    // Phase 1c: infer real type schemes for each std module in order so that
+    // dependent modules (including user code) get proper type-checking.
+    let mut all_module_schemes: HashMap<String, opalc::typecheck::TypeEnv> = HashMap::new();
+    let std_aliases: HashMap<String, String> = std_mods
+        .iter()
+        .map(|(u, e, _)| (u.clone(), e.clone()))
+        .collect();
+
+    for (user_name, _erlang_name, source) in &std_mods {
+        let mut std_imports: HashMap<String, String> = HashMap::new();
+        let mut std_imported_type_decls: Vec<opalc::ast::TypeDecl> = Vec::new();
+        let mut std_imported_schemes: opalc::typecheck::TypeEnv = HashMap::new();
+
+        for (_, mod_name) in opalc::used_modules(source) {
+            let erl_name = std_aliases
+                .get(&mod_name)
+                .cloned()
+                .unwrap_or_else(|| mod_name.clone());
+            if let Some(exports) = module_exports.get(&mod_name) {
+                for fn_name in exports {
+                    std_imports.insert(fn_name.clone(), erl_name.clone());
+                }
+            }
+            if let Some(type_decls) = module_type_decls.get(&mod_name) {
+                std_imported_type_decls.extend(type_decls.clone());
+            }
+            if let Some(dep_schemes) = all_module_schemes.get(&mod_name) {
+                for (fn_name, scheme) in dep_schemes {
+                    std_imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    std_imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
+                }
+            }
+        }
+
+        let std_module_exports: HashMap<String, Vec<String>> = std_mods
+            .iter()
+            .map(|(u, _, src)| (u.clone(), opalc::exported_names(src)))
+            .collect();
+
+        let schemes = opalc::infer_module_exports(
+            user_name,
+            source,
+            std_imports,
+            &std_module_exports,
+            &std_imported_type_decls,
+            &std_imported_schemes,
+        );
+        all_module_schemes.insert(user_name.clone(), schemes);
+    }
+
+    // Phase 2: compile each user file with its resolved import map
     let mut erl_paths: Vec<PathBuf> = Vec::new();
     let mut had_error = false;
 
     for (module_name, source) in &module_sources {
-        // Build imports: fn_name → module_name for each `use` in this file
         let mut imports: HashMap<String, String> = HashMap::new();
+        let mut imported_schemes: opalc::typecheck::TypeEnv = HashMap::new();
+
         for (_, mod_name) in opalc::used_modules(source) {
-            // For std modules, route to the prefixed Erlang name to avoid shadowing OTP builtins
             let erlang_name = std_mods
                 .iter()
                 .find(|(user, _, _)| user == &mod_name)
@@ -116,7 +171,23 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
                     imports.insert(fn_name.clone(), erlang_name.clone());
                 }
             }
-            // Unknown module — the compiler will emit a proper codespan diagnostic
+
+            if let Some(mod_schemes) = all_module_schemes.get(&mod_name) {
+                for (fn_name, scheme) in mod_schemes {
+                    imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
+                }
+            }
+        }
+
+        // Inject qualified-name schemes for ALL known modules (handles transitive re-exports)
+        for (user_name, schemes) in &all_module_schemes {
+            for (fn_name, scheme) in schemes {
+                let qualified = format!("{user_name}/{fn_name}");
+                imported_schemes
+                    .entry(qualified)
+                    .or_insert_with(|| scheme.clone());
+            }
         }
 
         let module_aliases: HashMap<String, String> = std_mods
@@ -124,9 +195,42 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
             .map(|(user, erlang, _)| (user.clone(), erlang.clone()))
             .collect();
 
-        match opalc::compile_with_imports(module_name, source, imports, &module_exports, module_aliases) {
+        // Type decls (constructors, field accessors) come into scope only for
+        // modules the user explicitly names — either via `(use mod)` or by
+        // writing a qualified call `mod/fn`.  No transitive propagation: if you
+        // want `Some`/`None` you write `(use std/option)`; if you want
+        // `TakeResult` field access you write `(use std/map)` or call `map/take`.
+        let mut referenced_modules: std::collections::HashSet<String> =
+            opalc::used_modules(source)
+                .into_iter()
+                .map(|(_, mod_name)| mod_name)
+                .collect();
+        for tok in opalc::lexer::Lexer::new(source).lex() {
+            if let opalc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind {
+                referenced_modules.insert(module);
+            }
+        }
+        let imported_type_decls: Vec<opalc::ast::TypeDecl> = referenced_modules
+            .iter()
+            .flat_map(|mod_name| {
+                module_type_decls
+                    .get(mod_name)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        match opalc::compile_with_imports(
+            module_name,
+            source,
+            imports,
+            &module_exports,
+            module_aliases,
+            &imported_type_decls,
+            &imported_schemes,
+        ) {
             Some(erl_src) => {
-                let erl_path = build_dir.join(format!("{module_name}.erl"));
+                let erl_path = erl_dir.join(format!("{module_name}.erl"));
                 std::fs::write(&erl_path, erl_src).expect("could not write .erl");
                 erl_paths.push(erl_path);
             }
@@ -147,18 +251,99 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         .map(|(_, m)| m)
         .collect();
 
+    let std_module_exports: HashMap<String, Vec<String>> = std_mods
+        .iter()
+        .map(|(user_name, _, source)| (user_name.clone(), opalc::exported_names(source)))
+        .collect();
+
+    // Also compile std sub-modules referenced via qualified idents (e.g. `io/println`)
+    let std_sub_names: std::collections::HashSet<&str> =
+        std_mods.iter().map(|(u, _, _)| u.as_str()).collect();
+    let mut expanded_std_names = used_std_names.clone();
+    for (_, src) in &module_sources {
+        for tok in opalc::lexer::Lexer::new(src).lex() {
+            if let opalc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind
+                && std_sub_names.contains(module.as_str())
+            {
+                expanded_std_names.insert(module);
+            }
+        }
+    }
+
     for (user_name, erlang_name, source) in &std_mods {
-        if !used_std_names.contains(user_name.as_str()) {
+        if !expanded_std_names.contains(user_name.as_str()) {
             continue;
         }
-        match opalc::compile(erlang_name, source) {
+
+        let mut std_imports: HashMap<String, String> = HashMap::new();
+        let mut std_imported_schemes: opalc::typecheck::TypeEnv = HashMap::new();
+
+        for (_, mod_name) in opalc::used_modules(source) {
+            let erl_name = std_aliases
+                .get(&mod_name)
+                .cloned()
+                .unwrap_or_else(|| mod_name.clone());
+            if let Some(exports) = std_module_exports.get(&mod_name) {
+                for fn_name in exports {
+                    std_imports.insert(fn_name.clone(), erl_name.clone());
+                }
+            }
+            if let Some(dep_schemes) = all_module_schemes.get(&mod_name) {
+                for (fn_name, scheme) in dep_schemes {
+                    std_imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    std_imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
+                }
+            }
+        }
+
+        let std_imported_type_decls: Vec<opalc::ast::TypeDecl> = opalc::used_modules(source)
+            .into_iter()
+            .flat_map(|(_, mod_name)| {
+                module_type_decls
+                    .get(&mod_name)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        match opalc::compile_with_imports(
+            erlang_name,
+            source,
+            std_imports,
+            &std_module_exports,
+            std_aliases.clone(),
+            &std_imported_type_decls,
+            &std_imported_schemes,
+        ) {
             Some(erl_src) => {
-                let erl_path = build_dir.join(format!("{erlang_name}.erl"));
+                let erl_path = erl_dir.join(format!("{erlang_name}.erl"));
                 std::fs::write(&erl_path, erl_src).expect("could not write .erl");
                 erl_paths.push(erl_path);
             }
             None => std::process::exit(1),
         }
+    }
+
+    Ok(ErlSources {
+        erl_paths,
+        manifest,
+        project_type,
+    })
+}
+
+pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
+    let build_dir = project_dir.join(DEBUG_DIR);
+    std::fs::create_dir_all(&build_dir).context(format!("could not create {DEBUG_DIR} dir"))?;
+    gitignore::write_gitignore(project_dir.into())?;
+
+    let ErlSources {
+        erl_paths,
+        manifest,
+        project_type,
+    } = generate_erl_sources(project_dir, &build_dir)?;
+
+    if matches!(project_type, ProjectType::Lib) && run {
+        return Err(eyre::eyre!("loupe cannot run a library project"));
     }
 
     // Run erlc on all .erl files at once
@@ -184,7 +369,6 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
             .arg("-pa")
             .arg(&build_dir)
             .arg("-eval")
-            // Entry point is always main:main/1 (src/main.opal)
             .arg("main:main(unit), init:stop().")
             .status()
             .unwrap_or_else(|e| {
@@ -204,22 +388,7 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
     Ok(())
 }
 
-fn find_opal_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("opal") {
-            files.push(path);
-        }
-    }
-    files.sort(); // deterministic order
-    files
-}
-
-fn verify_project_type(source_files: &Vec<PathBuf>) -> Option<ProjectType> {
+fn verify_project_type(source_files: &[PathBuf]) -> Option<ProjectType> {
     let entry_point = OsStr::from(BIN_ENTRY_POINT);
     let lib_root = OsStr::from(LIB_ROOT);
     for file in source_files {

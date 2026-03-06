@@ -32,8 +32,11 @@ pub struct Token {
 
 #[derive(Logos, Clone, Debug, PartialEq)]
 #[logos(skip r"[ \t\r\n]+")]
-#[logos(skip(r";[^\n]*", allow_greedy = true))]
 pub enum TokenKind {
+    /// A line comment: `;;` to end of line. Preserved in the token stream so
+    /// that formatters and tooling can see comments; the parser filters these out.
+    #[regex(r";[^\n]*", allow_greedy = true)]
+    Comment,
     // Structural symbols
     #[token("(")]
     LRound,
@@ -53,8 +56,6 @@ pub enum TokenKind {
     // Keywords
     #[token("pub")]
     Pub,
-    #[token("opaque")]
-    Opaque,
     #[token("type")]
     Type,
     #[token("let?")]
@@ -126,6 +127,7 @@ pub enum TokenKind {
 impl TokenKind {
     pub(crate) fn name(&self) -> &str {
         match self {
+            TokenKind::Comment => "comment",
             TokenKind::LRound => "opening bracket '('",
             TokenKind::RRound => "closing bracket ')'",
             TokenKind::LSquare => "opening bracket '['",
@@ -134,7 +136,6 @@ impl TokenKind {
             TokenKind::LCurly => "opening bracket '{'",
             TokenKind::RCurly => "closing bracket '}'",
             TokenKind::Pub => "keyword 'pub'",
-            TokenKind::Opaque => "keyword 'opaque'",
             TokenKind::Type => "keyword 'type'",
             TokenKind::LetBind => "keyword 'let?'",
             TokenKind::Let => "keyword 'let'",
@@ -414,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn comments_are_stripped() {
+    fn comments_are_emitted_as_tokens() {
         let source = r#"
             ;; this is a comment
             42
@@ -422,7 +423,7 @@ mod tests {
         "#;
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
-        assert_eq!(tokens, vec![Int(42)]);
+        assert_eq!(tokens, vec![Comment, Int(42), Comment]);
     }
 
     #[test]
@@ -430,7 +431,7 @@ mod tests {
         let source = "True ;; rest of line ignored\nFalse";
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
-        assert_eq!(tokens, vec![Bool(true), Bool(false)]);
+        assert_eq!(tokens, vec![Bool(true), Comment, Bool(false)]);
     }
 
     #[test]
@@ -454,11 +455,14 @@ mod tests {
         let source = "math/add collections/map math/MyType";
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
-        assert_eq!(tokens, vec![
-            QualifiedIdent(("math".into(), "add".into())),
-            QualifiedIdent(("collections".into(), "map".into())),
-            QualifiedIdent(("math".into(), "MyType".into())),
-        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                QualifiedIdent(("math".into(), "add".into())),
+                QualifiedIdent(("collections".into(), "map".into())),
+                QualifiedIdent(("math".into(), "MyType".into())),
+            ]
+        );
     }
 
     #[test]

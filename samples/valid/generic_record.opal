@@ -4,4 +4,5 @@
 ))
 
 (let main {}
-(let [x  (MyGenericType :name "Hello" :data 1)]))
+  (let
+    [x (MyGenericType :name "Hello" :data 1)]))

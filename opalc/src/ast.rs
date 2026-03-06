@@ -10,6 +10,7 @@ pub enum Declaration {
     /// or  (extern let name {} ~ ReturnType module/function)  -- nullary Erlang function
     ExternLet {
         name: String,
+        is_pub: bool,
         is_nullary: bool,
         ty: TypeSig,
         erlang_target: (String, String), // (module, function)
@@ -34,9 +35,9 @@ pub enum Declaration {
 /// A type written in source — only valid inside `extern` declarations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeSig {
-    Named(String),              // Int, String, Bool, Unit, a user type
-    Generic(String),            // 'a, 'b
-    App(String, Vec<TypeSig>),  // Option 'a, Result 'e 'a
+    Named(String),                   // Int, String, Bool, Unit, a user type
+    Generic(String),                 // 'a, 'b
+    App(String, Vec<TypeSig>),       // Option 'a, Result 'e 'a
     Fun(Box<TypeSig>, Box<TypeSig>), // A -> B
 }
 
@@ -45,7 +46,6 @@ pub enum TypeDecl {
     /// (type MyType ( (:field ~ Type) ... ))
     Record {
         is_pub: bool,
-        is_opaque: bool,
         name: String,
         params: Vec<String>,              // ["'e", "'a"]
         fields: Vec<(String, TypeUsage)>, // (field_name, type)
@@ -54,7 +54,6 @@ pub enum TypeDecl {
     /// (type ['e 'a] Result ( (Error ~ 'e) (Ok ~ 'a) ))
     Variant {
         is_pub: bool,
-        is_opaque: bool,
         name: String,
         params: Vec<String>,                            // ["'e", "'a"]
         constructors: Vec<(String, Option<TypeUsage>)>, // (name, payload type)
@@ -122,6 +121,8 @@ pub enum Expr {
         function: String,
         args: Vec<Expr>,
         span: Range<usize>,
+        /// Span of just the `module/function` ident token (for diagnostics).
+        fn_span: Range<usize>,
     },
 }
 

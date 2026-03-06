@@ -13,14 +13,24 @@ struct Ctx {
     imports: HashMap<String, String>,
     /// User-facing module name → Erlang module name (e.g. "io" → "opal_io")
     module_aliases: HashMap<String, String>,
+    /// Record field name → 1-based element index (tag is at 1, fields start at 2)
+    field_indices: HashMap<String, usize>,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
-pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<String, String>, module_aliases: HashMap<String, String>) -> ir::Module {
-    // Pass 1: collect function names and constructor arities
+pub fn lower_module(
+    name: &str,
+    decls: &[ast::Declaration],
+    imports: HashMap<String, String>,
+    module_aliases: HashMap<String, String>,
+    imported_constructors: HashMap<String, usize>,
+    imported_field_indices: HashMap<String, usize>,
+) -> ir::Module {
+    // Pass 1: collect function names, constructor arities, and record field indices
     let mut fn_names = HashSet::new();
-    let mut constructors = HashMap::new();
+    let mut constructors = imported_constructors;
+    let mut field_indices = imported_field_indices;
 
     for decl in decls {
         match decl {
@@ -38,6 +48,12 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<Str
                     constructors.insert(ctor_name.clone(), if payload.is_some() { 1 } else { 0 });
                 }
             }
+            ast::Declaration::Type(ast::TypeDecl::Record { fields, .. }) => {
+                // Tag is at element(1), fields start at element(2)
+                for (i, (field_name, _)) in fields.iter().enumerate() {
+                    field_indices.insert(field_name.clone(), i + 2);
+                }
+            }
             _ => {}
         }
     }
@@ -47,6 +63,7 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<Str
         constructors,
         imports,
         module_aliases,
+        field_indices,
     };
 
     // Pass 2: lower declarations to IR functions
@@ -55,18 +72,27 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], imports: HashMap<Str
     for decl in decls {
         match decl {
             ast::Declaration::Expression(ast::Expr::LetFunc {
-                name, args, value, ..
+                name,
+                args,
+                value,
+                is_pub,
+                ..
             }) => {
-                functions.push(lower_letfunc(name, args, value, &ctx));
+                let mut f = lower_letfunc(name, args, value, &ctx);
+                f.is_pub = *is_pub;
+                functions.push(f);
             }
             ast::Declaration::ExternLet {
                 name,
+                is_pub,
                 is_nullary,
                 ty,
                 erlang_target,
                 ..
             } => {
-                functions.push(lower_extern_let(name, *is_nullary, ty, erlang_target));
+                let mut f = lower_extern_let(name, *is_nullary, ty, erlang_target);
+                f.is_pub = *is_pub;
+                functions.push(f);
             }
             _ => {} // Type decls, Use, ExternType produce no Erlang functions
         }
@@ -87,8 +113,9 @@ fn lower_letfunc(name: &str, args: &[String], body: &ast::Expr, ctx: &Ctx) -> ir
     match lambda {
         ir::Expr::Fun(param, inner) => ir::Function {
             name: name.to_string(),
-            param,
+            param: Some(param),
             body: *inner,
+            is_pub: false, // caller sets this
         },
         _ => unreachable!(),
     }
@@ -107,8 +134,8 @@ fn lower_extern_let(
     let remote_args: Vec<ir::Expr> = params.iter().map(|p| ir::Expr::Var(p.clone())).collect();
     let call = ir::Expr::RemoteCall(module.clone(), function.clone(), remote_args);
 
-    // Wrap the remote call in curried funs for arity > 0
-    let body = if params.is_empty() {
+    // Wrap the remote call in curried funs for arity > 1
+    let body = if params.len() <= 1 {
         call
     } else {
         params[1..]
@@ -117,16 +144,14 @@ fn lower_extern_let(
             .fold(call, |acc, p| ir::Expr::Fun(p.clone(), Box::new(acc)))
     };
 
-    let param = if params.is_empty() {
-        "_Unit".to_string()
-    } else {
-        params[0].clone()
-    };
+    // param: None for 0-arity, Some(first_arg) for arity >= 1
+    let param = params.into_iter().next().map(Some).unwrap_or(None);
 
     ir::Function {
         name: name.to_string(),
         param,
         body,
+        is_pub: false, // caller sets this
     }
 }
 
@@ -189,9 +214,13 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
         ast::Expr::Call { func, args, .. } => lower_call(func, args, ctx),
 
         ast::Expr::FieldAccess { field, record, .. } => {
-            // Emitted as a call to a generated accessor — handled via constructor_schemes
-            // For now emit a placeholder call that will fail at runtime if reached
-            ir::Expr::LocalCall(format!("field_{field}"), Box::new(lower_expr(record, ctx)))
+            // Emit erlang:element(N, Record) where N is the 1-based field index.
+            let idx = ctx.field_indices.get(field.as_str()).copied().unwrap_or(2);
+            ir::Expr::RemoteCall(
+                "erlang".into(),
+                "element".into(),
+                vec![ir::Expr::Int(idx as i64), lower_expr(record, ctx)],
+            )
         }
 
         ast::Expr::RecordConstruct { name, fields, .. } => {
@@ -203,11 +232,20 @@ fn lower_expr(expr: &ast::Expr, ctx: &Ctx) -> ir::Expr {
             ir::Expr::Tuple(items)
         }
 
-        ast::Expr::QualifiedCall { module, function, args, .. } => {
-            let erl_module = ctx.module_aliases.get(module.as_str()).cloned().unwrap_or_else(|| module.clone());
+        ast::Expr::QualifiedCall {
+            module,
+            function,
+            args,
+            ..
+        } => {
+            let erl_module = ctx
+                .module_aliases
+                .get(module.as_str())
+                .cloned()
+                .unwrap_or_else(|| module.clone());
             if args.is_empty() {
-                // 0-arg: call with unit
-                ir::Expr::RemoteCall(erl_module, function.clone(), vec![ir::Expr::Atom("unit".into())])
+                // 0-arg: true Erlang 0-arity call
+                ir::Expr::RemoteCall(erl_module, function.clone(), vec![])
             } else {
                 // First arg goes into the remote call, rest chain as curried calls
                 let first = lower_expr(&args[0], ctx);
@@ -257,7 +295,7 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
         if let Some(module) = ctx.imports.get(name.as_str()) {
             let module = module.clone();
             if args.is_empty() {
-                return ir::Expr::RemoteCall(module, name.clone(), vec![ir::Expr::Atom("unit".into())]);
+                return ir::Expr::RemoteCall(module, name.clone(), vec![]);
             }
             let first = lower_expr(&args[0], ctx);
             let mut result = ir::Expr::RemoteCall(module, name.clone(), vec![first]);
@@ -426,16 +464,31 @@ fn unary_op(name: &str) -> Option<&'static str> {
 
 // ─── Emitter: IR → Erlang source ────────────────────────────────────────────
 
+/// Quote an Erlang atom if it doesn't match `[a-z][a-zA-Z0-9_]*`.
+fn quote_atom(name: &str) -> String {
+    let needs_quoting = name.starts_with(|c: char| !c.is_lowercase())
+        || name.chars().any(|c| !c.is_alphanumeric() && c != '_');
+    if needs_quoting {
+        format!("'{name}'")
+    } else {
+        name.to_string()
+    }
+}
+
 pub fn emit_module(module: &ir::Module) -> String {
     let mut out = String::new();
 
     out.push_str(&format!("-module({}).\n", module.name));
 
-    // Export all functions as arity 1 (curried), main is always exported
+    // Export all functions with their actual arity (0 or 1).
+    // Opal privacy is enforced by the import system, not Erlang exports.
     let exports: Vec<String> = module
         .functions
         .iter()
-        .map(|f| format!("{}/1", f.name))
+        .map(|f| {
+            let arity = if f.param.is_some() { 1 } else { 0 };
+            format!("{}/{arity}", quote_atom(&f.name))
+        })
         .collect();
     out.push_str(&format!("-export([{}]).\n\n", exports.join(", ")));
 
@@ -448,12 +501,18 @@ pub fn emit_module(module: &ir::Module) -> String {
 }
 
 fn emit_function(func: &ir::Function) -> String {
-    format!(
-        "{}({}) ->\n    {}.\n",
-        func.name,
-        func.param,
-        emit_expr(&func.body)
-    )
+    match &func.param {
+        None => format!(
+            "{}() ->\n    {}.\n",
+            quote_atom(&func.name),
+            emit_expr(&func.body)
+        ),
+        Some(param) => format!(
+            "{}({param}) ->\n    {}.\n",
+            quote_atom(&func.name),
+            emit_expr(&func.body)
+        ),
+    }
 }
 
 fn emit_expr(expr: &ir::Expr) -> String {
@@ -463,8 +522,8 @@ fn emit_expr(expr: &ir::Expr) -> String {
         ir::Expr::Float(f) => format!("{f}"),
         ir::Expr::Str(s) => format!("<<\"{}\"/utf8>>", escape_str(s)),
         ir::Expr::Var(s) => s.clone(),
-        ir::Expr::FunRef(name) => format!("fun {name}/1"),
-        ir::Expr::RemoteFunRef(module, name) => format!("fun {module}:{name}/1"),
+        ir::Expr::FunRef(name) => format!("fun {}/1", quote_atom(name)),
+        ir::Expr::RemoteFunRef(module, name) => format!("fun {module}:{}/1", quote_atom(name)),
 
         ir::Expr::Tuple(items) => {
             format!(
@@ -503,7 +562,7 @@ fn emit_expr(expr: &ir::Expr) -> String {
         }
 
         ir::Expr::LocalCall(name, arg) => {
-            format!("{name}({})", emit_expr(arg))
+            format!("{}({})", quote_atom(name), emit_expr(arg))
         }
 
         ir::Expr::RemoteCall(module, function, args) => {

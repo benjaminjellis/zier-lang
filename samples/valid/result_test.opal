@@ -2,7 +2,8 @@
 
 (type ['e 'a] Result (
   (Ok ~ 'a)
-  (Error ~ 'e)))
+  (Error ~ 'e)
+))
 
 (let safe_div {a b}
   (if (= b 0)
@@ -11,7 +12,7 @@
 
 (let show_result {r}
   (match r
-    (Ok _)    ~> (println "ok~n")
+    (Ok _) ~> (println "ok~n")
     (Error _) ~> (println "error~n")))
 
 (let main {}

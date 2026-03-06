@@ -33,10 +33,10 @@ pub(crate) fn create_new_project(name: String, root: &Path, lib: bool) -> eyre::
     Ok(())
 }
 
-const OPAL_HELLO_WORLD: &str = r#"(extern let println ~ (String -> Unit) io/format)
+const OPAL_HELLO_WORLD: &str = r#"(use std)
 
 (let main {}
-  (println "hello world~n"))
+  (io/println "hello world~n"))
 "#;
 
 const OPAL_LIB: &str = r#"(pub extern let println ~ (String -> Unit) io/format)"#;

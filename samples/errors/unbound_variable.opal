@@ -1,3 +1,2 @@
 ;; Error: `result` is never defined
-(let double {x}
- (result (* 2 x)))
+(let double {x} (result (* 2 x)))

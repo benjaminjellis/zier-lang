@@ -1,5 +1,3 @@
-(let add {a b}
-  (+ a b))
+(let add {a b} (+ a b))
 
-(let main {}
-  (add 3 4))
+(let main {} (add 3 4))

@@ -7,12 +7,14 @@ pub struct Module {
     pub functions: Vec<Function>,
 }
 
-/// A top-level Erlang function with a single parameter (curried).
+/// A top-level Erlang function. `param` is `None` for 0-arity extern functions.
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
-    pub param: String,
+    pub param: Option<String>,
     pub body: Expr,
+    /// Only pub Opal functions appear in the Erlang `-export` list.
+    pub is_pub: bool,
 }
 
 #[derive(Debug, Clone)]

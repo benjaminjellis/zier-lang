@@ -15,7 +15,7 @@ pub enum SExpr {
 }
 
 impl SExpr {
-    pub(crate) fn span(&self) -> Range<usize> {
+    pub fn span(&self) -> Range<usize> {
         match self {
             SExpr::Atom(t) => t.span.clone(),
             SExpr::Round(_, s) => s.clone(),
@@ -71,6 +71,12 @@ enum SExprType {
 
 impl SExprParser {
     pub fn new(tokens: Vec<Token>, file_id: usize) -> Self {
+        // Strip comments — they are preserved in the raw token stream for
+        // tooling (e.g. the formatter) but are invisible to the parser.
+        let tokens = tokens
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Comment)
+            .collect();
         Self {
             tokens,
             pos: 0,

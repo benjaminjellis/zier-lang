@@ -1,0 +1,7 @@
+[package]
+name = "opal-format"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+opalc = { path = "../opalc" }

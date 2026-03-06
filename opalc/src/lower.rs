@@ -39,16 +39,8 @@ impl Lowerer {
         items: &[SExpr],
         span: Range<usize>,
         is_pub: bool,
-        is_opaque: bool,
     ) -> Option<TypeDecl> {
-        // items[0] is either `type` or `opaque` — skip to find `type` then the rest
-        let mut cursor = 1; // Skip the leading keyword (type or opaque)
-        // If items[0] is `opaque`, items[1] must be `type` — skip it too
-        if let Some(SExpr::Atom(t)) = items.first()
-            && matches!(t.kind, TokenKind::Opaque)
-        {
-            cursor = 2; // skip both `opaque` and `type`
-        }
+        let mut cursor = 1; // Skip the leading `type` keyword
 
         // 1. Parse optional generics: ['t] or ['e 'a]
         let mut params = Vec::new();
@@ -153,27 +145,17 @@ impl Lowerer {
                             );
                             return None;
                         }
-                        let Some(SExpr::Atom(type_token)) = field_items.get(2) else {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("expected type name after `~`")
-                                    .with_labels(vec![Label::primary(file_id, field_span.clone())])
-                                    .with_notes(vec!["example: `(:x ~ Int)`".into()]),
-                            );
-                            return None;
-                        };
-                        let type_str = self.source_at(file_id, type_token.span.clone()).to_string();
-                        let type_usage = match type_token.kind {
-                            TokenKind::Generic => TypeUsage::Generic(type_str),
-                            _ => TypeUsage::Named(type_str),
-                        };
+                        let type_usage = self.lower_type_usage_atoms(
+                            file_id,
+                            &field_items[2..],
+                            field_span.clone(),
+                        )?;
                         fields.push((field_name.clone(), type_usage));
                     }
                 }
             }
             Some(TypeDecl::Record {
                 is_pub,
-                is_opaque,
                 name,
                 params,
                 fields,
@@ -195,12 +177,12 @@ impl Lowerer {
             };
             for item in body_items {
                 match item {
-                    // Case: (Some ~ 'a) or (Error ~ 'e)
+                    // Case: (Some ~ 'a) or (Error ~ 'e) or (Wrap ~ Map 'k 'v)
                     SExpr::Round(inner, inner_span) => {
-                        // Expect exactly: (ConstructorName ~ TypeName)
-                        let (name_token, tilde_token, type_token) =
-                            match (inner.first(), inner.get(1), inner.get(2)) {
-                                (Some(n), Some(t), Some(ty)) => (n, t, ty),
+                        // Expect: (ConstructorName ~ Type [TypeArgs...])
+                        let (name_token, tilde_token) =
+                            match (inner.first(), inner.get(1)) {
+                                (Some(n), Some(t)) if inner.len() >= 3 => (n, t),
                                 _ => {
                                     self.error(
                                         Diagnostic::error()
@@ -249,19 +231,11 @@ impl Lowerer {
                             return None;
                         }
 
-                        let SExpr::Atom(type_tok) = type_token else {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("expected a type name after '~'")
-                                    .with_labels(vec![Label::primary(file_id, type_token.span())]),
-                            );
-                            return None;
-                        };
-                        let type_str = self.source_at(file_id, type_tok.span.clone()).to_string();
-                        let type_usage = match type_tok.kind {
-                            TokenKind::Generic => TypeUsage::Generic(type_str),
-                            _ => TypeUsage::Named(type_str),
-                        };
+                        let type_usage = self.lower_type_usage_atoms(
+                            file_id,
+                            &inner[2..],
+                            inner_span.clone(),
+                        )?;
                         constructors.push((c_name, Some(type_usage)));
                     }
                     // Case: None — nullary constructor (no payload)
@@ -298,7 +272,6 @@ impl Lowerer {
             }
             Some(TypeDecl::Variant {
                 is_pub,
-                is_opaque,
                 name,
                 params,
                 constructors,
@@ -332,19 +305,6 @@ impl Lowerer {
                                     effective_items,
                                     span.clone(),
                                     is_pub,
-                                    false,
-                                ) {
-                                    lowered_declarations.push(Declaration::Type(t));
-                                }
-                            }
-                            TokenKind::Opaque => {
-                                // (pub opaque type [...] Name (...))
-                                if let Some(t) = self.lower_type_decl(
-                                    file_id,
-                                    effective_items,
-                                    span.clone(),
-                                    is_pub,
-                                    true,
                                 ) {
                                     lowered_declarations.push(Declaration::Type(t));
                                 }
@@ -459,6 +419,7 @@ impl Lowerer {
                 module: module.clone(),
                 function: function.clone(),
                 args: vec![],
+                fn_span: token.span.clone(),
                 span: token.span.clone(),
             }),
 
@@ -568,11 +529,18 @@ impl Lowerer {
                         TokenKind::QualifiedIdent((module, function)) => {
                             let module = module.clone();
                             let function = function.clone();
+                            let fn_span = token.span.clone();
                             let args = items[1..]
                                 .iter()
                                 .map(|s| self.lower_expr(file_id, s))
                                 .collect::<Option<Vec<_>>>()?;
-                            return Some(Expr::QualifiedCall { module, function, args, span: span.clone() });
+                            return Some(Expr::QualifiedCall {
+                                module,
+                                function,
+                                args,
+                                span: span.clone(),
+                                fn_span,
+                            });
                         }
                         _ => {} // Fall through to function call
                     }
@@ -802,6 +770,61 @@ impl Lowerer {
         Some(Expr::RecordConstruct { name, fields, span })
     }
 
+    /// Parse a flat sequence of atoms as a `TypeUsage`.
+    ///   - 1 atom  → `Named("Int")` or `Generic("'a")`
+    ///   - N atoms → `App("Option", [Generic("'a")])`, `App("Map", [Generic("'k"), Generic("'v")])`
+    fn lower_type_usage_atoms(
+        &mut self,
+        file_id: usize,
+        atoms: &[SExpr],
+        err_span: std::ops::Range<usize>,
+    ) -> Option<TypeUsage> {
+        if atoms.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message("expected a type after `~`")
+                    .with_labels(vec![Label::primary(file_id, err_span)
+                        .with_message("expected a type name here")]),
+            );
+            return None;
+        }
+        let head_sexpr = &atoms[0];
+        let SExpr::Atom(head_tok) = head_sexpr else {
+            self.error(
+                Diagnostic::error()
+                    .with_message("expected a type constructor name")
+                    .with_labels(vec![Label::primary(file_id, head_sexpr.span())]),
+            );
+            return None;
+        };
+        let head_text = self.source_at(file_id, head_tok.span.clone()).to_string();
+        if atoms.len() == 1 {
+            return Some(match head_tok.kind {
+                TokenKind::Generic => TypeUsage::Generic(head_text),
+                _ => TypeUsage::Named(head_text),
+            });
+        }
+        // Multiple atoms: head is the constructor, rest are type arguments.
+        let mut args = Vec::new();
+        for arg_sexpr in &atoms[1..] {
+            let SExpr::Atom(arg_tok) = arg_sexpr else {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected a type argument")
+                        .with_labels(vec![Label::primary(file_id, arg_sexpr.span())
+                            .with_message("expected a type variable or type name")]),
+                );
+                return None;
+            };
+            let arg_text = self.source_at(file_id, arg_tok.span.clone()).to_string();
+            args.push(match arg_tok.kind {
+                TokenKind::Generic => TypeUsage::Generic(arg_text),
+                _ => TypeUsage::Named(arg_text),
+            });
+        }
+        Some(TypeUsage::App(head_text, args))
+    }
+
     /// Parse a type signature used inside `extern` declarations.
     /// Syntax: a single atom (Int, String, 'a, ...) or a parenthesised (A -> B -> C).
     fn lower_type_sig(&mut self, file_id: usize, sexpr: &SExpr) -> Option<TypeSig> {
@@ -825,25 +848,32 @@ impl Lowerer {
                 }
             }
             SExpr::Round(items, span) => {
-                // Parenthesised type: (A -> B -> C) parsed right-associatively.
-                // items is a flat list: [A, ->, B, ->, C]
+                // Parenthesised type: (A -> B -> C) parsed right-associatively,
+                // where each segment between `->` tokens may be a type application
+                // (e.g. `Map 'k 'v` is three consecutive atoms treated as App("Map", ['k,'v])).
                 if items.is_empty() {
                     return Some(TypeSig::Named("Unit".to_string()));
                 }
-                // Collect segments separated by ThinArrow
-                let mut segments: Vec<&SExpr> = Vec::new();
-                let mut cursor = 0;
-                while cursor < items.len() {
-                    if let SExpr::Atom(t) = &items[cursor]
+
+                // Group consecutive non-arrow items; each group becomes one TypeSig.
+                let mut groups: Vec<Vec<&SExpr>> = Vec::new();
+                let mut current: Vec<&SExpr> = Vec::new();
+                for item in items {
+                    if let SExpr::Atom(t) = item
                         && matches!(t.kind, TokenKind::ThinArrow)
                     {
-                        cursor += 1;
-                        continue;
+                        if !current.is_empty() {
+                            groups.push(std::mem::take(&mut current));
+                        }
+                    } else {
+                        current.push(item);
                     }
-                    segments.push(&items[cursor]);
-                    cursor += 1;
                 }
-                if segments.is_empty() {
+                if !current.is_empty() {
+                    groups.push(current);
+                }
+
+                if groups.is_empty() {
                     self.error(
                         Diagnostic::error()
                             .with_message("empty type signature")
@@ -851,11 +881,39 @@ impl Lowerer {
                     );
                     return None;
                 }
-                // Lower each segment, then fold right into Fun chain
-                let mut lowered: Vec<TypeSig> = segments
-                    .iter()
-                    .map(|s| self.lower_type_sig(file_id, s))
+
+                // Lower each group: single item → recurse; multiple items → type application.
+                let lower_group = |this: &mut Self, group: Vec<&SExpr>| -> Option<TypeSig> {
+                    if group.len() == 1 {
+                        this.lower_type_sig(file_id, group[0])
+                    } else {
+                        // First atom is the type constructor, rest are type arguments.
+                        let head = match group[0] {
+                            SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
+                                this.source_at(file_id, t.span.clone()).to_string()
+                            }
+                            other => {
+                                this.error(
+                                    Diagnostic::error()
+                                        .with_message("expected a type constructor name")
+                                        .with_labels(vec![Label::primary(file_id, other.span())]),
+                                );
+                                return None;
+                            }
+                        };
+                        let args: Vec<TypeSig> = group[1..]
+                            .iter()
+                            .map(|a| this.lower_type_sig(file_id, a))
+                            .collect::<Option<Vec<_>>>()?;
+                        Some(TypeSig::App(head, args))
+                    }
+                };
+
+                let mut lowered: Vec<TypeSig> = groups
+                    .into_iter()
+                    .map(|g| lower_group(self, g))
                     .collect::<Option<Vec<_>>>()?;
+
                 let last = lowered.pop().unwrap();
                 Some(
                     lowered
@@ -885,7 +943,7 @@ impl Lowerer {
     ) -> Option<Declaration> {
         match items.get(1) {
             Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::Let) => {
-                self.lower_extern_let(file_id, items, span)
+                self.lower_extern_let(file_id, items, span, is_pub)
             }
             Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::Type) => {
                 self.lower_extern_type(file_id, items, span, is_pub)
@@ -916,6 +974,7 @@ impl Lowerer {
         file_id: usize,
         items: &[SExpr],
         span: Range<usize>,
+        is_pub: bool,
     ) -> Option<Declaration> {
         // items[0]=extern, items[1]=let, items[2]=name, then either:
         //   nullary: items[3]={}, items[4]=~, items[5]=ReturnType, items[6]=target  (len=7)
@@ -1003,6 +1062,7 @@ impl Lowerer {
 
         Some(Declaration::ExternLet {
             name,
+            is_pub,
             is_nullary,
             ty,
             erlang_target,
@@ -1508,8 +1568,10 @@ impl Lowerer {
                         other => {
                             let mut diag = Diagnostic::error()
                                 .with_message("expected identifier in let-binding name position")
-                                .with_labels(vec![Label::primary(file_id, other.span())
-                                    .with_message("this is not a valid binding name")]);
+                                .with_labels(vec![
+                                    Label::primary(file_id, other.span())
+                                        .with_message("this is not a valid binding name"),
+                                ]);
                             if matches!(other, SExpr::Round(..)) {
                                 diag = diag.with_notes(vec![
                                     "hint: each binding is `name value` — the value must be a single expression; wrap multiple tokens in parentheses".into(),
