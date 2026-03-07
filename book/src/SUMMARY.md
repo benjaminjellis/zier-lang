@@ -1,4 +1,18 @@
 # Summary
 
-- [The Opal Programming Language](./the_opal_programming_languge.md)
+[The Opal Programming Language](./the_opal_programming_languge.md)
+- [Getting Started](./getting_started.md)
+  - [Installation](./installation.md)
+  - [Loupe](./loupe.md)
+- [Language Tour](./language_tour.md)
+  - [Primitive Types](./primitive_types.md)
+  - [Functions](./functions.md)
+  - [Local Bindings](./local_bindings.md)
+  - [Types](./types.md)
+  - [List](./lists.md)
+  - [If / Else](./if_else.md)
+  - [Match](./match.md)
+  - [Imports](./imports.md)
+- [The Standard Library](./the_standard_library.md)
+- [Erlang FFI](./erlang_ffi.md)
 

@@ -999,6 +999,26 @@ impl TypeChecker {
                 Declaration::ExternType { .. } | Declaration::Use { .. } => {
                     // Not yet handled by the typechecker.
                 }
+                Declaration::Test { name, body, span } => {
+                    // Result is ['e 'a] — error first, ok second
+                    // test bodies must return Result String Unit (Error=String, Ok=Unit)
+                    let expected = Rc::new(Type::Con(
+                        "Result".into(),
+                        vec![Type::string(), Type::unit()],
+                    ));
+                    match self.infer(env, body) {
+                        Ok((s, ty)) => {
+                            *env = apply_subst_env(&s, env);
+                            let ty = apply_subst(&s, &ty);
+                            if let Err(e) = unify(&ty, &expected) {
+                                return Err(Box::new((e, *body.clone())));
+                            }
+                            last_ty = ty;
+                        }
+                        Err(error) => return Err(Box::new((error, *body.clone()))),
+                    }
+                    let _ = (name, span); // used for discovery by loupe, not the typechecker
+                }
             }
         }
 

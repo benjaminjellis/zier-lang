@@ -80,6 +80,8 @@ pub enum TokenKind {
     Extern,
     #[token("use")]
     Use,
+    #[token("test")]
+    Test,
     #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
     NamedField(String),
 
@@ -148,6 +150,7 @@ impl TokenKind {
             TokenKind::ThinArrow => "arrow '->'",
             TokenKind::Extern => "keyword 'extern'",
             TokenKind::Use => "keyword 'use'",
+            TokenKind::Test => "keyword 'test'",
             TokenKind::NamedField(_) => "field name (e.g. :name)",
             TokenKind::Float(_) => "float literal",
             TokenKind::Int(_) => "integer literal",

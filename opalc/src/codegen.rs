@@ -68,6 +68,7 @@ pub fn lower_module(
 
     // Pass 2: lower declarations to IR functions
     let mut functions = Vec::new();
+    let mut test_idx: usize = 0;
 
     for decl in decls {
         match decl {
@@ -93,6 +94,16 @@ pub fn lower_module(
                 let mut f = lower_extern_let(name, *is_nullary, ty, erlang_target);
                 f.is_pub = *is_pub;
                 functions.push(f);
+            }
+            ast::Declaration::Test { body, .. } => {
+                let body_ir = lower_expr(body, &ctx);
+                functions.push(ir::Function {
+                    name: format!("opal_test_{test_idx}"),
+                    param: Some("_Unit".to_string()),
+                    body: body_ir,
+                    is_pub: true,
+                });
+                test_idx += 1;
             }
             _ => {} // Type decls, Use, ExternType produce no Erlang functions
         }

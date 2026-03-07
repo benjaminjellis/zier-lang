@@ -18,6 +18,7 @@ pub fn compile(module_name: &str, source: &str) -> Option<String> {
     compile_with_imports(
         module_name,
         source,
+        &format!("{module_name}.opal"),
         HashMap::new(),
         &HashMap::new(),
         HashMap::new(),
@@ -34,6 +35,7 @@ pub fn compile(module_name: &str, source: &str) -> Option<String> {
 pub fn compile_with_imports(
     module_name: &str,
     source: &str,
+    source_path: &str,
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     module_aliases: HashMap<String, String>,
@@ -45,8 +47,7 @@ pub fn compile_with_imports(
     let writer = StandardStream::stderr(ColorChoice::Always);
     let config = codespan_reporting::term::Config::default();
 
-    let file_name = format!("{module_name}.opal");
-    let file_id = lowerer.add_file(file_name, source.to_string());
+    let file_id = lowerer.add_file(source_path.to_string(), source.to_string());
 
     let sexprs = match crate::sexpr::SExprParser::new(tokens, file_id).parse() {
         Ok(res) => res,
@@ -345,6 +346,33 @@ pub fn infer_module_exports(
 
     env.into_iter()
         .filter(|(k, _)| pub_names.contains(k.as_str()))
+        .collect()
+}
+
+/// Extract test declarations from a test source file.
+/// Returns `(display_name, erlang_fn_name)` pairs in declaration order.
+/// The erlang_fn_name matches what codegen emits: `opal_test_0`, `opal_test_1`, ...
+pub fn test_declarations(source: &str) -> Vec<(String, String)> {
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(source).lex();
+    // Use a tests/ path so the lowerer accepts `test` declarations
+    let file_id = lowerer.add_file("tests/scan.opal".into(), source.into());
+    let Ok(sexprs) = crate::sexpr::SExprParser::new(tokens, file_id).parse() else {
+        return vec![];
+    };
+    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut test_idx = 0;
+    decls
+        .into_iter()
+        .filter_map(|d| {
+            if let ast::Declaration::Test { name, .. } = d {
+                let fn_name = format!("opal_test_{test_idx}");
+                test_idx += 1;
+                Some((name, fn_name))
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
