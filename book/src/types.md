@@ -1,7 +1,7 @@
 # Types
-If you've ever written Clojure code before a lot of what we have covered so far will be ver familiar but this section might not be. Unlike Clojure (which heavily inspired `Opal`'s design) 'Opal' is statically typed.
+If you've ever written Clojure code before a lot of what we have covered so far will be ver familiar but this section might not be. Unlike Clojure (which heavily inspired `Opal`'s design) `Opal` is statically typed.
 
-There are two classes of types that you can express:
+There are two forms of types that you can express:
 
 ## Sum / Variant Types
 

@@ -7,6 +7,8 @@ use crate::{ast, ir};
 struct Ctx {
     /// Names of all top-level functions (used to distinguish fn-refs from local vars)
     fn_names: HashSet<String>,
+    /// Top-level function name → number of Opal args (for multi-arg TCO)
+    fn_arities: HashMap<String, usize>,
     /// Constructor name → arity (0 = nullary atom, 1+ = tuple)
     constructors: HashMap<String, usize>,
     /// Imported function name → Erlang module (from `use` declarations)
@@ -27,15 +29,17 @@ pub fn lower_module(
     imported_constructors: HashMap<String, usize>,
     imported_field_indices: HashMap<String, usize>,
 ) -> ir::Module {
-    // Pass 1: collect function names, constructor arities, and record field indices
+    // Pass 1: collect function names, arities, constructor arities, and record field indices
     let mut fn_names = HashSet::new();
+    let mut fn_arities = HashMap::new();
     let mut constructors = imported_constructors;
     let mut field_indices = imported_field_indices;
 
     for decl in decls {
         match decl {
-            ast::Declaration::Expression(ast::Expr::LetFunc { name, .. }) => {
+            ast::Declaration::Expression(ast::Expr::LetFunc { name, args, .. }) => {
                 fn_names.insert(name.clone());
+                fn_arities.insert(name.clone(), args.len());
             }
             ast::Declaration::ExternLet { name, .. } => {
                 fn_names.insert(name.clone());
@@ -60,6 +64,7 @@ pub fn lower_module(
 
     let ctx = Ctx {
         fn_names,
+        fn_arities,
         constructors,
         imports,
         module_aliases,
@@ -79,9 +84,32 @@ pub fn lower_module(
                 is_pub,
                 ..
             }) => {
-                let mut f = lower_letfunc(name, args, value, &ctx);
-                f.is_pub = *is_pub;
-                functions.push(f);
+                if args.len() >= 2 {
+                    // Curried entry: f(A) -> fun(B) -> ... f(A, B, ...) end ... end.
+                    let all_vars: Vec<ir::Expr> =
+                        args.iter().map(|a| ir::Expr::Var(var_name(a))).collect();
+                    let direct = ir::Expr::LocalCallMulti(name.clone(), all_vars);
+                    let curried_body = args[1..].iter().rev().fold(direct, |acc, arg| {
+                        ir::Expr::Fun(var_name(arg), Box::new(acc))
+                    });
+                    functions.push(ir::Function {
+                        name: name.clone(),
+                        params: vec![var_name(&args[0])],
+                        body: curried_body,
+                        is_pub: *is_pub,
+                    });
+                    // Multi-arg impl: f(A, B, ...) -> body.  Self-recursive calls target this.
+                    functions.push(ir::Function {
+                        name: name.clone(),
+                        params: args.iter().map(|a| var_name(a)).collect(),
+                        body: lower_expr(value, &ctx),
+                        is_pub: false,
+                    });
+                } else {
+                    let mut f = lower_letfunc(name, args, value, &ctx);
+                    f.is_pub = *is_pub;
+                    functions.push(f);
+                }
             }
             ast::Declaration::ExternLet {
                 name,
@@ -96,11 +124,10 @@ pub fn lower_module(
                 functions.push(f);
             }
             ast::Declaration::Test { body, .. } => {
-                let body_ir = lower_expr(body, &ctx);
                 functions.push(ir::Function {
                     name: format!("opal_test_{test_idx}"),
-                    param: Some("_Unit".to_string()),
-                    body: body_ir,
+                    params: vec!["_Unit".to_string()],
+                    body: lower_expr(body, &ctx),
                     is_pub: true,
                 });
                 test_idx += 1;
@@ -117,18 +144,19 @@ pub fn lower_module(
 
 // ─── Function lowering ──────────────────────────────────────────────────────
 
+// Only called for 0-arg and 1-arg functions (N >= 2 handled inline in lower_module).
 fn lower_letfunc(name: &str, args: &[String], body: &ast::Expr, ctx: &Ctx) -> ir::Function {
     let body_ir = lower_expr(body, ctx);
-    let lambda = make_lambda(args, body_ir);
-    // Destructure the outermost Fun to get the function's param and body
-    match lambda {
-        ir::Expr::Fun(param, inner) => ir::Function {
-            name: name.to_string(),
-            param: Some(param),
-            body: *inner,
-            is_pub: false, // caller sets this
-        },
-        _ => unreachable!(),
+    let param = if args.is_empty() {
+        "_Unit".to_string()
+    } else {
+        var_name(&args[0])
+    };
+    ir::Function {
+        name: name.to_string(),
+        params: vec![param],
+        body: body_ir,
+        is_pub: false, // caller sets this
     }
 }
 
@@ -155,12 +183,11 @@ fn lower_extern_let(
             .fold(call, |acc, p| ir::Expr::Fun(p.clone(), Box::new(acc)))
     };
 
-    // param: None for 0-arity, Some(first_arg) for arity >= 1
-    let param = params.into_iter().next().map(Some).unwrap_or(None);
+    let erlang_params = params.into_iter().take(1).collect();
 
     ir::Function {
         name: name.to_string(),
-        param,
+        params: erlang_params,
         body,
         is_pub: false, // caller sets this
     }
@@ -322,6 +349,13 @@ fn lower_call(func: &ast::Expr, args: &[ast::Expr], ctx: &Ctx) -> ir::Expr {
                 // 0-arg call → call with unit
                 return ir::Expr::LocalCall(name.clone(), Box::new(ir::Expr::Atom("unit".into())));
             }
+            let opal_arity = ctx.fn_arities.get(name.as_str()).copied().unwrap_or(0);
+            // Full application of a multi-arg function → direct N-arity call (enables TCO)
+            if opal_arity >= 2 && args.len() == opal_arity {
+                let lowered = args.iter().map(|a| lower_expr(a, ctx)).collect();
+                return ir::Expr::LocalCallMulti(name.clone(), lowered);
+            }
+            // Partial application or single-arg — use curried form
             let first = lower_expr(&args[0], ctx);
             let mut result = ir::Expr::LocalCall(name.clone(), Box::new(first));
             for arg in &args[1..] {
@@ -498,15 +532,11 @@ pub fn emit_module(module: &ir::Module) -> String {
 
     out.push_str(&format!("-module({}).\n", module.name));
 
-    // Export all functions with their actual arity (0 or 1).
-    // Opal privacy is enforced by the import system, not Erlang exports.
+    // Export all functions. Opal privacy is enforced by the import system, not Erlang exports.
     let exports: Vec<String> = module
         .functions
         .iter()
-        .map(|f| {
-            let arity = if f.param.is_some() { 1 } else { 0 };
-            format!("{}/{arity}", quote_atom(&f.name))
-        })
+        .map(|f| format!("{}/{}", quote_atom(&f.name), f.params.len()))
         .collect();
     out.push_str(&format!("-export([{}]).\n\n", exports.join(", ")));
 
@@ -519,18 +549,12 @@ pub fn emit_module(module: &ir::Module) -> String {
 }
 
 fn emit_function(func: &ir::Function) -> String {
-    match &func.param {
-        None => format!(
-            "{}() ->\n    {}.\n",
-            quote_atom(&func.name),
-            emit_expr(&func.body)
-        ),
-        Some(param) => format!(
-            "{}({param}) ->\n    {}.\n",
-            quote_atom(&func.name),
-            emit_expr(&func.body)
-        ),
-    }
+    let params_s = func.params.join(", ");
+    format!(
+        "{}({params_s}) ->\n    {}.\n",
+        quote_atom(&func.name),
+        emit_expr(&func.body)
+    )
 }
 
 fn emit_expr(expr: &ir::Expr) -> String {
@@ -572,7 +596,9 @@ fn emit_expr(expr: &ir::Expr) -> String {
                 ir::Expr::Var(name) | ir::Expr::Atom(name) => format!("{name}({arg_s})"),
                 ir::Expr::FunRef(name) => format!("(fun {name}/1)({arg_s})"),
                 // Chained calls need parens around the inner call
-                ir::Expr::Call(_, _) | ir::Expr::LocalCall(_, _) => {
+                ir::Expr::Call(_, _)
+                | ir::Expr::LocalCall(_, _)
+                | ir::Expr::LocalCallMulti(_, _) => {
                     format!("({})({})", emit_expr(func), arg_s)
                 }
                 other => format!("({})({})", emit_expr(other), arg_s),
@@ -581,6 +607,11 @@ fn emit_expr(expr: &ir::Expr) -> String {
 
         ir::Expr::LocalCall(name, arg) => {
             format!("{}({})", quote_atom(name), emit_expr(arg))
+        }
+
+        ir::Expr::LocalCallMulti(name, args) => {
+            let args_s = args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
+            format!("{}({})", quote_atom(name), args_s)
         }
 
         ir::Expr::RemoteCall(module, function, args) => {
@@ -611,6 +642,55 @@ fn emit_expr(expr: &ir::Expr) -> String {
                 arms_s.join(";\n")
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_arg_tco_emits_two_functions() {
+        let src = r#"
+(let sum {acc n}
+  (if (= n 0)
+    acc
+    (sum (+ acc n) (- n 1))))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        // Curried entry: sum/1
+        assert!(erl.contains("sum(Acc) ->"), "missing curried entry:\n{erl}");
+        // Multi-arg impl: sum/2
+        assert!(erl.contains("sum(Acc, N) ->"), "missing multi-arg impl:\n{erl}");
+        // Self-recursive call uses sum/2 directly (not curried)
+        assert!(erl.contains("sum("), "missing recursive call:\n{erl}");
+        // Both arities exported
+        assert!(erl.contains("sum/1"), "sum/1 not exported:\n{erl}");
+        assert!(erl.contains("sum/2"), "sum/2 not exported:\n{erl}");
+    }
+
+    #[test]
+    fn single_arg_function_unchanged() {
+        let src = r#"
+(let double {x}
+  (* 2 x))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        // Only one function, no /2
+        assert!(erl.contains("double(X) ->"), "missing function:\n{erl}");
+        assert!(!erl.contains("double/2"), "unexpected double/2:\n{erl}");
+    }
+
+    #[test]
+    fn partial_application_uses_curried_entry() {
+        // (add 1) applied partially — must call add/1, not add/2
+        let src = r#"
+(let add {a b} (+ a b))
+(let inc {x} (add 1 x))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        // inc calls add with both args → LocalCallMulti → add(1, X)
+        assert!(erl.contains("add(1, X)") || erl.contains("add(1,X)"), "expected add(1, X):\n{erl}");
     }
 }
 

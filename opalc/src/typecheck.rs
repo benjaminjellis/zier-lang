@@ -129,7 +129,11 @@ impl TypeError {
                 let found_s = type_display_inner(found, &mut var_names);
                 let mut notes = vec![format!("expected `{expected_s}`, found `{found_s}`")];
                 // Helpful hints for common mismatches
-                if *expected == Type::float() && *found == Type::int() {
+                if *expected == Type::unit() && matches!(found.as_ref(), Type::Fun(..)) {
+                    notes.push(
+                        "hint: `Unit` is not a function — if you meant to sequence two expressions, use `(do expr1 expr2)`".into(),
+                    );
+                } else if *expected == Type::float() && *found == Type::int() {
                     notes.push(
                         "hint: integer literals like `1` have type `Int`; write `1.0` for a `Float`".into(),
                     );

@@ -1,21 +1,7 @@
 # Imports
+As your project gets bigger than on file you can add modules. Currently `Opal` and `Loupe` only support a flat layout, that is all files are in `src`, you cannot use nested directors like `src/moudle_a/file_a.opal`
 
-`(use std)` brings in the standard library and it's modules and lets you call functions as `module/function`:
+But a file like `src/file_a.opal` can be imported into `src/main.opal` with the `use` key word.
 
-```
-(use std)
 
-(let main {}
-  (io/println "hello")
-  (io/println (string/to_upper "hello")))
-```
-
-`(use std/io)` imports a single module and brings its public functions into scope unqualified:
-
-```
-(use std/io)
-
-(let main {}
-  (println "hello"))
-```
 

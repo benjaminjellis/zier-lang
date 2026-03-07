@@ -517,7 +517,7 @@ impl Lowerer {
             }
 
             // Catch keywords that wandered into the wrong place
-            TokenKind::Let | TokenKind::If | TokenKind::Match => {
+            TokenKind::Let | TokenKind::If | TokenKind::Match | TokenKind::Do => {
                 self.error(Diagnostic {
                     severity: Severity::Error,
                     code: Some("E003".to_string()),
@@ -586,6 +586,7 @@ impl Lowerer {
                         }
                         TokenKind::If => return self.lower_if(file_id, items, span.clone()),
                         TokenKind::Match => return self.lower_match(file_id, items, span.clone()),
+                        TokenKind::Do => return self.lower_do(file_id, items, span.clone()),
                         TokenKind::NamedField(_) => {
                             return self.lower_field_access(file_id, items, span.clone());
                         }
@@ -1429,6 +1430,31 @@ impl Lowerer {
             let body = self.lower_expr(file_id, result_sexpr)?;
             cursor += 1;
 
+            // Check for the common mistake of writing multiple expressions in a match arm
+            // without `do`. The next item is a Round (call expression) but there's no `~>`
+            // n_targets positions after it, meaning it can't be a pattern-arrow pair.
+            if let Some(next) = items.get(cursor) {
+                if matches!(next, SExpr::Round(..)) {
+                    let next_has_arrow = items
+                        .get(cursor + n_targets)
+                        .map(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Arrow)))
+                        .unwrap_or(false);
+                    if !next_has_arrow {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message(
+                                    "match arm has multiple expressions — use `do` to sequence them",
+                                )
+                                .with_labels(vec![Label::primary(file_id, next.span())])
+                                .with_notes(vec![
+                                    "help: wrap the expressions in `do`: `pat ~> (do expr1 expr2 ...)`".to_string(),
+                                ]),
+                        );
+                        return None;
+                    }
+                }
+            }
+
             arms.push((arm_patterns, body));
         }
 
@@ -1601,6 +1627,40 @@ impl Lowerer {
             els: Box::new(els),
             span,
         })
+    }
+
+    fn lower_do(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
+        // (do e1 e2 ... eN) — must have at least one expression after `do`
+        let exprs = &items[1..];
+        if exprs.is_empty() {
+            self.error(Diagnostic {
+                severity: Severity::Error,
+                code: Some("E003".to_string()),
+                message: "`do` requires at least one expression".to_string(),
+                labels: vec![Label {
+                    style: LabelStyle::Primary,
+                    file_id,
+                    range: span,
+                    message: "".to_string(),
+                }],
+                notes: vec![],
+            });
+            return None;
+        }
+        let mut lowered: Vec<Expr> = exprs
+            .iter()
+            .map(|s| self.lower_expr(file_id, s))
+            .collect::<Option<Vec<_>>>()?;
+        // Fold all but the last into LetLocal "_" bindings
+        let last = lowered.pop().unwrap();
+        Some(lowered.into_iter().rev().fold(last, |body, expr| {
+            Expr::LetLocal {
+                name: "_".to_string(),
+                value: Box::new(expr),
+                body: Box::new(body),
+                span: span.clone(),
+            }
+        }))
     }
 
     pub fn lower_let(
@@ -2394,6 +2454,60 @@ mod tests {
         } else {
             panic!("expected Match");
         }
+    }
+
+    #[test]
+    fn test_do_sequences_expressions() {
+        let src = "(let f {} (do (g 1) (h 2) (i 3)))";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Declaration::Expression(Expr::LetFunc { value, .. }) = &decls[0] {
+            // (do e1 e2 e3) ~> LetLocal("_", e1, LetLocal("_", e2, e3))
+            assert!(matches!(value.as_ref(), Expr::LetLocal { name, .. } if name == "_"));
+        } else {
+            panic!("expected LetFunc");
+        }
+    }
+
+    #[test]
+    fn test_do_single_expr_is_identity() {
+        let src = "(let f {} (do (g 1)))";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Declaration::Expression(Expr::LetFunc { value, .. }) = &decls[0] {
+            // (do e) ~> e — no wrapping
+            assert!(!matches!(value.as_ref(), Expr::LetLocal { .. }));
+        } else {
+            panic!("expected LetFunc");
+        }
+    }
+
+    #[test]
+    fn test_do_empty_is_error() {
+        let src = "(let f {} (do))";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        lowerer.lower_file(file_id, &sexprs);
+        assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_match_arm_multi_expr_suggests_do() {
+        // Two call expressions in a match arm without `do` should produce an error
+        // with a hint to use `do`.
+        let src = "(let f {x} (match x _ ~> (g x) (h x)))";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        lowerer.lower_file(file_id, &sexprs);
+        assert!(
+            !lowerer.diagnostics.is_empty(),
+            "expected an error for multi-expr match arm"
+        );
+        assert!(
+            lowerer.diagnostics[0].message.contains("do"),
+            "error should mention `do`: {}",
+            lowerer.diagnostics[0].message
+        );
     }
 
     #[test]

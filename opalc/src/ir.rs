@@ -1,5 +1,4 @@
 /// Erlang IR — a simplified Erlang AST we emit to `.erl` source.
-/// All Opal functions are fully curried: every function takes exactly one param.
 
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -7,13 +6,12 @@ pub struct Module {
     pub functions: Vec<Function>,
 }
 
-/// A top-level Erlang function. `param` is `None` for 0-arity extern functions.
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
-    pub param: Option<String>,
+    /// Erlang parameter list. Empty = 0-arity, one entry = normal, N entries = multi-arg impl.
+    pub params: Vec<String>,
     pub body: Expr,
-    /// Only pub Opal functions appear in the Erlang `-export` list.
     pub is_pub: bool,
 }
 
@@ -41,6 +39,8 @@ pub enum Expr {
     Call(Box<Expr>, Box<Expr>),
     /// `name(Arg)` — known local function call (avoids fun-ref wrapping)
     LocalCall(String, Box<Expr>),
+    /// `name(Arg0, Arg1, ...)` — direct N-arity call for TCO on multi-arg functions
+    LocalCallMulti(String, Vec<Expr>),
     /// `module:function(arg1, arg2, ...)` — remote (FFI) call
     RemoteCall(String, String, Vec<Expr>),
     /// `Left op Right` — binary operator

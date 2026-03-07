@@ -14,7 +14,7 @@ loupe run
 
 And you should see "Hello World" printed to stdout
 
-If you look in src/main.opal, you'll see this:
+If you look in `src/main.opal`, you'll see this:
 
 ```
 (use std)
@@ -23,4 +23,4 @@ If you look in src/main.opal, you'll see this:
   (io/println "Hello, world!"))
 ```
 
-In the next section we'll go the language and clarify what all of this means
+In the next section we'll go through the language and see what all of this means

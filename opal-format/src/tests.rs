@@ -291,6 +291,37 @@ fn extern_type_sig_flat() {
     assert_eq!(format(src, 100), format!("{src}\n"));
 }
 
+// ── do ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn do_single_inline() {
+    assert_eq!(fmt("(do (f x))"), "(do (f x))\n");
+}
+
+#[test]
+fn do_multi_breaks() {
+    let src = "(do (io/debug h) (iterate t))";
+    let out = fmt(src); // always breaks regardless of width
+    assert_eq!(out, "(do (io/debug h)\n    (iterate t))\n");
+}
+
+#[test]
+fn do_idempotent() {
+    let src = "(let f {x} (do (io/debug x) (io/println \"done\")))";
+    let out = format(src, 80);
+    let out2 = format(&out, 80);
+    assert_eq!(out, out2, "formatter is not idempotent on do");
+}
+
+#[test]
+fn do_in_match_arm() {
+    let src = r#"(let iterate {list} (match list [] ~> (io/println "empty") [h | t] ~> (do (io/debug h) (iterate t))))"#;
+    let out = format(src, 80);
+    let out2 = format(&out, 80);
+    assert_eq!(out, out2, "formatter is not idempotent");
+    assert!(out.contains("(do ("), "do should keep first expr inline");
+}
+
 #[test]
 fn extern_type_sig_idempotent() {
     let src = include_str!("../../opal-std/src/map.opal");

@@ -174,6 +174,7 @@ fn fmt_round(items: &[SExpr], source: &str) -> Doc {
             TokenKind::If => fmt_if(rest, source),
             TokenKind::Match => fmt_match(rest, source),
             TokenKind::Fn => fmt_fn(rest, source),
+            TokenKind::Do => fmt_do(rest, source),
             // use / extern — always stay on one line
             TokenKind::Use | TokenKind::Extern => fmt_inline(items, source),
             _ => fmt_generic(items, source),
@@ -395,6 +396,33 @@ fn fmt_fn(rest: &[SExpr], source: &str) -> Doc {
             text(")"),
         ])),
         _ => fmt_generic_with_head("fn", rest, source),
+    }
+}
+
+// ── do ────────────────────────────────────────────────────────────────────────
+
+fn fmt_do(rest: &[SExpr], source: &str) -> Doc {
+    match rest {
+        [] => text("(do)"),
+        [single] => group(concat_all([
+            text("(do "),
+            fmt(single, source),
+            text(")"),
+        ])),
+        [first, tail @ ..] => {
+            // Multiple expressions always break — `do` is for sequencing side
+            // effects and is never flat. First expr stays inline after `do`,
+            // subsequent ones align to the same column.
+            let tail_docs: Vec<Doc> = tail
+                .iter()
+                .map(|e| concat(hardline(), fmt(e, source)))
+                .collect();
+            concat_all([
+                text("(do "),
+                align(concat_all([fmt(first, source), concat_all(tail_docs)])),
+                text(")"),
+            ])
+        }
     }
 }
 
