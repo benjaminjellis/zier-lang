@@ -326,6 +326,13 @@ impl Lowerer {
                                     lowered_declarations.push(d);
                                 }
                             }
+                            TokenKind::Test => {
+                                if let Some(d) =
+                                    self.lower_test(file_id, effective_items, span.clone())
+                                {
+                                    lowered_declarations.push(d);
+                                }
+                            }
                             TokenKind::Let => {
                                 // At the top level, only function definitions are allowed.
                                 // (let [x 10] body) is a local binding — only valid inside a function.
@@ -385,6 +392,74 @@ impl Lowerer {
         }
 
         lowered_declarations
+    }
+
+    fn lower_test(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Option<Declaration> {
+        let file_name = self
+            .files
+            .get(file_id)
+            .expect("invalid file_id")
+            .name()
+            .clone();
+        let is_test_file =
+            file_name.contains("/tests/") || file_name.starts_with("tests/");
+
+        if !is_test_file {
+            self.error(
+                Diagnostic::error()
+                    .with_message("`test` declarations are only allowed in the `tests/` directory")
+                    .with_labels(vec![Label::primary(file_id, span)
+                        .with_message("move this to a file under `tests/`")]),
+            );
+            return None;
+        }
+
+        // items[0] = `test` keyword
+        // items[1] = string name literal
+        // items[2] = body expression
+        let name = match items.get(1) {
+            Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::String) => {
+                let raw = self.source_at(file_id, t.span.clone());
+                raw[1..raw.len() - 1].to_string()
+            }
+            _ => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected a string name after `test`")
+                        .with_labels(vec![Label::primary(file_id, items.get(0).map(|s| s.span()).unwrap_or(0..0))])
+                        .with_notes(vec!["example: `(test \"my test\" ...)`".into()]),
+                );
+                return None;
+            }
+        };
+
+        let body_sexpr = match items.get(2) {
+            Some(b) => b,
+            None => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("expected body expression after test name")
+                        .with_labels(vec![Label::primary(
+                            file_id,
+                            items.get(1).map(|s| s.span()).unwrap_or(0..0),
+                        )]),
+                );
+                return None;
+            }
+        };
+
+        let body = self.lower_expr(file_id, body_sexpr)?;
+
+        Some(Declaration::Test {
+            name,
+            body: Box::new(body),
+            span: items.get(0).map(|s| s.span()).unwrap_or(0..0),
+        })
     }
 
     fn source_at(&self, file_id: usize, span: Range<usize>) -> &str {

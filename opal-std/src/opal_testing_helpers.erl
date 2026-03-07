@@ -1,4 +1,4 @@
--module(opal_test_helpers).
+-module(opal_testing_helpers).
 -export([assert_eq/2, assert_ne/2]).
 
 assert_eq(A, A) ->

@@ -19,7 +19,7 @@
 (pub extern let uppercase ~ (String -> String) string/uppercase)
 
 ;; Splits String where SearchPattern is encountered and return the remaining parts.
-(pub extern let split ~ (String -> String -> (List String)) string/split)
+(pub extern let split ~ (String -> String -> (List String)) opal_string_helpers/split)
 
 ;; Concatenates String1 and String2 to form a new string String3, which is returned.
 (pub extern let concat ~ (String -> String -> String) opal_string_helpers/concat)

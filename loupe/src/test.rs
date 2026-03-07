@@ -71,7 +71,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
     // Compile each test file
     let mut had_error = false;
-    let mut test_fns_by_module: Vec<(String, Vec<String>)> = Vec::new();
+    // (module_name, Vec<(display_name, erlang_fn_name)>)
+    let mut test_fns_by_module: Vec<(String, Vec<(String, String)>)> = Vec::new();
 
     for (module_name, source) in &test_module_sources {
         let mut imports: HashMap<String, String> = HashMap::new();
@@ -132,6 +133,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         match opalc::compile_with_imports(
             module_name,
             source,
+            &format!("tests/{module_name}.opal"),
             imports,
             &all_exports,
             module_aliases,
@@ -148,18 +150,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             }
         }
 
-        // Discover test functions: exported names starting with "test_"
-        let test_fns: Vec<String> = test_module_exports
-            .get(module_name)
-            .map(|exports| {
-                exports
-                    .iter()
-                    .filter(|name| name.starts_with("test_"))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        // Discover test declarations from source
+        let test_fns = opalc::test_declarations(source);
         if !test_fns.is_empty() {
             test_fns_by_module.push((module_name.clone(), test_fns));
         }
@@ -231,6 +223,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         if let Some(erl_src) = opalc::compile_with_imports(
             erlang_name,
             source,
+            &format!("{erlang_name}.opal"),
             std_imports,
             &std_module_exports,
             std_aliases.clone(),
@@ -257,7 +250,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
     let total: usize = test_fns_by_module.iter().map(|(_, fns)| fns.len()).sum();
     if total == 0 {
-        println!("no test functions found (functions must be named test_*)");
+        println!("no test declarations found");
         return Ok(());
     }
 
@@ -288,8 +281,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     println!("running {total} test{}", if total == 1 { "" } else { "s" });
     let status = Command::new("erl")
         .arg("-noshell")
-        .arg("-noinput")
-        .arg("-pa")
+        .arg("-pz")
         .arg(&build_dir)
         .arg("-eval")
         .arg("opal_test_runner:run().")
@@ -302,15 +294,17 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn generate_runner(test_fns_by_module: &[(String, Vec<String>)]) -> String {
+fn generate_runner(test_fns_by_module: &[(String, Vec<(String, String)>)]) -> String {
     let mut tests_list = String::new();
     let mut first = true;
     for (module, fns) in test_fns_by_module {
-        for fn_name in fns {
+        for (display_name, erlang_fn) in fns {
             if !first {
                 tests_list.push_str(",\n        ");
             }
-            tests_list.push_str(&format!("{{{module}, {fn_name}}}"));
+            tests_list.push_str(&format!(
+                "{{\"{display_name}\", {module}, {erlang_fn}}}"
+            ));
             first = false;
         }
     }
@@ -323,17 +317,17 @@ run() ->
     Tests = [
         {tests_list}
     ],
-    Results = lists:map(fun({{Mod, Fun}}) ->
+    Results = lists:map(fun({{Name, Mod, Fun}}) ->
         try Mod:Fun(unit) of
             {{ok, _}} ->
-                io:format("  ~s::~s ... ok~n", [Mod, Fun]),
+                io:format("  ~s ... ok~n", [Name]),
                 ok;
             {{error, Msg}} ->
-                io:format("  ~s::~s ... FAILED~n    ~s~n", [Mod, Fun, Msg]),
+                io:format("  ~s ... FAILED~n    ~s~n", [Name, Msg]),
                 failed
         catch
             Class:Reason:Stack ->
-                io:format("  ~s::~s ... CRASHED~n    ~p:~p~n    ~p~n", [Mod, Fun, Class, Reason, Stack]),
+                io:format("  ~s ... CRASHED~n    ~p:~p~n    ~p~n", [Name, Class, Reason, Stack]),
                 failed
         end
     end, Tests),

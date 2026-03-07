@@ -30,6 +30,12 @@ pub enum Declaration {
         path: (String, String), // (namespace, module) e.g. ("std", "dict") or ("", "io")
         span: Range<usize>,
     },
+    /// For (test "name" body) — only valid in tests/ directory
+    Test {
+        name: String,
+        body: Box<Expr>,
+        span: Range<usize>,
+    },
 }
 
 /// A type written in source — only valid inside `extern` declarations.

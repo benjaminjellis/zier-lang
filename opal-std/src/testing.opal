@@ -5,7 +5,7 @@
   (if cond (Ok ()) (Error "assertion failed")))
 
 ;; Returns Ok if a equals b, Error with a formatted message otherwise.
-(pub extern let assert_eq ~ ('a -> 'a -> (Result String Unit)) opal_test_helpers/assert_eq)
+(pub extern let assert_eq ~ ('a -> 'a -> (Result String Unit)) opal_testing_helpers/assert_eq)
 
 ;; Returns Ok if a does not equal b, Error with a formatted message otherwise.
-(pub extern let assert_ne ~ ('a -> 'a -> (Result String Unit)) opal_test_helpers/assert_ne)
+(pub extern let assert_ne ~ ('a -> 'a -> (Result String Unit)) opal_testing_helpers/assert_ne)

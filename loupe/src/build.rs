@@ -227,6 +227,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         match opalc::compile_with_imports(
             module_name,
             source,
+            &format!("{module_name}.opal"),
             imports,
             &module_exports,
             module_aliases,
@@ -313,6 +314,7 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         match opalc::compile_with_imports(
             erlang_name,
             source,
+            &format!("{erlang_name}.opal"),
             std_imports,
             &std_module_exports,
             std_aliases.clone(),

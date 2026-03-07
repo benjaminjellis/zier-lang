@@ -6,4 +6,4 @@
 (pub use option)
 (pub use map)
 (pub use list)
-(pub use test)
+(pub use testing)
