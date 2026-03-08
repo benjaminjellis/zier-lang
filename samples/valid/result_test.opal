@@ -1,14 +1,8 @@
 (extern let println ~ (String -> Unit) io/format)
 
-(type ['e 'a] Result (
-  (Ok ~ 'a)
-  (Error ~ 'e)
-))
+(type ['e 'a] Result ( (Ok ~ 'a) (Error ~ 'e) ))
 
-(let safe_div {a b}
-  (if (= b 0)
-    (Error "division by zero")
-    (Ok (/ a b))))
+(let safe_div {a b} (if (= b 0) (Error "division by zero") (Ok (/ a b))))
 
 (let show_result {r}
   (match r

@@ -35,5 +35,5 @@ pub fn format(source: &str, width: usize) -> String {
 
 /// Format with the default line width (100 columns).
 pub fn format_default(source: &str) -> String {
-    format(source, 70)
+    format(source, 80)
 }

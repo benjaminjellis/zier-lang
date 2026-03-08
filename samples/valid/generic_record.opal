@@ -1,8 +1,3 @@
-(type ['t] MyGenericType (
-  (:name ~ String)
-  (:data ~ 't)
-))
+(type ['t] MyGenericType ( (:name ~ String) (:data ~ 't) ))
 
-(let main {}
-  (let
-    [x (MyGenericType :name "Hello" :data 1)]))
+(let main {} (let [x (MyGenericType :name "Hello" :data 1)]))

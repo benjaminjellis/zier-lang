@@ -1,3 +1,5 @@
+use core::panic;
+
 use crate::format;
 
 fn fmt(src: &str) -> String {
@@ -81,6 +83,14 @@ fn if_breaks_long() {
 }
 
 // ── match ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn match_inside_function() {
+    let src = r#"(let check_two {x} (match x 10 or 11 or 12 ~> (println "expected") _ ~> (println "not expected")))"#;
+    let out = fmt(src);
+    let expected = "(let check_two {x}\n  (match x\n    10 or 11 or 12 ~> (println \"expected\")\n    _ ~> (println \"not expected\")))\n";
+    assert_eq!(out, expected);
+}
 
 #[test]
 fn match_arms_on_lines() {
