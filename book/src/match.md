@@ -1,6 +1,6 @@
 # Match
 
-You can pattern match with keyword `match`. Use `~>` to separate each pattern from its result. `_` is a wildcard.
+You can pattern match with the keyword `match`. Use `~>` to separate each pattern from its result. `_` is a wildcard.
 
 Pattern matching works on single variables
 
@@ -33,7 +33,7 @@ or on lists with the cons operator
 
 ```
 
-Or-patterns let multiple cases share a branch:
+For patterns with multiple cases on one branch you can use `or`
 
 ```opal
 (let is_weekend {day}
@@ -43,7 +43,7 @@ Or-patterns let multiple cases share a branch:
 ```
 
 
-The list example above also introduces the `do` keyword. In some places the compile is expecting only one expression. This gives us an opportunity to demonstrate something else about `Opal`, the friendlily compiler errors. You may be tempted to not use `do`. You could the write the example above as 
+The list example above also introduces the `do` keyword. In some places the compile is expecting only one expression but you might like to do more. This gives us an opportunity to demonstrate something else about `Opal`, the friendlily compiler errors. You may be tempted to not use `do`. You could the write the example above as 
 
 
 ```opal
@@ -65,7 +65,7 @@ error: type mismatch: expected `Unit`, found `('a -> 'b)`
   │                                                                                     ^^^^^^^^^^^ this argument has type `'a`
   │
   = expected `Unit`, found `('a -> 'b)`
-  = hint: `Unit` is not a function — if you meant to sequence two expressions, use `(do expr1 expr2)`
+  = hint: `Unit` is not a function — if you meant to sequence multiple expressions, use `(do expr1 expr2 ...)`
 ```
 
 

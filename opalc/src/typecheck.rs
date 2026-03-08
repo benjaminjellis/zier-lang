@@ -131,7 +131,7 @@ impl TypeError {
                 // Helpful hints for common mismatches
                 if *expected == Type::unit() && matches!(found.as_ref(), Type::Fun(..)) {
                     notes.push(
-                        "hint: `Unit` is not a function — if you meant to sequence two expressions, use `(do expr1 expr2)`".into(),
+                        "hint: `Unit` is not a function — if you meant to sequence multiple expressions, use `(do expr1 expr2 ...)`".into(),
                     );
                 } else if *expected == Type::float() && *found == Type::int() {
                     notes.push(
@@ -917,11 +917,8 @@ impl TypeChecker {
                     self.infer_pattern(env, head_pat, &apply_subst(&s_list, &elem_ty))?;
                 let s = compose_subst(&s_head, &s_list);
 
-                let (s_tail, tail_env) = self.infer_pattern(
-                    &head_env,
-                    tail_pat,
-                    &apply_subst(&s, &list_ty),
-                )?;
+                let (s_tail, tail_env) =
+                    self.infer_pattern(&head_env, tail_pat, &apply_subst(&s, &list_ty))?;
                 let s = compose_subst(&s_tail, &s);
                 Ok((s, tail_env))
             }
@@ -2137,7 +2134,10 @@ mod tests {
                 [h | _] ~> (= h True)))
             (let main {} (f [1 2]))
         "#;
-        assert!(check(src).is_err(), "expected type error: Bool vs Int in cons pattern");
+        assert!(
+            check(src).is_err(),
+            "expected type error: Bool vs Int in cons pattern"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 # Local Bindings
-You can bind local variables inside functions using (let [name value] body). Bindings can be chained and each name is in scope for the body of the local binding.
+You can bind local variables inside functions using `(let [name value] body)`. Bindings can be chained and each name is in scope for the body of the local binding.
 
 As an example below we have a function called `circle_area` which: 
 - takes one argument `r`

@@ -31,4 +31,5 @@ Opal supports self-recursive functions (with tail call optimisation). So we can 
 
 By convention functions names are `snake_case`
 
-Note that no type signature is required (Opal doesn't actually support them apart from when calling directly into Erlang, we'll cover that later). `Opal` uses a Hindley-Milner type system that infers types at compile times so no type signatures are eve needed.
+
+`Opal` uses a Hindley-Milner type system, this means that all types are inferred at compile time and no type signatures are required. Because of this `Opal` doesn't actually support type signatures.

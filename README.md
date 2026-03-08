@@ -1,4 +1,4 @@
-# opal
-opal is an experimental, functional lisp-ish language with ml-ish semantics than runs on [BEAM](https://www.erlang.org/blog/a-brief-beam-primer/)
+# Opal
+Opal is an experimental functional language with a Lisp-inspired syntax and ML-style static types that targets the BEAM.
 
 To get started read the [book](https://benjaminjellis.github.io/opal-lang/)
