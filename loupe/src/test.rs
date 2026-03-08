@@ -79,7 +79,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         let mut imported_schemes: opalc::typecheck::TypeEnv = HashMap::new();
 
         // Resolve imports: std modules + src modules
-        for (_, mod_name) in opalc::used_modules(source) {
+        for (_, mod_name, unqualified) in opalc::used_modules(source) {
             let erlang_name = std_mods
                 .iter()
                 .find(|(user, _, _)| user == &mod_name)
@@ -88,13 +88,17 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
             if let Some(exports) = all_exports.get(&mod_name) {
                 for fn_name in exports {
-                    imports.insert(fn_name.clone(), erlang_name.clone());
+                    if unqualified.includes(fn_name) {
+                        imports.insert(fn_name.clone(), erlang_name.clone());
+                    }
                 }
             }
 
             if let Some(mod_schemes) = all_module_schemes.get(&mod_name) {
                 for (fn_name, scheme) in mod_schemes {
-                    imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    if unqualified.includes(fn_name) {
+                        imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    }
                     imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
                 }
             }
@@ -118,7 +122,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         // Collect type decls from referenced modules
         let mut referenced_modules: std::collections::HashSet<String> = opalc::used_modules(source)
             .into_iter()
-            .map(|(_, mod_name)| mod_name)
+            .map(|(_, mod_name, _)| mod_name)
             .collect();
         for tok in opalc::lexer::Lexer::new(source).lex() {
             if let opalc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind {
@@ -166,7 +170,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         std_mods.iter().map(|(u, _, _)| u.as_str()).collect();
     let mut needed_std: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, source) in &test_module_sources {
-        for (_, mod_name) in opalc::used_modules(source) {
+        for (_, mod_name, _) in opalc::used_modules(source) {
             if std_sub_names.contains(mod_name.as_str()) {
                 needed_std.insert(mod_name);
             }
@@ -192,19 +196,23 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         let mut std_imports: HashMap<String, String> = HashMap::new();
         let mut std_imported_schemes: opalc::typecheck::TypeEnv = HashMap::new();
 
-        for (_, mod_name) in opalc::used_modules(source) {
+        for (_, mod_name, unqualified) in opalc::used_modules(source) {
             let erl_name = std_aliases
                 .get(&mod_name)
                 .cloned()
                 .unwrap_or_else(|| mod_name.clone());
             if let Some(exports) = std_module_exports.get(&mod_name) {
                 for fn_name in exports {
-                    std_imports.insert(fn_name.clone(), erl_name.clone());
+                    if unqualified.includes(fn_name) {
+                        std_imports.insert(fn_name.clone(), erl_name.clone());
+                    }
                 }
             }
             if let Some(dep_schemes) = all_module_schemes.get(&mod_name) {
                 for (fn_name, scheme) in dep_schemes {
-                    std_imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    if unqualified.includes(fn_name) {
+                        std_imported_schemes.insert(fn_name.clone(), scheme.clone());
+                    }
                     std_imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
                 }
             }
@@ -212,7 +220,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
         let std_imported_type_decls: Vec<opalc::ast::TypeDecl> = opalc::used_modules(source)
             .into_iter()
-            .flat_map(|(_, mod_name)| {
+            .flat_map(|(_, mod_name, _)| {
                 module_type_decls
                     .get(&mod_name)
                     .cloned()
@@ -302,9 +310,7 @@ fn generate_runner(test_fns_by_module: &[(String, Vec<(String, String)>)]) -> St
             if !first {
                 tests_list.push_str(",\n        ");
             }
-            tests_list.push_str(&format!(
-                "{{\"{display_name}\", {module}, {erlang_fn}}}"
-            ));
+            tests_list.push_str(&format!("{{\"{display_name}\", {module}, {erlang_fn}}}"));
             first = false;
         }
     }

@@ -160,9 +160,7 @@ fn fmt_round(items: &[SExpr], source: &str) -> Doc {
     // Strip leading modifier keywords (pub) to find the governing keyword.
     let mod_count = items
         .iter()
-        .take_while(
-            |i| matches!(i, SExpr::Atom(t) if matches!(t.kind, TokenKind::Pub)),
-        )
+        .take_while(|i| matches!(i, SExpr::Atom(t) if matches!(t.kind, TokenKind::Pub)))
         .count();
 
     let tail = &items[mod_count..];
@@ -404,11 +402,7 @@ fn fmt_fn(rest: &[SExpr], source: &str) -> Doc {
 fn fmt_do(rest: &[SExpr], source: &str) -> Doc {
     match rest {
         [] => text("(do)"),
-        [single] => group(concat_all([
-            text("(do "),
-            fmt(single, source),
-            text(")"),
-        ])),
+        [single] => group(concat_all([text("(do "), fmt(single, source), text(")")])),
         [first, tail @ ..] => {
             // Multiple expressions always break — `do` is for sequencing side
             // effects and is never flat. First expr stays inline after `do`,

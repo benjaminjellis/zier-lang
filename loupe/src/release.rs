@@ -2,8 +2,10 @@ use std::{path::Path, process::Command};
 
 use eyre::Context;
 
-use crate::{ProjectType, TARGET_DIR};
-use crate::build::{ErlSources, generate_erl_sources};
+use crate::{
+    ProjectType, TARGET_DIR,
+    build::{ErlSources, generate_erl_sources},
+};
 
 pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     // Stage the rebar3 project under target/release/
@@ -15,8 +17,12 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     let src_dir = staging.join("src");
     std::fs::create_dir_all(&src_dir).context("could not create release staging dir")?;
 
-    let ErlSources { erl_paths: _, manifest, project_type, .. } =
-        generate_erl_sources(project_dir, &src_dir)?;
+    let ErlSources {
+        erl_paths: _,
+        manifest,
+        project_type,
+        ..
+    } = generate_erl_sources(project_dir, &src_dir)?;
 
     if matches!(project_type, ProjectType::Lib) {
         return Err(eyre::eyre!("loupe cannot release a library project"));

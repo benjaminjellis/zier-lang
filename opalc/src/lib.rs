@@ -32,6 +32,7 @@ pub fn compile(module_name: &str, source: &str) -> Option<String> {
 /// - `module_exports`: module name → exported function names (for validating qualified calls)
 /// - `imported_type_decls`: pub type declarations from imported modules (brings constructors into scope)
 /// - `imported_schemes`: real type schemes from imported modules (keyed by "fn" or "module/fn")
+#[allow(clippy::too_many_arguments)]
 pub fn compile_with_imports(
     module_name: &str,
     source: &str,
@@ -217,8 +218,8 @@ pub fn pub_reexports(source: &str) -> Vec<String> {
 }
 
 /// Extract the `use` declarations from a source file.
-/// Returns `(namespace, module)` pairs — local modules have an empty namespace.
-pub fn used_modules(source: &str) -> Vec<(String, String)> {
+/// Returns `(namespace, module, unqualified)` triples — local modules have an empty namespace.
+pub fn used_modules(source: &str) -> Vec<(String, String, ast::UnqualifiedImports)> {
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(source).lex();
     let file_id = lowerer.add_file("scan.opal".into(), source.into());
@@ -229,8 +230,11 @@ pub fn used_modules(source: &str) -> Vec<(String, String)> {
     decls
         .into_iter()
         .filter_map(|d| {
-            if let ast::Declaration::Use { path, .. } = d {
-                Some(path)
+            if let ast::Declaration::Use {
+                path, unqualified, ..
+            } = d
+            {
+                Some((path.0, path.1, unqualified))
             } else {
                 None
             }

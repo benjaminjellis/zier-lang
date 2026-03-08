@@ -385,6 +385,18 @@ fn lower_variable(name: &str, ctx: &Ctx) -> ir::Expr {
     if let Some(&0) = ctx.constructors.get(name) {
         return ir::Expr::Atom(name.to_lowercase());
     }
+    // Non-nullary constructor in value position → curried lambda: fun(X0) -> {tag, X0} end
+    if let Some(&arity) = ctx.constructors.get(name) {
+        let tag = ir::Expr::Atom(name.to_lowercase());
+        let params: Vec<String> = (0..arity).map(|i| format!("X{i}__")).collect();
+        let mut items = vec![tag];
+        items.extend(params.iter().map(|p| ir::Expr::Var(p.clone())));
+        let body = ir::Expr::Tuple(items);
+        return params
+            .iter()
+            .rev()
+            .fold(body, |acc, p| ir::Expr::Fun(p.clone(), Box::new(acc)));
+    }
     // Top-level function in value position → fun f/1
     if ctx.fn_names.contains(name) {
         return ir::Expr::FunRef(name.to_string());
@@ -550,11 +562,38 @@ pub fn emit_module(module: &ir::Module) -> String {
 
 fn emit_function(func: &ir::Function) -> String {
     let params_s = func.params.join(", ");
+    // Flatten top-level Let chain into a statement list for clean output:
+    //   X = val,
+    //   Y = ...,
+    //   final_expr.
+    let (bindings, final_expr) = collect_lets(&func.body);
+    let body_s = if bindings.is_empty() {
+        emit_expr(final_expr)
+    } else {
+        let mut parts: Vec<String> = bindings
+            .iter()
+            .map(|(v, e)| format!("{v} = {}", emit_expr(e)))
+            .collect();
+        parts.push(emit_expr(final_expr));
+        parts.join(",\n    ")
+    };
     format!(
         "{}({params_s}) ->\n    {}.\n",
         quote_atom(&func.name),
-        emit_expr(&func.body)
+        body_s
     )
+}
+
+/// Peel off consecutive `Let` nodes, returning the list of `(var, val)` bindings
+/// and the final non-Let expression.
+fn collect_lets(expr: &ir::Expr) -> (Vec<(&str, &ir::Expr)>, &ir::Expr) {
+    let mut bindings = Vec::new();
+    let mut cur = expr;
+    while let ir::Expr::Let(var, val, body) = cur {
+        bindings.push((var.as_str(), val.as_ref()));
+        cur = body.as_ref();
+    }
+    (bindings, cur)
 }
 
 fn emit_expr(expr: &ir::Expr) -> String {
@@ -627,8 +666,15 @@ fn emit_expr(expr: &ir::Expr) -> String {
             format!("({op} {})", emit_expr(expr))
         }
 
-        ir::Expr::Let(var, val, body) => {
-            format!("{var} = {},\n    {}", emit_expr(val), emit_expr(body))
+        ir::Expr::Let(_, _, _) => {
+            // Flatten consecutive Lets and wrap in begin...end (valid in any expression position)
+            let (bindings, final_expr) = collect_lets(expr);
+            let mut parts: Vec<String> = bindings
+                .iter()
+                .map(|(v, e)| format!("{v} = {}", emit_expr(e)))
+                .collect();
+            parts.push(emit_expr(final_expr));
+            format!("begin {} end", parts.join(", "))
         }
 
         ir::Expr::Case(scrutinee, arms) => {
@@ -645,53 +691,8 @@ fn emit_expr(expr: &ir::Expr) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn multi_arg_tco_emits_two_functions() {
-        let src = r#"
-(let sum {acc n}
-  (if (= n 0)
-    acc
-    (sum (+ acc n) (- n 1))))
-"#;
-        let erl = crate::compile("test", src).unwrap();
-        // Curried entry: sum/1
-        assert!(erl.contains("sum(Acc) ->"), "missing curried entry:\n{erl}");
-        // Multi-arg impl: sum/2
-        assert!(erl.contains("sum(Acc, N) ->"), "missing multi-arg impl:\n{erl}");
-        // Self-recursive call uses sum/2 directly (not curried)
-        assert!(erl.contains("sum("), "missing recursive call:\n{erl}");
-        // Both arities exported
-        assert!(erl.contains("sum/1"), "sum/1 not exported:\n{erl}");
-        assert!(erl.contains("sum/2"), "sum/2 not exported:\n{erl}");
-    }
-
-    #[test]
-    fn single_arg_function_unchanged() {
-        let src = r#"
-(let double {x}
-  (* 2 x))
-"#;
-        let erl = crate::compile("test", src).unwrap();
-        // Only one function, no /2
-        assert!(erl.contains("double(X) ->"), "missing function:\n{erl}");
-        assert!(!erl.contains("double/2"), "unexpected double/2:\n{erl}");
-    }
-
-    #[test]
-    fn partial_application_uses_curried_entry() {
-        // (add 1) applied partially — must call add/1, not add/2
-        let src = r#"
-(let add {a b} (+ a b))
-(let inc {x} (add 1 x))
-"#;
-        let erl = crate::compile("test", src).unwrap();
-        // inc calls add with both args → LocalCallMulti → add(1, X)
-        assert!(erl.contains("add(1, X)") || erl.contains("add(1,X)"), "expected add(1, X):\n{erl}");
-    }
+fn escape_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn emit_pattern(pat: &ir::Pattern) -> String {
@@ -732,6 +733,56 @@ fn emit_pattern(pat: &ir::Pattern) -> String {
     }
 }
 
-fn escape_str(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn multi_arg_tco_emits_two_functions() {
+        let src = r#"
+(let sum {acc n}
+  (if (= n 0)
+    acc
+    (sum (+ acc n) (- n 1))))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        // Curried entry: sum/1
+        assert!(erl.contains("sum(Acc) ->"), "missing curried entry:\n{erl}");
+        // Multi-arg impl: sum/2
+        assert!(
+            erl.contains("sum(Acc, N) ->"),
+            "missing multi-arg impl:\n{erl}"
+        );
+        // Self-recursive call uses sum/2 directly (not curried)
+        assert!(erl.contains("sum("), "missing recursive call:\n{erl}");
+        // Both arities exported
+        assert!(erl.contains("sum/1"), "sum/1 not exported:\n{erl}");
+        assert!(erl.contains("sum/2"), "sum/2 not exported:\n{erl}");
+    }
+
+    #[test]
+    fn single_arg_function_unchanged() {
+        let src = r#"
+(let double {x}
+  (* 2 x))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        // Only one function, no /2
+        assert!(erl.contains("double(X) ->"), "missing function:\n{erl}");
+        assert!(!erl.contains("double/2"), "unexpected double/2:\n{erl}");
+    }
+
+    #[test]
+    fn partial_application_uses_curried_entry() {
+        // (add 1) applied partially — must call add/1, not add/2
+        let src = r#"
+(let add {a b} (+ a b))
+(let inc {x} (add 1 x))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        // inc calls add with both args → LocalCallMulti → add(1, X)
+        assert!(
+            erl.contains("add(1, X)") || erl.contains("add(1,X)"),
+            "expected add(1, X):\n{erl}"
+        );
+    }
 }

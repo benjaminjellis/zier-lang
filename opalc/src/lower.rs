@@ -4,7 +4,7 @@ use codespan_reporting::{
 };
 
 use crate::{
-    ast::{Declaration, Expr, Literal, Pattern, TypeDecl, TypeSig, TypeUsage},
+    ast::{Declaration, Expr, Literal, Pattern, TypeDecl, TypeSig, TypeUsage, UnqualifiedImports},
     lexer::{Token, TokenKind},
     sexpr::SExpr,
 };
@@ -180,23 +180,22 @@ impl Lowerer {
                     // Case: (Some ~ 'a) or (Error ~ 'e) or (Wrap ~ Map 'k 'v)
                     SExpr::Round(inner, inner_span) => {
                         // Expect: (ConstructorName ~ Type [TypeArgs...])
-                        let (name_token, tilde_token) =
-                            match (inner.first(), inner.get(1)) {
-                                (Some(n), Some(t)) if inner.len() >= 3 => (n, t),
-                                _ => {
-                                    self.error(
-                                        Diagnostic::error()
-                                            .with_message(
-                                                "invalid constructor — expected (Name ~ Type)",
-                                            )
-                                            .with_labels(vec![Label::primary(
-                                                file_id,
-                                                inner_span.clone(),
-                                            )]),
-                                    );
-                                    return None;
-                                }
-                            };
+                        let (name_token, tilde_token) = match (inner.first(), inner.get(1)) {
+                            (Some(n), Some(t)) if inner.len() >= 3 => (n, t),
+                            _ => {
+                                self.error(
+                                    Diagnostic::error()
+                                        .with_message(
+                                            "invalid constructor — expected (Name ~ Type)",
+                                        )
+                                        .with_labels(vec![Label::primary(
+                                            file_id,
+                                            inner_span.clone(),
+                                        )]),
+                                );
+                                return None;
+                            }
+                        };
 
                         let c_name = self.source_at(file_id, name_token.span()).to_string();
                         if !c_name.starts_with(|c: char| c.is_uppercase()) {
@@ -231,11 +230,8 @@ impl Lowerer {
                             return None;
                         }
 
-                        let type_usage = self.lower_type_usage_atoms(
-                            file_id,
-                            &inner[2..],
-                            inner_span.clone(),
-                        )?;
+                        let type_usage =
+                            self.lower_type_usage_atoms(file_id, &inner[2..], inner_span.clone())?;
                         constructors.push((c_name, Some(type_usage)));
                     }
                     // Case: None — nullary constructor (no payload)
@@ -406,15 +402,16 @@ impl Lowerer {
             .expect("invalid file_id")
             .name()
             .clone();
-        let is_test_file =
-            file_name.contains("/tests/") || file_name.starts_with("tests/");
+        let is_test_file = file_name.contains("/tests/") || file_name.starts_with("tests/");
 
         if !is_test_file {
             self.error(
                 Diagnostic::error()
                     .with_message("`test` declarations are only allowed in the `tests/` directory")
-                    .with_labels(vec![Label::primary(file_id, span)
-                        .with_message("move this to a file under `tests/`")]),
+                    .with_labels(vec![
+                        Label::primary(file_id, span)
+                            .with_message("move this to a file under `tests/`"),
+                    ]),
             );
             return None;
         }
@@ -431,7 +428,10 @@ impl Lowerer {
                 self.error(
                     Diagnostic::error()
                         .with_message("expected a string name after `test`")
-                        .with_labels(vec![Label::primary(file_id, items.get(0).map(|s| s.span()).unwrap_or(0..0))])
+                        .with_labels(vec![Label::primary(
+                            file_id,
+                            items.first().map(|s| s.span()).unwrap_or(0..0),
+                        )])
                         .with_notes(vec!["example: `(test \"my test\" ...)`".into()]),
                 );
                 return None;
@@ -458,7 +458,7 @@ impl Lowerer {
         Some(Declaration::Test {
             name,
             body: Box::new(body),
-            span: items.get(0).map(|s| s.span()).unwrap_or(0..0),
+            span: items.first().map(|s| s.span()).unwrap_or(0..0),
         })
     }
 
@@ -859,8 +859,9 @@ impl Lowerer {
             self.error(
                 Diagnostic::error()
                     .with_message("expected a type after `~`")
-                    .with_labels(vec![Label::primary(file_id, err_span)
-                        .with_message("expected a type name here")]),
+                    .with_labels(vec![
+                        Label::primary(file_id, err_span).with_message("expected a type name here"),
+                    ]),
             );
             return None;
         }
@@ -887,8 +888,10 @@ impl Lowerer {
                 self.error(
                     Diagnostic::error()
                         .with_message("expected a type argument")
-                        .with_labels(vec![Label::primary(file_id, arg_sexpr.span())
-                            .with_message("expected a type variable or type name")]),
+                        .with_labels(vec![
+                            Label::primary(file_id, arg_sexpr.span())
+                                .with_message("expected a type variable or type name"),
+                        ]),
                 );
                 return None;
             };
@@ -1225,7 +1228,10 @@ impl Lowerer {
     }
 
     /// Lower a `use` declaration.
-    /// Syntax: (use std/dict)
+    /// Syntax:
+    ///   (use std/io)              — qualified only
+    ///   (use std/io [println])    — bring specific names into unqualified scope
+    ///   (use std/io [*])          — bring all exports into unqualified scope
     fn lower_use(
         &mut self,
         file_id: usize,
@@ -1233,12 +1239,14 @@ impl Lowerer {
         span: Range<usize>,
         is_pub: bool,
     ) -> Option<Declaration> {
-        if items.len() != 2 {
+        if items.len() < 2 || items.len() > 3 {
             self.error(
                 Diagnostic::error()
                     .with_message("invalid use declaration")
                     .with_labels(vec![Label::primary(file_id, span.clone())])
-                    .with_notes(vec!["syntax: (use std/dict)".into()]),
+                    .with_notes(vec![
+                        "syntax: (use std/io) or (use std/io [println read])".into(),
+                    ]),
             );
             return None;
         }
@@ -1277,7 +1285,100 @@ impl Lowerer {
             }
         };
 
-        Some(Declaration::Use { is_pub, path, span })
+        let unqualified = if items.len() == 3 {
+            match &items[2] {
+                SExpr::Square(contents, sq_span) => {
+                    if contents.is_empty() {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message("empty import list")
+                                .with_labels(vec![Label::primary(file_id, sq_span.clone())])
+                                .with_notes(vec![
+                                    "use [*] to import everything, or list names: [println read]"
+                                        .into(),
+                                ]),
+                        );
+                        return None;
+                    }
+                    // Check for wildcard [*]
+                    if contents.len() == 1 {
+                        if let SExpr::Atom(t) = &contents[0] {
+                            if matches!(t.kind, TokenKind::Operator)
+                                && self.source_at(file_id, t.span.clone()) == "*"
+                            {
+                                UnqualifiedImports::Wildcard
+                            } else {
+                                // Single non-wildcard name
+                                let name = match &t.kind {
+                                    TokenKind::Ident => {
+                                        self.source_at(file_id, t.span.clone()).to_string()
+                                    }
+                                    _ => {
+                                        self.error(
+                                            Diagnostic::error()
+                                                .with_message(
+                                                    "expected an identifier in import list",
+                                                )
+                                                .with_labels(vec![Label::primary(
+                                                    file_id,
+                                                    t.span.clone(),
+                                                )]),
+                                        );
+                                        return None;
+                                    }
+                                };
+                                UnqualifiedImports::Specific(vec![name])
+                            }
+                        } else {
+                            self.error(
+                                Diagnostic::error()
+                                    .with_message("expected an identifier in import list")
+                                    .with_labels(vec![Label::primary(file_id, contents[0].span())]),
+                            );
+                            return None;
+                        }
+                    } else {
+                        let mut names = Vec::with_capacity(contents.len());
+                        for item in contents {
+                            match item {
+                                SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
+                                    names.push(self.source_at(file_id, t.span.clone()).to_string());
+                                }
+                                other => {
+                                    self.error(
+                                        Diagnostic::error()
+                                            .with_message("expected an identifier in import list")
+                                            .with_labels(vec![Label::primary(
+                                                file_id,
+                                                other.span(),
+                                            )]),
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                        UnqualifiedImports::Specific(names)
+                    }
+                }
+                other => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected an import list like [println read] or [*]")
+                            .with_labels(vec![Label::primary(file_id, other.span())]),
+                    );
+                    return None;
+                }
+            }
+        } else {
+            UnqualifiedImports::None
+        };
+
+        Some(Declaration::Use {
+            is_pub,
+            path,
+            unqualified,
+            span,
+        })
     }
 
     fn lower_match(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
@@ -1433,25 +1534,26 @@ impl Lowerer {
             // Check for the common mistake of writing multiple expressions in a match arm
             // without `do`. The next item is a Round (call expression) but there's no `~>`
             // n_targets positions after it, meaning it can't be a pattern-arrow pair.
-            if let Some(next) = items.get(cursor) {
-                if matches!(next, SExpr::Round(..)) {
-                    let next_has_arrow = items
-                        .get(cursor + n_targets)
-                        .map(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Arrow)))
-                        .unwrap_or(false);
-                    if !next_has_arrow {
-                        self.error(
-                            Diagnostic::error()
-                                .with_message(
-                                    "match arm has multiple expressions — use `do` to sequence them",
-                                )
-                                .with_labels(vec![Label::primary(file_id, next.span())])
-                                .with_notes(vec![
-                                    "help: wrap the expressions in `do`: `pat ~> (do expr1 expr2 ...)`".to_string(),
-                                ]),
-                        );
-                        return None;
-                    }
+            if let Some(next) = items.get(cursor)
+                && matches!(next, SExpr::Round(..))
+            {
+                let next_has_arrow = items
+                    .get(cursor + n_targets)
+                    .map(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Arrow)))
+                    .unwrap_or(false);
+                if !next_has_arrow {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message(
+                                "match arm has multiple expressions — use `do` to sequence them",
+                            )
+                            .with_labels(vec![Label::primary(file_id, next.span())])
+                            .with_notes(vec![
+                                "help: wrap the expressions in `do`: `pat ~> (do expr1 expr2 ...)`"
+                                    .to_string(),
+                            ]),
+                    );
+                    return None;
                 }
             }
 
@@ -1545,10 +1647,10 @@ impl Lowerer {
                 }
                 // Find the `|` operator that separates head from tail
                 let pipe_pos = items.iter().position(|item| {
-                    if let SExpr::Atom(t) = item {
-                        if t.kind == TokenKind::Operator {
-                            return self.source_at(file_id, t.span.clone()) == "|";
-                        }
+                    if let SExpr::Atom(t) = item
+                        && t.kind == TokenKind::Operator
+                    {
+                        return self.source_at(file_id, t.span.clone()) == "|";
                     }
                     false
                 });
@@ -1563,8 +1665,10 @@ impl Lowerer {
                             Diagnostic::error()
                                 .with_code("E005")
                                 .with_message("invalid list pattern")
-                                .with_labels(vec![Label::primary(file_id, span.clone())
-                                    .with_message("expected `[]` or `[head | tail]`")])
+                                .with_labels(vec![
+                                    Label::primary(file_id, span.clone())
+                                        .with_message("expected `[]` or `[head | tail]`"),
+                                ])
                                 .with_notes(vec![
                                     "hint: list patterns are `[]` (empty) or `[h | t]` (cons)"
                                         .into(),
@@ -1653,14 +1757,17 @@ impl Lowerer {
             .collect::<Option<Vec<_>>>()?;
         // Fold all but the last into LetLocal "_" bindings
         let last = lowered.pop().unwrap();
-        Some(lowered.into_iter().rev().fold(last, |body, expr| {
-            Expr::LetLocal {
-                name: "_".to_string(),
-                value: Box::new(expr),
-                body: Box::new(body),
-                span: span.clone(),
-            }
-        }))
+        Some(
+            lowered
+                .into_iter()
+                .rev()
+                .fold(last, |body, expr| Expr::LetLocal {
+                    name: "_".to_string(),
+                    value: Box::new(expr),
+                    body: Box::new(body),
+                    span: span.clone(),
+                }),
+        )
     }
 
     pub fn lower_let(

@@ -1,5 +1,27 @@
 use std::ops::Range;
 
+/// Which names a `use` declaration brings into unqualified scope.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnqualifiedImports {
+    /// `(use std/io)` — qualified calls only; nothing unqualified
+    None,
+    /// `(use std/io [println read])` — only the listed names
+    Specific(Vec<String>),
+    /// `(use std/io [*])` — every export
+    Wildcard,
+}
+
+impl UnqualifiedImports {
+    /// Returns true if `name` should be brought into unqualified scope.
+    pub fn includes(&self, name: &str) -> bool {
+        match self {
+            UnqualifiedImports::None => false,
+            UnqualifiedImports::Specific(names) => names.iter().any(|n| n == name),
+            UnqualifiedImports::Wildcard => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
     /// For (type MyType ...)
@@ -28,6 +50,7 @@ pub enum Declaration {
     Use {
         is_pub: bool,
         path: (String, String), // (namespace, module) e.g. ("std", "dict") or ("", "io")
+        unqualified: UnqualifiedImports,
         span: Range<usize>,
     },
     /// For (test "name" body) — only valid in tests/ directory

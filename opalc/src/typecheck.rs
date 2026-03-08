@@ -556,7 +556,9 @@ impl TypeChecker {
                 Ok((s_res.clone(), apply_subst(&s_res, &t_then)))
             }
 
-            Expr::Call { func, args, .. } => {
+            Expr::Call {
+                func, args, span, ..
+            } => {
                 let (callee_name, callee_span) = if let Expr::Variable(name, s) = func.as_ref() {
                     (Some(name.clone()), Some(s.clone()))
                 } else {
@@ -565,6 +567,31 @@ impl TypeChecker {
                 let (s0, mut t_func) = self.infer(env, func)?;
                 let mut subst = s0;
                 let mut prev_span: Option<std::ops::Range<usize>> = None;
+
+                // 0-arg call `(f)` is equivalent to `(f unit)` in codegen.
+                // Enforce this in the type checker so calling a non-function is caught.
+                if args.is_empty() {
+                    let ret = self.fresh();
+                    let s_unify = unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(
+                        |e| match e {
+                            TypeError::Mismatch {
+                                expected, found, ..
+                            } => TypeError::Mismatch {
+                                expected,
+                                found,
+                                span: Some(span.clone()),
+                                prior_span: None,
+                                arg_ty: None,
+                                callee_name: callee_name.clone(),
+                                callee_span: callee_span.clone(),
+                            },
+                            other => other,
+                        },
+                    )?;
+                    subst = compose_subst(&s_unify, &subst);
+                    let result_ty = apply_subst(&subst, &ret);
+                    return Ok((subst, result_ty));
+                }
 
                 for arg in args {
                     let (s_arg, t_arg) = self.infer(&apply_subst_env(&subst, env), arg)?;
@@ -606,6 +633,8 @@ impl TypeChecker {
             } => {
                 let arg_tys: Vec<Rc<Type>> = args.iter().map(|_| self.fresh()).collect();
                 let ret_ty = self.fresh();
+                // 0-arg functions are compiled as `f(_Unit) -> body` on the BEAM.
+                // Type them as `Unit -> ReturnType` so `(f)` calls unify correctly.
                 let fun_ty = arg_tys
                     .iter()
                     .rev()
@@ -974,9 +1003,17 @@ impl TypeChecker {
                     match self.infer(env, expr) {
                         Ok((s, ty)) => {
                             *env = apply_subst_env(&s, env);
-                            // Named top-level functions must be available to subsequent declarations
-                            if let Expr::LetFunc { name, .. } = expr {
-                                let scheme = generalize(env, &ty);
+                            // Named top-level functions must be available to subsequent declarations.
+                            // 0-arg functions (let f {} body) are compiled as f(_Unit) -> body on
+                            // the BEAM, so store them as Unit -> ReturnType in the env so that
+                            // 0-arg call sites `(f)` unify correctly.
+                            if let Expr::LetFunc { name, args, .. } = expr {
+                                let env_ty = if args.is_empty() {
+                                    Type::fun(Type::unit(), ty.clone())
+                                } else {
+                                    ty.clone()
+                                };
+                                let scheme = generalize(env, &env_ty);
                                 env.insert(name.clone(), scheme);
                             }
                             last_ty = ty;
