@@ -471,6 +471,56 @@ impl Lowerer {
         &file.source()[span]
     }
 
+    fn reject_ambiguous_constructor_sequence(
+        &mut self,
+        file_id: usize,
+        body_sexprs: &[SExpr],
+    ) -> bool {
+        if body_sexprs.len() <= 1 {
+            return false;
+        }
+
+        for (idx, sexpr) in body_sexprs.iter().enumerate().take(body_sexprs.len() - 1) {
+            let SExpr::Atom(token) = sexpr else {
+                continue;
+            };
+            if token.kind != TokenKind::Ident {
+                continue;
+            }
+
+            let name = self.source_at(file_id, token.span.clone()).to_string();
+            let is_constructor_like = name
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false);
+            if !is_constructor_like {
+                continue;
+            }
+
+            let next_span = body_sexprs[idx + 1].span();
+            self.error(
+                Diagnostic::error()
+                    .with_message(format!(
+                        "constructor `{name}` cannot be followed by a separate body expression"
+                    ))
+                    .with_labels(vec![
+                        Label::primary(file_id, token.span.clone())
+                            .with_message("this constructor expression is complete on its own"),
+                        Label::secondary(file_id, next_span)
+                            .with_message("this is parsed as a separate expression"),
+                    ])
+                    .with_notes(vec![
+                        "if you intended constructor application, write it in one expression: `(Some x)`".into(),
+                        "if you intended sequencing, make it explicit with `do`".into(),
+                    ]),
+            );
+            return true;
+        }
+
+        false
+    }
+
     fn lower_atom(&mut self, file_id: usize, token: &Token) -> Option<Expr> {
         match &token.kind {
             TokenKind::Int(val) => Some(Expr::Literal(Literal::Int(*val), token.span.clone())),
@@ -1798,6 +1848,9 @@ impl Lowerer {
 
                 // Collect all body expressions — implicit sequencing in let body
                 let body_sexprs = &items[cursor..];
+                if self.reject_ambiguous_constructor_sequence(file_id, body_sexprs) {
+                    return None;
+                }
                 let mut current_expr = if body_sexprs.is_empty() {
                     Expr::Literal(Literal::Unit, span.clone())
                 } else {
@@ -1894,6 +1947,9 @@ impl Lowerer {
                             .with_message("missing function body")
                             .with_labels(vec![Label::primary(file_id, span.clone())]),
                     );
+                    return None;
+                }
+                if self.reject_ambiguous_constructor_sequence(file_id, body_sexprs) {
                     return None;
                 }
 
@@ -2464,6 +2520,24 @@ mod tests {
         } else {
             panic!("expected LetFunc");
         }
+    }
+
+    #[test]
+    fn test_constructor_followed_by_body_expr_is_error() {
+        let src = "(let always_none {x} None x)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let _ = lowerer.lower_file(file_id, &sexprs);
+        assert!(
+            !lowerer.diagnostics.is_empty(),
+            "expected diagnostic for ambiguous constructor sequencing"
+        );
+        assert!(
+            lowerer.diagnostics[0]
+                .message
+                .contains("constructor `None` cannot be followed"),
+            "unexpected error message: {}",
+            lowerer.diagnostics[0].message
+        );
     }
 
     #[test]

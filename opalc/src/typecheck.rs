@@ -127,6 +127,49 @@ impl TypeError {
                 let mut var_names = std::collections::HashMap::new();
                 let expected_s = type_display_inner(expected, &mut var_names);
                 let found_s = type_display_inner(found, &mut var_names);
+
+                let is_non_function_call = callee_name.is_some()
+                    && !matches!(expected.as_ref(), Type::Fun(_, _))
+                    && matches!(found.as_ref(), Type::Fun(_, _));
+                if is_non_function_call {
+                    let label_span = precise_span.clone().unwrap_or(span.clone());
+                    let mut labels = vec![
+                        Label::primary(file_id, label_span).with_message("argument provided here"),
+                    ];
+                    if let (Some(name), Some(cs)) = (callee_name, callee_span) {
+                        labels.push(
+                            Label::secondary(file_id, cs.clone())
+                                .with_message(format!("`{name}` has type `{expected_s}`")),
+                        );
+                    }
+
+                    let mut notes = vec![format!(
+                        "`{}` is not a function and cannot be called",
+                        callee_name.as_deref().unwrap_or("this expression")
+                    )];
+                    if let Some(name) = callee_name
+                        && name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_ascii_uppercase())
+                            .unwrap_or(false)
+                    {
+                        notes.push(format!(
+                            "hint: `{name}` is a nullary constructor. Use `{name}` without arguments"
+                        ));
+                    }
+
+                    return vec![
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "cannot call non-function `{}`",
+                                callee_name.as_deref().unwrap_or("expression")
+                            ))
+                            .with_labels(labels)
+                            .with_notes(notes),
+                    ];
+                }
+
                 let mut notes = vec![format!("expected `{expected_s}`, found `{found_s}`")];
                 // Helpful hints for common mismatches
                 if *expected == Type::unit() && matches!(found.as_ref(), Type::Fun(..)) {
@@ -1466,6 +1509,40 @@ mod tests {
             checker.infer(&env, &expr),
             Err(TypeError::Mismatch { .. })
         ));
+    }
+
+    #[test]
+    fn nullary_constructor_call_has_helpful_diagnostic() {
+        let src = "(type ['a] Option (None (Some ~ 'a)))\n(let always_none {x} (None x))";
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let mut lowerer = crate::lower::Lowerer::new();
+        let file_id = lowerer.add_file("test.opal".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse failed");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut checker = TypeChecker::new();
+        let mut env = primitive_env();
+        let err = checker
+            .check_program(&mut env, &decls, file_id)
+            .expect_err("expected type error");
+        let (type_err, expr) = *err;
+        let diags = type_err.to_diagnostics(file_id, expr.span());
+
+        assert!(
+            diags[0].message.contains("cannot call non-function `None`"),
+            "unexpected message: {}",
+            diags[0].message
+        );
+        assert!(
+            diags[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("nullary constructor")),
+            "expected nullary constructor hint in notes: {:?}",
+            diags[0].notes
+        );
     }
 
     #[test]
