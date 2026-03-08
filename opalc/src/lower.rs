@@ -1779,25 +1779,6 @@ impl Lowerer {
     ) -> Option<Expr> {
         let mut cursor = 1; // Skip the 'let' keyword
 
-        // Detect the removed `rec` keyword and emit a helpful error.
-        if let Some(SExpr::Atom(token)) = items.get(cursor)
-            && matches!(token.kind, TokenKind::Ident)
-            && self.source_at(file_id, token.span.clone()) == "rec"
-        {
-            self.error(
-                Diagnostic::error()
-                    .with_message("the `rec` keyword has been removed")
-                    .with_labels(vec![
-                        Label::primary(file_id, token.span.clone())
-                            .with_message("remove `rec` here"),
-                    ])
-                    .with_notes(vec![
-                        "named functions in Opal are self-recursive by default".into(),
-                    ]),
-            );
-            return None;
-        }
-
         match items.get(cursor) {
             // CASE A: Sequential Variable Bindings -> (let [x 10 y 20] body)
             Some(SExpr::Square(bindings, b_span)) => {
@@ -1894,13 +1875,12 @@ impl Lowerer {
                     arg_names
                 } else {
                     // This catches (let x 42 ...) and rejects it.
-                    let err_span = items.get(cursor).map(|s| s.span()).unwrap_or(span.clone());
                     self.error(
                     Diagnostic::error()
                         .with_message("invalid let syntax")
                         .with_labels(vec![
-                            Label::primary(file_id, err_span)
-                                .with_message("expected '{args}' for function definition or '[' for variable bindings")
+                            Label::primary(file_id, span.clone())
+                                .with_message("If you were trying to write a function the syntax is 'let my_func {args}', if you were trying to define some variable binding it's 'let [name variable]'")
                         ]),
                 );
                     return None;
@@ -2308,36 +2288,6 @@ mod tests {
         let exprs = lowerer.lower_file(file_id, &sexprs);
         // The :my_field as a bare value in position should produce a diagnostic
         assert!(exprs.is_empty() || !lowerer.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn test_rec_keyword_rejected() {
-        // `rec` was removed from the language — all named functions are self-recursive
-        let (mut lowerer, file_id, sexprs) =
-            setup("(let rec countdown {n} (if (= n 0) 0 (countdown (- n 1))))");
-        let exprs = lowerer.lower_file(file_id, &sexprs);
-        assert!(exprs.is_empty(), "expected lowering to fail");
-        assert!(!lowerer.diagnostics.is_empty());
-        assert_eq!(
-            lowerer.diagnostics[0].message,
-            "the `rec` keyword has been removed"
-        );
-    }
-
-    #[test]
-    fn test_self_recursive_function() {
-        // Without `rec` — named functions are self-recursive by default
-        let (mut lowerer, file_id, sexprs) =
-            setup("(let countdown {n} (if (= n 0) 0 (countdown (- n 1))))");
-        let exprs = lowerer.lower_file(file_id, &sexprs);
-        assert!(lowerer.diagnostics.is_empty());
-        assert_eq!(exprs.len(), 1);
-        if let Declaration::Expression(Expr::LetFunc { name, args, .. }) = &exprs[0] {
-            assert_eq!(name, "countdown");
-            assert_eq!(args, &vec!["n".to_string()]);
-        } else {
-            panic!("expected LetFunc");
-        }
     }
 
     #[test]
@@ -2789,10 +2739,8 @@ mod tests {
         let (mut lowerer, file_id, sexprs) = setup("(let rec f {x} x)");
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty());
-        assert_eq!(
-            lowerer.diagnostics[0].message,
-            "the `rec` keyword has been removed"
-        );
+        dbg!(&lowerer.diagnostics[0].labels);
+        assert_eq!(lowerer.diagnostics[0].message, "invalid let syntax");
     }
 
     #[test]

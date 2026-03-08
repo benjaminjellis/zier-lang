@@ -1,5 +1,3 @@
-use core::panic;
-
 use crate::format;
 
 fn fmt(src: &str) -> String {
