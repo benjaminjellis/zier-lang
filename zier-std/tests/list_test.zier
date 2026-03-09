@@ -32,11 +32,42 @@
       (assert_eq (list/filter (f {x} -> (> x 2)) [1 2 3 4]) [3 4]))))
 
 (test
+  "list/member returns false for missing element"
+  (assert_eq (list/member 42 (test_list)) False))
+
+(test
+  "list/map and filter handle empty lists"
+  (let? [_ (assert_eq (list/map (f {x} -> (+ x 1)) []) [])]
+    (assert_eq (list/filter (f {x} -> (> x 2)) []) [])))
+
+(test
   "list/foldl and foldr"
   (let? [_ (assert_eq (list/foldl (f {x acc} -> (+ acc x)) 0 [1 2 3 4]) 10)]
     (assert_eq (list/foldr (f {x acc} -> (- x acc)) 0 [1 2 3]) 2)))
 
 (test
+  "list/foldl and foldr preserve traversal order"
+  (let? [_ (assert_eq
+           (list/foldl (f {x acc} -> (list/append acc [x])) [] [1 2 3])
+           [1 2 3])]
+    (assert_eq
+      (list/foldr (f {x acc} -> (list/append acc [x])) [] [1 2 3])
+      [3 2 1])))
+
+(test
+  "list/folds on empty lists return the accumulator"
+  (let? [_ (assert_eq (list/foldl (f {x acc} -> (+ acc x)) 10 []) 10)]
+    (assert_eq (list/foldr (f {x acc} -> (+ acc x)) 10 []) 10)))
+
+(test
   "list/sort and flatten"
   (let? [_ (assert_eq (list/sort [3 1 2]) [1 2 3])]
     (assert_eq (list/flatten [[1 2] [3] [4 5]]) [1 2 3 4 5])))
+
+(test
+  "list/sort preserves duplicates"
+  (assert_eq (list/sort [3 1 2 1 3]) [1 1 2 3 3]))
+
+(test
+  "list/flatten handles empty nested lists"
+  (assert_eq (list/flatten [[] [1 2] [] [3]]) [1 2 3]))

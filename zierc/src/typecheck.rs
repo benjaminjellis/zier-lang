@@ -61,25 +61,36 @@ pub type TypeEnv = HashMap<String, Scheme>;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+pub struct MismatchTypeError {
+    expected: Rc<Type>,
+    found: Rc<Type>,
+    /// Precise source span of the offending sub-expression, if known.
+    span: Option<std::ops::Range<usize>>,
+    /// Span of an earlier argument that first constrained the expected type, if known.
+    prior_span: Option<std::ops::Range<usize>>,
+    /// Actual type of the argument at the offending span (may be richer than `found`,
+    /// which is a structural sub-component extracted by unification).
+    arg_ty: Option<Rc<Type>>,
+    /// Full expected argument type at the call site, if known.
+    expected_arg_ty: Option<Rc<Type>>,
+    /// Name of the function being called, for "X expects Y" context in the error.
+    callee_name: Option<String>,
+    /// Source span of the callee expression, for a secondary label.
+    callee_span: Option<std::ops::Range<usize>>,
+    /// Definition site of the callee, if it is a known local/top-level binding.
+    callee_def: Option<(usize, std::ops::Range<usize>)>,
+    /// Inferred type of the callee at the call site, if known.
+    callee_ty: Option<Rc<Type>>,
+}
+
+#[derive(Debug, Clone)]
 pub enum TypeError {
     OccursCheck {
         var: u64,
         ty: Rc<Type>,
     },
     Mismatch {
-        expected: Rc<Type>,
-        found: Rc<Type>,
-        /// Precise source span of the offending sub-expression, if known.
-        span: Option<std::ops::Range<usize>>,
-        /// Span of an earlier argument that first constrained the expected type, if known.
-        prior_span: Option<std::ops::Range<usize>>,
-        /// Actual type of the argument at the offending span (may be richer than `found`,
-        /// which is a structural sub-component extracted by unification).
-        arg_ty: Option<Rc<Type>>,
-        /// Name of the function being called, for "X expects Y" context in the error.
-        callee_name: Option<String>,
-        /// Source span of the callee expression, for a secondary label.
-        callee_span: Option<std::ops::Range<usize>>,
+        mismatch: Box<MismatchTypeError>,
     },
     BranchMismatch {
         then_ty: Rc<Type>,
@@ -113,30 +124,22 @@ impl TypeError {
     ) -> Vec<codespan_reporting::diagnostic::Diagnostic<usize>> {
         use codespan_reporting::diagnostic::{Diagnostic, Label};
         match self {
-            TypeError::Mismatch {
-                expected,
-                found,
-                span: precise_span,
-                prior_span,
-                arg_ty,
-                callee_name,
-                callee_span,
-            } => {
+            TypeError::Mismatch { mismatch } => {
                 // Share var_names so the same inference variable prints the same name
                 // in both expected and found (e.g. both show `'a` not `?5`/`?6`).
                 let mut var_names = std::collections::HashMap::new();
-                let expected_s = type_display_inner(expected, &mut var_names);
-                let found_s = type_display_inner(found, &mut var_names);
+                let expected_s = type_display_inner(&mismatch.expected, &mut var_names);
+                let found_s = type_display_inner(&mismatch.found, &mut var_names);
 
-                let is_non_function_call = callee_name.is_some()
-                    && !matches!(expected.as_ref(), Type::Fun(_, _))
-                    && matches!(found.as_ref(), Type::Fun(_, _));
+                let is_non_function_call = mismatch.callee_name.is_some()
+                    && !matches!(mismatch.expected.as_ref(), Type::Fun(_, _))
+                    && matches!(mismatch.found.as_ref(), Type::Fun(_, _));
                 if is_non_function_call {
-                    let label_span = precise_span.clone().unwrap_or(span.clone());
+                    let label_span = mismatch.span.clone().unwrap_or(span.clone());
                     let mut labels = vec![
                         Label::primary(file_id, label_span).with_message("argument provided here"),
                     ];
-                    if let (Some(name), Some(cs)) = (callee_name, callee_span) {
+                    if let (Some(name), Some(cs)) = (&mismatch.callee_name, &mismatch.callee_span) {
                         labels.push(
                             Label::secondary(file_id, cs.clone())
                                 .with_message(format!("`{name}` has type `{expected_s}`")),
@@ -145,9 +148,9 @@ impl TypeError {
 
                     let mut notes = vec![format!(
                         "`{}` is not a function and cannot be called",
-                        callee_name.as_deref().unwrap_or("this expression")
+                        mismatch.callee_name.as_deref().unwrap_or("this expression")
                     )];
-                    if let Some(name) = callee_name
+                    if let Some(name) = &mismatch.callee_name
                         && name
                             .chars()
                             .next()
@@ -163,7 +166,7 @@ impl TypeError {
                         Diagnostic::error()
                             .with_message(format!(
                                 "cannot call non-function `{}`",
-                                callee_name.as_deref().unwrap_or("expression")
+                                mismatch.callee_name.as_deref().unwrap_or("expression")
                             ))
                             .with_labels(labels)
                             .with_notes(notes),
@@ -172,11 +175,13 @@ impl TypeError {
 
                 let mut notes = vec![format!("expected `{expected_s}`, found `{found_s}`")];
                 // Helpful hints for common mismatches
-                if *expected == Type::unit() && matches!(found.as_ref(), Type::Fun(..)) {
+                if mismatch.expected == Type::unit()
+                    && matches!(mismatch.found.as_ref(), Type::Fun(..))
+                {
                     notes.push(
                         "hint: `Unit` is not a function — if you meant to sequence multiple expressions, use `(do expr1 expr2 ...)`".into(),
                     );
-                } else if *expected == Type::float() && *found == Type::int() {
+                } else if mismatch.expected == Type::float() && mismatch.found == Type::int() {
                     notes.push(
                         "hint: integer literals like `1` have type `Int`; write `1.0` for a `Float`".into(),
                     );
@@ -184,7 +189,7 @@ impl TypeError {
                         "hint: float operators use a `.` suffix — `+.` `-.` `*.` `/.` `<.` `>.`"
                             .into(),
                     );
-                } else if *expected == Type::int() && *found == Type::float() {
+                } else if mismatch.expected == Type::int() && mismatch.found == Type::float() {
                     notes.push(
                         "hint: float literals like `1.0` have type `Float`; write `1` for an `Int`"
                             .into(),
@@ -193,24 +198,41 @@ impl TypeError {
                         "hint: integer operators have no suffix — `+` `-` `*` `/` `<` `>`".into(),
                     );
                 }
-                let label_span = precise_span.clone().unwrap_or(span);
-                let primary_msg = if let Some(actual) = arg_ty {
+                let label_span = mismatch.span.clone().unwrap_or(span);
+                let primary_msg = if let Some(actual) = &mismatch.arg_ty {
                     format!("this argument has type `{}`", type_display(actual))
                 } else {
                     format!("this has type `{found_s}`")
                 };
+                let expected_here = mismatch
+                    .expected_arg_ty
+                    .as_ref()
+                    .map(|ty| type_display(ty))
+                    .unwrap_or_else(|| expected_s.clone());
                 let mut labels =
                     vec![Label::primary(file_id, label_span).with_message(primary_msg)];
-                if let Some(ps) = prior_span {
-                    labels.push(
-                        Label::secondary(file_id, ps.clone())
-                            .with_message(format!("`{expected_s}` inferred from this argument")),
-                    );
+                if let Some(ps) = &mismatch.prior_span {
+                    labels
+                        .push(Label::secondary(file_id, ps.clone()).with_message(format!(
+                            "`{expected_here}` inferred from this argument"
+                        )));
                 }
-                if let (Some(name), Some(cs)) = (callee_name, callee_span) {
+                if let (Some(name), Some(cs)) = (&mismatch.callee_name, &mismatch.callee_span) {
                     labels.push(
                         Label::secondary(file_id, cs.clone())
-                            .with_message(format!("`{name}` expects `{expected_s}` here")),
+                            .with_message(format!("`{name}` expects `{expected_here}` here")),
+                    );
+                }
+                if let (Some((def_file_id, def_span)), Some(name), Some(callee_ty)) = (
+                    mismatch.callee_def.clone(),
+                    mismatch.callee_name.clone(),
+                    &mismatch.callee_ty,
+                ) {
+                    labels.push(
+                        Label::secondary(def_file_id, def_span.clone()).with_message(format!(
+                            "`{name}` was inferred as `{}`",
+                            type_display(callee_ty)
+                        )),
                     );
                 }
                 vec![
@@ -321,7 +343,7 @@ impl TypeError {
     }
 }
 
-fn type_display(ty: &Type) -> String {
+pub fn type_display(ty: &Type) -> String {
     let mut var_names: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
     type_display_inner(ty, &mut var_names)
 }
@@ -431,6 +453,8 @@ fn free_vars(ty: &Type) -> HashSet<u64> {
 }
 
 fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
+    const GENERALIZED_VAR_BASE: u64 = u64::MAX - 4096;
+
     // 1. Get all variables currently free in the environment
     let env_fv: HashSet<u64> = env
         .values()
@@ -454,10 +478,17 @@ fn generalize(env: &TypeEnv, ty: &Rc<Type>) -> Scheme {
         .collect();
 
     vars.sort(); // Keep ordering deterministic
-    Scheme {
-        vars,
-        ty: ty.clone(),
-    }
+    let renumbering: Substitution = vars
+        .iter()
+        .enumerate()
+        .map(|(i, old)| (*old, Rc::new(Type::Var(GENERALIZED_VAR_BASE - i as u64))))
+        .collect();
+    let ty = apply_subst(&renumbering, ty);
+    let vars = (0..vars.len())
+        .map(|i| GENERALIZED_VAR_BASE - i as u64)
+        .collect();
+
+    Scheme { vars, ty }
 }
 
 fn is_non_expansive(expr: &Expr) -> bool {
@@ -509,13 +540,19 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
                 })
         }
         _ => Err(TypeError::Mismatch {
-            expected: t1.clone(),
-            found: t2.clone(),
-            span: None,
-            prior_span: None,
-            arg_ty: None,
-            callee_name: None,
-            callee_span: None,
+            mismatch: MismatchTypeError {
+                expected: t1.clone(),
+                found: t2.clone(),
+                span: None,
+                prior_span: None,
+                arg_ty: None,
+                expected_arg_ty: None,
+                callee_name: None,
+                callee_span: None,
+                callee_def: None,
+                callee_ty: None,
+            }
+            .into(),
         }),
     }
 }
@@ -529,6 +566,10 @@ pub struct TypeChecker {
     counter: u64,
     /// Maps type name → (file_id, definition span) for error reporting
     type_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
+    /// Maps value/function name → (file_id, definition span) for error reporting.
+    value_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
+    /// Best-effort inferred types for expression spans, used by editor tooling.
+    expr_types: Vec<(std::ops::Range<usize>, Rc<Type>)>,
 }
 
 impl TypeChecker {
@@ -536,6 +577,8 @@ impl TypeChecker {
         Self {
             counter: 0,
             type_def_spans: HashMap::new(),
+            value_def_spans: HashMap::new(),
+            expr_types: Vec::new(),
         }
     }
 
@@ -548,6 +591,24 @@ impl TypeChecker {
     fn instantiate(&mut self, scheme: &Scheme) -> Rc<Type> {
         let subst: Substitution = scheme.vars.iter().map(|&v| (v, self.fresh())).collect();
         apply_subst(&subst, &scheme.ty)
+    }
+
+    fn record_expr_type(&mut self, span: std::ops::Range<usize>, ty: Rc<Type>) {
+        if let Some((_, existing)) = self.expr_types.iter_mut().find(|(seen, _)| *seen == span) {
+            *existing = ty;
+            return;
+        }
+        self.expr_types.push((span, ty));
+    }
+
+    pub fn inferred_expr_types(&self) -> &[(std::ops::Range<usize>, Rc<Type>)] {
+        &self.expr_types
+    }
+
+    fn apply_expr_type_subst(&mut self, subst: &Substitution) {
+        for (_, ty) in &mut self.expr_types {
+            *ty = apply_subst(subst, ty);
+        }
     }
 
     pub fn infer(
@@ -564,6 +625,7 @@ impl TypeChecker {
                     Literal::String(_) => Type::string(),
                     Literal::Unit => Type::unit(),
                 };
+                self.record_expr_type(expr.span(), ty.clone());
                 Ok((HashMap::new(), ty))
             }
 
@@ -571,7 +633,9 @@ impl TypeChecker {
                 let scheme = env
                     .get(name)
                     .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
-                Ok((HashMap::new(), self.instantiate(scheme)))
+                let ty = self.instantiate(scheme);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((HashMap::new(), ty))
             }
 
             Expr::List(items, _) => {
@@ -585,7 +649,9 @@ impl TypeChecker {
                     let s_unify = unify(&known_elem, &t)?;
                     subst = compose_subst(&compose_subst(&s_unify, &s), &subst);
                 }
-                Ok((subst.clone(), Type::array(apply_subst(&subst, &elem_ty))))
+                let ty = Type::array(apply_subst(&subst, &elem_ty));
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((subst.clone(), ty))
             }
 
             Expr::If {
@@ -613,17 +679,25 @@ impl TypeChecker {
                     }
                 })?;
                 let s_res = compose_subst(&s_final, &s123);
-                Ok((s_res.clone(), apply_subst(&s_res, &t_then)))
+                let ty = apply_subst(&s_res, &t_then);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((s_res.clone(), ty))
             }
 
             Expr::Call {
                 func, args, span, ..
             } => {
-                let (callee_name, callee_span) = if let Expr::Variable(name, s) = func.as_ref() {
-                    (Some(name.clone()), Some(s.clone()))
-                } else {
-                    (None, None)
-                };
+                let (callee_name, callee_span, callee_def, callee_ty) =
+                    if let Expr::Variable(name, s) = func.as_ref() {
+                        (
+                            Some(name.clone()),
+                            Some(s.clone()),
+                            self.value_def_spans.get(name).cloned(),
+                            env.get(name).map(|scheme| self.instantiate(scheme)),
+                        )
+                    } else {
+                        (None, None, None, None)
+                    };
                 let (s0, mut t_func) = self.infer(env, func)?;
                 let mut subst = s0;
                 let mut prev_span: Option<std::ops::Range<usize>> = None;
@@ -634,22 +708,27 @@ impl TypeChecker {
                     let ret = self.fresh();
                     let s_unify = unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(
                         |e| match e {
-                            TypeError::Mismatch {
-                                expected, found, ..
-                            } => TypeError::Mismatch {
-                                expected,
-                                found,
-                                span: Some(span.clone()),
-                                prior_span: None,
-                                arg_ty: None,
-                                callee_name: callee_name.clone(),
-                                callee_span: callee_span.clone(),
+                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
+                                mismatch: MismatchTypeError {
+                                    expected: mismatch.expected,
+                                    found: mismatch.found,
+                                    span: Some(span.clone()),
+                                    prior_span: None,
+                                    arg_ty: None,
+                                    expected_arg_ty: None,
+                                    callee_name: callee_name.clone(),
+                                    callee_span: callee_span.clone(),
+                                    callee_def: callee_def.clone(),
+                                    callee_ty: callee_ty.clone(),
+                                }
+                                .into(),
                             },
                             other => other,
                         },
                     )?;
                     subst = compose_subst(&s_unify, &subst);
                     let result_ty = apply_subst(&subst, &ret);
+                    self.record_expr_type(expr.span(), result_ty.clone());
                     return Ok((subst, result_ty));
                 }
 
@@ -661,20 +740,29 @@ impl TypeChecker {
                     let ret = self.fresh();
                     let prior = prev_span.clone();
                     let t_arg_for_err = apply_subst(&subst, &t_arg);
+                    let expected_arg_for_err = if let Type::Fun(arg_ty, _) = t_func.as_ref() {
+                        Some(arg_ty.clone())
+                    } else {
+                        None
+                    };
                     let callee = callee_name.clone();
                     let cs = callee_span.clone();
                     let s_unify =
                         unify(&t_func, &Type::fun(t_arg, ret.clone())).map_err(|e| match e {
-                            TypeError::Mismatch {
-                                expected, found, ..
-                            } => TypeError::Mismatch {
-                                expected,
-                                found,
-                                span: Some(arg.span()),
-                                prior_span: prior,
-                                arg_ty: Some(t_arg_for_err),
-                                callee_name: callee,
-                                callee_span: cs,
+                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
+                                mismatch: MismatchTypeError {
+                                    expected: mismatch.expected,
+                                    found: mismatch.found,
+                                    span: Some(arg.span()),
+                                    prior_span: prior,
+                                    arg_ty: Some(t_arg_for_err),
+                                    expected_arg_ty: expected_arg_for_err,
+                                    callee_name: callee,
+                                    callee_span: cs,
+                                    callee_def: callee_def.clone(),
+                                    callee_ty: callee_ty.clone(),
+                                }
+                                .into(),
                             },
                             other => other,
                         })?;
@@ -682,6 +770,7 @@ impl TypeChecker {
                     t_func = apply_subst(&subst, &ret);
                     prev_span = Some(arg.span());
                 }
+                self.record_expr_type(expr.span(), t_func.clone());
                 Ok((subst, t_func))
             }
 
@@ -689,7 +778,12 @@ impl TypeChecker {
             // The function name is added to inner_env before inferring the body,
             // so it can call itself without any special keyword.
             Expr::LetFunc {
-                name, args, value, ..
+                name,
+                args,
+                arg_spans,
+                name_span,
+                value,
+                ..
             } => {
                 let arg_tys: Vec<Rc<Type>> = args.iter().map(|_| self.fresh()).collect();
                 let ret_ty = self.fresh();
@@ -701,7 +795,7 @@ impl TypeChecker {
                     .fold(ret_ty.clone(), |acc, a| Type::fun(a.clone(), acc));
 
                 let mut inner_env = env.clone();
-                for (arg, ty) in args.iter().zip(&arg_tys) {
+                for ((arg, span), ty) in args.iter().zip(arg_spans.iter()).zip(&arg_tys) {
                     inner_env.insert(
                         arg.clone(),
                         Scheme {
@@ -709,6 +803,7 @@ impl TypeChecker {
                             ty: ty.clone(),
                         },
                     );
+                    self.record_expr_type(span.clone(), ty.clone());
                 }
                 // Self-reference: name is in scope during its own body
                 inner_env.insert(
@@ -723,17 +818,28 @@ impl TypeChecker {
                 let s2 = unify(&apply_subst(&s1, &ret_ty), &t_val)?;
                 let s12 = compose_subst(&s2, &s1);
 
+                for (span, ty) in arg_spans.iter().zip(arg_tys.iter()) {
+                    self.record_expr_type(span.clone(), apply_subst(&s12, ty));
+                }
+
                 let binding_ty = apply_subst(&s12, &fun_ty);
+                self.record_expr_type(name_span.clone(), binding_ty.clone());
+                self.record_expr_type(expr.span(), binding_ty.clone());
                 Ok((s12, binding_ty))
             }
 
             // Sequential local binding — (let [x val] body).
             // The name is NOT in scope during its own value expression.
             Expr::LetLocal {
-                name, value, body, ..
+                name,
+                name_span,
+                value,
+                body,
+                ..
             } => {
                 let (s1, t_val) = self.infer(env, value)?;
                 let ty = apply_subst(&s1, &t_val);
+                self.record_expr_type(name_span.clone(), ty.clone());
                 let scheme = if is_non_expansive(value) {
                     generalize(&apply_subst_env(&s1, env), &ty)
                 } else {
@@ -744,7 +850,10 @@ impl TypeChecker {
                 body_env.insert(name.clone(), scheme);
                 let (s2, t_body) = self.infer(&body_env, body)?;
 
-                Ok((compose_subst(&s2, &s1), t_body))
+                let subst = compose_subst(&s2, &s1);
+                let ty = apply_subst(&subst, &t_body);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((subst, ty))
             }
 
             Expr::Match { targets, arms, .. } => {
@@ -782,8 +891,14 @@ impl TypeChecker {
                         found: found.clone(),
                     })?;
                     subst = compose_subst(&s_unify, &subst);
+
+                    for pat in pats {
+                        self.record_pattern_binding_types(pat, &subst, &pat_env);
+                    }
                 }
-                Ok((subst.clone(), apply_subst(&subst, &result_ty)))
+                let ty = apply_subst(&subst, &result_ty);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((subst.clone(), ty))
             }
 
             Expr::FieldAccess {
@@ -819,14 +934,21 @@ impl TypeChecker {
                 )?;
                 let s12 = compose_subst(&s2, &s1);
 
-                Ok((s12.clone(), apply_subst(&s12, &ret_ty)))
+                let ty = apply_subst(&s12, &ret_ty);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((s12.clone(), ty))
             }
 
-            Expr::Lambda { args, body, .. } => {
+            Expr::Lambda {
+                args,
+                arg_spans,
+                body,
+                ..
+            } => {
                 let mut inner_env = env.clone();
                 let mut arg_tys = Vec::new();
 
-                for arg in args {
+                for (arg, span) in args.iter().zip(arg_spans.iter()) {
                     let tv = self.fresh();
                     inner_env.insert(
                         arg.clone(),
@@ -835,6 +957,7 @@ impl TypeChecker {
                             ty: tv.clone(),
                         },
                     );
+                    self.record_expr_type(span.clone(), tv.clone());
                     arg_tys.push(tv);
                 }
 
@@ -848,6 +971,11 @@ impl TypeChecker {
                         Type::fun(apply_subst(&s, arg_ty), acc)
                     });
 
+                for (span, ty) in arg_spans.iter().zip(arg_tys.iter()) {
+                    self.record_expr_type(span.clone(), apply_subst(&s, ty));
+                }
+
+                self.record_expr_type(expr.span(), ty.clone());
                 Ok((s, ty))
             }
 
@@ -884,7 +1012,9 @@ impl TypeChecker {
                     subst = compose_subst(&s_field, &subst);
                 }
 
-                Ok((subst.clone(), apply_subst(&subst, &result_ty)))
+                let ty = apply_subst(&subst, &result_ty);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((subst.clone(), ty))
             }
 
             // Cross-module call: look up the function's type and check all arguments.
@@ -908,22 +1038,27 @@ impl TypeChecker {
                     let ret = self.fresh();
                     let s_unify = unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(
                         |e| match e {
-                            TypeError::Mismatch {
-                                expected, found, ..
-                            } => TypeError::Mismatch {
-                                expected,
-                                found,
-                                span: Some(span.clone()),
-                                prior_span: None,
-                                arg_ty: None,
-                                callee_name: Some(callee_name.clone()),
-                                callee_span: Some(fn_span.clone()),
+                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
+                                mismatch: MismatchTypeError {
+                                    expected: mismatch.expected,
+                                    found: mismatch.found,
+                                    span: Some(span.clone()),
+                                    prior_span: None,
+                                    arg_ty: None,
+                                    expected_arg_ty: None,
+                                    callee_name: Some(callee_name.clone()),
+                                    callee_span: Some(fn_span.clone()),
+                                    callee_def: None,
+                                    callee_ty: None,
+                                }
+                                .into(),
                             },
                             other => other,
                         },
                     )?;
                     subst = compose_subst(&s_unify, &subst);
                     let result_ty = apply_subst(&subst, &ret);
+                    self.record_expr_type(expr.span(), result_ty.clone());
                     return Ok((subst, result_ty));
                 }
                 for arg in args {
@@ -934,18 +1069,27 @@ impl TypeChecker {
                     let ret = self.fresh();
                     let prior = prev_span.clone();
                     let t_arg_for_err = apply_subst(&subst, &t_arg);
+                    let expected_arg_for_err = if let Type::Fun(arg_ty, _) = t_func.as_ref() {
+                        Some(arg_ty.clone())
+                    } else {
+                        None
+                    };
                     let s_unify =
                         unify(&t_func, &Type::fun(t_arg, ret.clone())).map_err(|e| match e {
-                            TypeError::Mismatch {
-                                expected, found, ..
-                            } => TypeError::Mismatch {
-                                expected,
-                                found,
-                                span: Some(arg.span()),
-                                prior_span: prior,
-                                arg_ty: Some(t_arg_for_err),
-                                callee_name: Some(callee_name.clone()),
-                                callee_span: Some(fn_span.clone()),
+                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
+                                mismatch: MismatchTypeError {
+                                    expected: mismatch.expected,
+                                    found: mismatch.found,
+                                    span: Some(arg.span()),
+                                    prior_span: prior,
+                                    arg_ty: Some(t_arg_for_err),
+                                    expected_arg_ty: expected_arg_for_err,
+                                    callee_name: Some(callee_name.clone()),
+                                    callee_span: Some(fn_span.clone()),
+                                    callee_def: None,
+                                    callee_ty: None,
+                                }
+                                .into(),
                             },
                             other => other,
                         })?;
@@ -954,6 +1098,7 @@ impl TypeChecker {
                     t_func = apply_subst(&subst, &ret);
                 }
 
+                self.record_expr_type(expr.span(), t_func.clone());
                 Ok((subst, t_func))
             }
         }
@@ -967,7 +1112,7 @@ impl TypeChecker {
     ) -> Result<(Substitution, TypeEnv), TypeError> {
         match pat {
             Pattern::Any(_) => Ok((HashMap::new(), env.clone())),
-            Pattern::Variable(name, _) => {
+            Pattern::Variable(name, span) => {
                 let mut new_env = env.clone();
                 new_env.insert(
                     name.clone(),
@@ -976,6 +1121,7 @@ impl TypeChecker {
                         ty: expected.clone(),
                     },
                 );
+                self.record_expr_type(span.clone(), expected.clone());
                 Ok((HashMap::new(), new_env))
             }
             Pattern::Literal(lit, _) => {
@@ -1005,13 +1151,19 @@ impl TypeChecker {
                         pat_env = new_env;
                     } else {
                         return Err(TypeError::Mismatch {
-                            expected: Type::fun(self.fresh(), self.fresh()),
-                            found: con_ty.clone(),
-                            span: None,
-                            prior_span: None,
-                            arg_ty: None,
-                            callee_name: None,
-                            callee_span: None,
+                            mismatch: MismatchTypeError {
+                                expected: Type::fun(self.fresh(), self.fresh()),
+                                found: con_ty.clone(),
+                                span: None,
+                                prior_span: None,
+                                arg_ty: None,
+                                expected_arg_ty: None,
+                                callee_name: None,
+                                callee_span: None,
+                                callee_def: None,
+                                callee_ty: None,
+                            }
+                            .into(),
                         });
                     }
                 }
@@ -1054,6 +1206,26 @@ impl TypeChecker {
             }
         }
     }
+
+    fn record_pattern_binding_types(&mut self, pat: &Pattern, subst: &Substitution, env: &TypeEnv) {
+        match pat {
+            Pattern::Variable(name, span) => {
+                if let Some(scheme) = env.get(name) {
+                    self.record_expr_type(span.clone(), apply_subst(subst, &scheme.ty));
+                }
+            }
+            Pattern::Constructor(_, args, _) | Pattern::Or(args, _) => {
+                for arg in args {
+                    self.record_pattern_binding_types(arg, subst, env);
+                }
+            }
+            Pattern::Cons(head, tail, _) => {
+                self.record_pattern_binding_types(head, subst, env);
+                self.record_pattern_binding_types(tail, subst, env);
+            }
+            Pattern::Any(_) | Pattern::Literal(_, _) | Pattern::EmptyList(_) => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1089,12 +1261,15 @@ impl TypeChecker {
                 Declaration::Expression(expr) => {
                     match self.infer(env, expr) {
                         Ok((s, ty)) => {
+                            self.apply_expr_type_subst(&s);
                             *env = apply_subst_env(&s, env);
                             // Named top-level functions must be available to subsequent declarations.
                             // 0-arg functions (let f {} body) are compiled as f(_Unit) -> body on
                             // the BEAM, so store them as Unit -> ReturnType in the env so that
                             // 0-arg call sites `(f)` unify correctly.
                             if let Expr::LetFunc { name, args, .. } = expr {
+                                self.value_def_spans
+                                    .insert(name.clone(), (file_id, expr.span()));
                                 let env_ty = if args.is_empty() {
                                     Type::fun(Type::unit(), ty.clone())
                                 } else {
@@ -1110,6 +1285,7 @@ impl TypeChecker {
                 }
                 Declaration::ExternLet {
                     name,
+                    name_span,
                     is_nullary,
                     ty,
                     ..
@@ -1119,6 +1295,7 @@ impl TypeChecker {
                         // {} means 0-arity Erlang function: wrap as Unit -> ReturnType
                         scheme.ty = Rc::new(Type::Fun(Type::unit(), scheme.ty));
                     }
+                    self.record_expr_type(name_span.clone(), scheme.ty.clone());
                     env.insert(name.clone(), scheme);
                 }
                 Declaration::ExternType { .. } | Declaration::Use { .. } => {
@@ -1133,6 +1310,7 @@ impl TypeChecker {
                     ));
                     match self.infer(env, body) {
                         Ok((s, ty)) => {
+                            self.apply_expr_type_subst(&s);
                             *env = apply_subst_env(&s, env);
                             let ty = apply_subst(&s, &ty);
                             if let Err(e) = unify(&ty, &expected) {
@@ -1656,6 +1834,54 @@ mod tests {
                 .any(|n| n.contains("nullary constructor")),
             "expected nullary constructor hint in notes: {:?}",
             diags[0].notes
+        );
+    }
+
+    #[test]
+    fn call_mismatch_mentions_inferred_callee_type() {
+        let src = r#"
+            (type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))
+            (extern let println ~ (String -> Unit) io/format)
+            (let match_and_print {val}
+              (match val
+                (Ok x) ~> (println x)
+                (Error err) ~> (println err)))
+            (let main {}
+              (let [good (Ok "hello")
+                    bad  (Error ())]
+                (do (match_and_print good)
+                    (match_and_print bad))))
+        "#;
+        let tokens = crate::lexer::Lexer::new(src).lex();
+        let mut lowerer = crate::lower::Lowerer::new();
+        let file_id = lowerer.add_file("test.zier".into(), src.into());
+        let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+            .parse()
+            .expect("parse failed");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+
+        let mut checker = TypeChecker::new();
+        let mut env = primitive_env();
+        let err = checker
+            .check_program(&mut env, &decls, file_id)
+            .expect_err("expected type error");
+        let (type_err, expr) = *err;
+        let diags = type_err.to_diagnostics(file_id, expr.span());
+
+        assert!(
+            diags[0]
+                .labels
+                .iter()
+                .any(|label| label.message.contains("`match_and_print` was inferred as")),
+            "expected inferred callee type label, got labels: {:?}",
+            diags[0].labels
+        );
+        assert!(
+            diags[0].labels.iter().any(|label| label
+                .message
+                .contains("`match_and_print` expects `Result String String` here")),
+            "expected full argument type label, got labels: {:?}",
+            diags[0].labels
         );
     }
 

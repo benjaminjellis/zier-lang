@@ -5,8 +5,6 @@
 ;; This function has to iterate across the whole string to count the number of
 ;; graphemes, so it runs in linear time. Avoid using this in a loop.
 (pub extern let length ~ (String -> Int) string/length)
-
-
 (pub extern let trim ~ (String -> String) string/trim)
 
 ;; Converts String to a case-agnostic comparable string

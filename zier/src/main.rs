@@ -42,6 +42,7 @@ struct Cli {
 enum Commands {
     Run,
     Test,
+    Lsp,
     Format {
         /// File to format (formats all source files if omitted)
         #[arg(long)]
@@ -87,6 +88,11 @@ fn main() -> eyre::Result<()> {
         }
         Commands::Test => {
             test::test(root)?;
+        }
+        Commands::Lsp => {
+            tokio::runtime::Runtime::new()?.block_on(async {
+                zier_lsp::serve(tokio::io::stdin(), tokio::io::stdout()).await;
+            });
         }
         Commands::Release => {
             release::release(root)?;

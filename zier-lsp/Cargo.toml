@@ -4,3 +4,9 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+tower-lsp = { workspace = true }
+codespan-reporting = { workspace = true }
+include_dir = { workspace = true }
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+zierc = { path = "../zierc" }
+zier-format = { path = "../zier-format" }

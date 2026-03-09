@@ -14,5 +14,6 @@ include_dir = "0.7"
 logos = "0.16"
 toml = "1.0"
 serde = { version = "1", features = ["derive"] }
+tower-lsp = "0.20.0"
 semver = "1.0.27"
 walkdir = "2.5.0"

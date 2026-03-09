@@ -694,17 +694,20 @@ impl Lowerer {
             return None;
         }
 
-        let args = match &items[1] {
+        let (args, arg_spans) = match &items[1] {
             SExpr::Curly(params, _) => params
                 .iter()
                 .filter_map(|p| {
                     if let SExpr::Atom(t) = p {
-                        Some(self.source_at(file_id, t.span.clone()).to_string())
+                        Some((
+                            self.source_at(file_id, t.span.clone()).to_string(),
+                            t.span.clone(),
+                        ))
                     } else {
                         None
                     }
                 })
-                .collect(),
+                .unzip(),
             _ => {
                 self.error(
                     Diagnostic::error()
@@ -738,6 +741,7 @@ impl Lowerer {
         let body = self.lower_expr(file_id, &items[3])?;
         Some(Expr::Lambda {
             args,
+            arg_spans,
             body: Box::new(body),
             span,
         })
@@ -751,7 +755,16 @@ impl Lowerer {
     ) -> Option<Expr> {
         // (let? [a expr1 b expr2] body)
         // items[0] = let?, items[1] = Square([name val ...]), items[2] = body
-        if items.len() != 3 {
+        if items.len() < 3 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("let? requires a body expression")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec!["syntax: (let? [name expr ...] body)".into()]),
+            );
+            return None;
+        }
+        if items.len() > 3 {
             self.error(
                 Diagnostic::error()
                     .with_message("invalid let? syntax")
@@ -811,6 +824,7 @@ impl Lowerer {
         let result = pairs.into_iter().rev().fold(body, |inner, (name, val)| {
             let lambda = Expr::Lambda {
                 args: vec![name],
+                arg_spans: vec![span.clone()],
                 body: Box::new(inner),
                 span: span.clone(),
             };
@@ -1205,6 +1219,7 @@ impl Lowerer {
 
         Some(Declaration::ExternLet {
             name,
+            name_span: items[2].span(),
             is_pub,
             is_nullary,
             ty,
@@ -1858,6 +1873,7 @@ impl Lowerer {
                 .rev()
                 .fold(last, |body, expr| Expr::LetLocal {
                     name: "_".to_string(),
+                    name_span: span.clone(),
                     value: Box::new(expr),
                     body: Box::new(body),
                     span: span.clone(),
@@ -1912,6 +1928,7 @@ impl Lowerer {
                             .rev()
                             .fold(last, |body, expr| Expr::LetLocal {
                                 name: "_".to_string(),
+                                name_span: span.clone(),
                                 value: Box::new(expr),
                                 body: Box::new(body),
                                 span: span.clone(),
@@ -1921,8 +1938,11 @@ impl Lowerer {
 
                 // We fold the bindings backwards to create nested LetLocal expressions
                 for chunk in bindings.chunks(2).rev() {
-                    let name = match &chunk[0] {
-                        SExpr::Atom(t) => self.source_at(file_id, t.span.clone()).to_string(),
+                    let (name, name_span) = match &chunk[0] {
+                        SExpr::Atom(t) => (
+                            self.source_at(file_id, t.span.clone()).to_string(),
+                            t.span.clone(),
+                        ),
                         other => {
                             let mut diag = Diagnostic::error()
                                 .with_message("expected identifier in let-binding name position")
@@ -1948,6 +1968,7 @@ impl Lowerer {
 
                     current_expr = Expr::LetLocal {
                         name,
+                        name_span,
                         value: Box::new(value),
                         body: Box::new(current_expr),
                         span: span.clone(),
@@ -1959,18 +1980,21 @@ impl Lowerer {
             // CASE B: Function Definition -> (let f {a b} body)
             Some(SExpr::Atom(name_token)) => {
                 let name = self.source_at(file_id, name_token.span.clone()).to_string();
+                let name_span = name_token.span.clone();
                 cursor += 1;
 
                 // STRICT ENFORCEMENT: The next item MUST be Curly brackets {}
-                let args = if let Some(SExpr::Curly(params, _)) = items.get(cursor) {
+                let (args, arg_spans) = if let Some(SExpr::Curly(params, _)) = items.get(cursor) {
                     let mut arg_names = Vec::new();
+                    let mut arg_spans = Vec::new();
                     for p in params {
                         if let SExpr::Atom(t) = p {
                             arg_names.push(self.source_at(file_id, t.span.clone()).to_string());
+                            arg_spans.push(t.span.clone());
                         }
                     }
                     cursor += 1;
-                    arg_names
+                    (arg_names, arg_spans)
                 } else {
                     // This catches (let x 42 ...) and rejects it.
                     self.error(
@@ -2013,6 +2037,7 @@ impl Lowerer {
                         .rev()
                         .fold(last, |body, expr| Expr::LetLocal {
                             name: "_".to_string(),
+                            name_span: span.clone(),
                             value: Box::new(expr),
                             body: Box::new(body),
                             span: span.clone(),
@@ -2023,6 +2048,8 @@ impl Lowerer {
                     is_pub,
                     name,
                     args,
+                    arg_spans,
+                    name_span,
                     value: Box::new(value),
                     span,
                 })
@@ -2944,6 +2971,18 @@ mod tests {
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty());
         assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_let_bind_missing_body_is_error() {
+        let (mut lowerer, file_id, sexprs) = setup("(let? [_ (Ok ())])");
+        let result = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(result.is_none());
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "let? requires a body expression"
+        );
     }
 
     #[test]

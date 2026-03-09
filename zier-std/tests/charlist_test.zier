@@ -1,0 +1,9 @@
+(use std/charlist)
+(use std/testing)
+
+(test
+  "to string and back again"
+  (let [test_string       "Hello, from erlang"
+        test_string_recon (charlist/to_string
+          (charlist/from_string test_string))]
+    (testing/assert_eq test_string_recon test_string)))

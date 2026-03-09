@@ -183,6 +183,7 @@ fn unused_function_spans(decls: &[ast::Declaration]) -> Vec<(String, std::ops::R
                 args,
                 value,
                 span,
+                ..
             }) => {
                 top_level.insert(
                     name.clone(),
@@ -1056,12 +1057,11 @@ pub fn exported_type_decls(source: &str) -> Vec<ast::TypeDecl> {
         .collect()
 }
 
-/// Type-check a module and return the inferred schemes for its pub-exported functions.
-/// Keys are plain function names ("get", "put", ...) — the caller prefixes with the
-/// module name when building the imported_schemes map for dependent modules.
+/// Type-check a module and return the inferred schemes for its top-level functions.
+/// Keys are plain function names ("get", "put", ...).
 ///
 /// Returns an empty map if the module fails to parse or type-check.
-pub fn infer_module_exports(
+pub fn infer_module_bindings(
     module_name: &str,
     source: &str,
     imports: HashMap<String, String>,
@@ -1111,7 +1111,110 @@ pub fn infer_module_exports(
         return HashMap::new();
     }
 
-    // Collect pub function names from this module
+    // Collect top-level functions from this module.
+    let binding_names: std::collections::HashSet<&str> = decls
+        .iter()
+        .filter_map(|d| match d {
+            ast::Declaration::Expression(ast::Expr::LetFunc { name, .. }) => Some(name.as_str()),
+            ast::Declaration::ExternLet { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    env.into_iter()
+        .filter(|(k, _)| binding_names.contains(k.as_str()))
+        .collect()
+}
+
+/// Type-check a module and return best-effort inferred expression types keyed by source span.
+///
+/// This is intended for editor tooling such as hover. Types are recorded after local
+/// inference steps and may be less precise than the final principal type for some
+/// outer-constrained expressions, but they are accurate for most variables and subexpressions.
+pub fn infer_module_expr_types(
+    module_name: &str,
+    source: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
+    imported_type_decls: &[ast::TypeDecl],
+    imported_schemes: &typecheck::TypeEnv,
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut sess = session::CompilerSession::new(session::SessionOptions {
+        emit_diagnostics: false,
+        emit_warnings: false,
+    });
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(source).lex();
+    let file_id = lowerer.add_file(format!("{module_name}.zier"), source.to_string());
+
+    let sexprs = match crate::sexpr::SExprParser::new(tokens, file_id).parse() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let decls = lowerer.lower_file(file_id, &sexprs);
+    if !lowerer.diagnostics.is_empty() {
+        return Vec::new();
+    }
+
+    let mut checker = typecheck::TypeChecker::new();
+    let mut env = typecheck::primitive_env();
+    for type_decl in imported_type_decls {
+        env.extend(typecheck::constructor_schemes(type_decl));
+    }
+    env.extend(imported_schemes.clone());
+
+    let unresolved = resolve::unresolved_env_names(
+        &decls,
+        imports.keys().cloned(),
+        &env,
+        sess.symbol_table(module_exports),
+    );
+    env.extend(typecheck::import_env(&unresolved));
+
+    if checker.check_program(&mut env, &decls, file_id).is_err() {
+        return Vec::new();
+    }
+
+    checker
+        .inferred_expr_types()
+        .iter()
+        .map(|(span, ty)| (span.clone(), typecheck::type_display(ty)))
+        .collect()
+}
+
+/// Type-check a module and return the inferred schemes for its pub-exported functions.
+/// Keys are plain function names ("get", "put", ...) — the caller prefixes with the
+/// module name when building the imported_schemes map for dependent modules.
+///
+/// Returns an empty map if the module fails to parse or type-check.
+pub fn infer_module_exports(
+    module_name: &str,
+    source: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
+    imported_type_decls: &[ast::TypeDecl],
+    imported_schemes: &typecheck::TypeEnv,
+) -> typecheck::TypeEnv {
+    let all_bindings = infer_module_bindings(
+        module_name,
+        source,
+        imports,
+        module_exports,
+        imported_type_decls,
+        imported_schemes,
+    );
+
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(source).lex();
+    let file_id = lowerer.add_file(format!("{module_name}.zier"), source.to_string());
+    let Ok(sexprs) = crate::sexpr::SExprParser::new(tokens, file_id).parse() else {
+        return HashMap::new();
+    };
+    let decls = lowerer.lower_file(file_id, &sexprs);
+    if !lowerer.diagnostics.is_empty() {
+        return HashMap::new();
+    }
+
     let pub_names: std::collections::HashSet<&str> = decls
         .iter()
         .filter_map(|d| match d {
@@ -1125,7 +1228,8 @@ pub fn infer_module_exports(
         })
         .collect();
 
-    env.into_iter()
+    all_bindings
+        .into_iter()
         .filter(|(k, _)| pub_names.contains(k.as_str()))
         .collect()
 }
@@ -1286,6 +1390,264 @@ mod tests {
         let src = "(pub use std/io)\n(use std/result)\n(pub use math)";
         let reexports = pub_reexports(src);
         assert_eq!(reexports, vec!["io".to_string(), "math".to_string()]);
+    }
+
+    #[test]
+    fn infer_module_exports_preserves_result_bind_error_type() {
+        let src = include_str!("../../zier-std/src/result.zier");
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "result".to_string(),
+            vec!["Result".to_string(), "bind".to_string()],
+        );
+
+        let schemes = infer_module_exports(
+            "result",
+            src,
+            HashMap::new(),
+            &module_exports,
+            &[],
+            &HashMap::new(),
+        );
+
+        let bind = schemes.get("bind").expect("missing bind export");
+        assert_eq!(
+            bind.vars.len(),
+            3,
+            "bind should quantify success, continuation result, and error"
+        );
+        let bind_var_set: std::collections::HashSet<u64> = bind.vars.iter().copied().collect();
+        assert_eq!(
+            bind_var_set.len(),
+            3,
+            "bind quantified vars should be distinct"
+        );
+        match bind.ty.as_ref() {
+            typecheck::Type::Fun(m, rest) => {
+                match m.as_ref() {
+                    typecheck::Type::Con(name, args) => {
+                        assert_eq!(name, "Result");
+                        assert_eq!(args.len(), 2);
+                        assert_ne!(args[0], args[1], "success and error vars collapsed");
+                    }
+                    other => panic!("expected Result argument, got {other:?}"),
+                }
+                match rest.as_ref() {
+                    typecheck::Type::Fun(func, ret) => {
+                        match func.as_ref() {
+                            typecheck::Type::Fun(arg, func_ret) => {
+                                assert_eq!(
+                                    arg,
+                                    &match m.as_ref() {
+                                        typecheck::Type::Con(_, args) => args[0].clone(),
+                                        _ => unreachable!(),
+                                    }
+                                );
+                                match func_ret.as_ref() {
+                                    typecheck::Type::Con(name, args) => {
+                                        assert_eq!(name, "Result");
+                                        assert_eq!(args.len(), 2);
+                                    }
+                                    other => panic!("expected Result return, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected function continuation, got {other:?}"),
+                        }
+                        match ret.as_ref() {
+                            typecheck::Type::Con(name, args) => {
+                                assert_eq!(name, "Result");
+                                assert_eq!(args.len(), 2);
+                            }
+                            other => panic!("expected Result return, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected second function arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected function type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imported_result_bind_reports_continuation_mismatch() {
+        let result_src = include_str!("../../zier-std/src/result.zier");
+        let io_src = include_str!("../../zier-std/src/io.zier");
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "result".to_string(),
+            vec!["Result".to_string(), "bind".to_string()],
+        );
+        module_exports.insert(
+            "io".to_string(),
+            vec!["println".to_string(), "debug".to_string()],
+        );
+
+        let result_schemes = infer_module_exports(
+            "result",
+            result_src,
+            HashMap::new(),
+            &module_exports,
+            &[],
+            &HashMap::new(),
+        );
+        let io_schemes = infer_module_exports(
+            "io",
+            io_src,
+            HashMap::new(),
+            &module_exports,
+            &[],
+            &HashMap::new(),
+        );
+
+        let mut imported_schemes = HashMap::new();
+        imported_schemes.insert("bind".to_string(), result_schemes["bind"].clone());
+        imported_schemes.insert("result/bind".to_string(), result_schemes["bind"].clone());
+        imported_schemes.insert("debug".to_string(), io_schemes["debug"].clone());
+        imported_schemes.insert("io/debug".to_string(), io_schemes["debug"].clone());
+
+        let imported_type_decls = exported_type_decls(result_src);
+        let mut imports = HashMap::new();
+        imports.insert("bind".to_string(), "result".to_string());
+        imports.insert("debug".to_string(), "io".to_string());
+
+        let src = r#"
+            (use result [Result bind])
+            (use io [debug])
+            (let ok {} (Ok ()))
+            (let main {}
+              (let? [val (ok)]
+                (debug val)))
+        "#;
+
+        let report = compile_with_imports_report(
+            "main",
+            src,
+            "main.zier",
+            imports,
+            &module_exports,
+            HashMap::new(),
+            &imported_type_decls,
+            &imported_schemes,
+        );
+
+        assert!(report.has_errors(), "expected type error");
+        let rendered: Vec<String> = report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|msg| msg.contains("type mismatch: expected `Result")),
+            "unexpected diagnostics: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
+        let result_src = include_str!("../../zier-std/src/result.zier");
+        let io_src = include_str!("../../zier-std/src/io.zier");
+        let testing_src = include_str!("../../zier-std/src/testing.zier");
+
+        let mut module_exports = HashMap::new();
+        module_exports.insert(
+            "result".to_string(),
+            vec!["Result".to_string(), "bind".to_string()],
+        );
+        module_exports.insert(
+            "io".to_string(),
+            vec!["println".to_string(), "debug".to_string()],
+        );
+        module_exports.insert(
+            "testing".to_string(),
+            vec![
+                "assert".to_string(),
+                "assert_eq".to_string(),
+                "assert_ne".to_string(),
+            ],
+        );
+
+        let result_schemes = infer_module_exports(
+            "result",
+            result_src,
+            HashMap::new(),
+            &module_exports,
+            &[],
+            &HashMap::new(),
+        );
+        let io_schemes = infer_module_exports(
+            "io",
+            io_src,
+            HashMap::new(),
+            &module_exports,
+            &[],
+            &HashMap::new(),
+        );
+        let testing_schemes = infer_module_exports(
+            "testing",
+            testing_src,
+            HashMap::new(),
+            &module_exports,
+            &exported_type_decls(result_src),
+            &result_schemes,
+        );
+
+        let mut imported_schemes = HashMap::new();
+        for (name, scheme) in &result_schemes {
+            imported_schemes.insert(name.clone(), scheme.clone());
+            imported_schemes.insert(format!("result/{name}"), scheme.clone());
+        }
+        for (name, scheme) in &io_schemes {
+            imported_schemes.insert(name.clone(), scheme.clone());
+            imported_schemes.insert(format!("io/{name}"), scheme.clone());
+        }
+        for (name, scheme) in &testing_schemes {
+            imported_schemes.insert(name.clone(), scheme.clone());
+            imported_schemes.insert(format!("testing/{name}"), scheme.clone());
+        }
+
+        let mut imports = HashMap::new();
+        imports.insert("bind".to_string(), "result".to_string());
+        imports.insert("debug".to_string(), "io".to_string());
+        imports.insert("assert_eq".to_string(), "testing".to_string());
+
+        let mut imported_type_decls = exported_type_decls(result_src);
+        imported_type_decls.extend(exported_type_decls(testing_src));
+
+        let src = r#"
+            (use result [bind])
+            (use io)
+            (use testing [assert_eq])
+            (test "x"
+              (let? [val (assert_eq 1 1)]
+                (io/debug val)))
+        "#;
+
+        let report = compile_with_imports_report(
+            "string_test",
+            src,
+            "tests/string_test.zier",
+            imports,
+            &module_exports,
+            HashMap::new(),
+            &imported_type_decls,
+            &imported_schemes,
+        );
+
+        assert!(report.has_errors(), "expected type error");
+        let labels: Vec<String> = report
+            .diagnostics
+            .iter()
+            .flat_map(|d| d.labels.iter().map(|l| l.message.clone()))
+            .collect();
+        assert!(
+            labels
+                .iter()
+                .any(|msg| msg.contains("`bind` expects `(Unit -> Result")),
+            "unexpected labels: {labels:?}"
+        );
     }
 
     #[test]
@@ -1533,5 +1895,36 @@ mod tests {
             unused_type_spans(&decls).is_empty(),
             "expected type to be considered used via constructor"
         );
+    }
+
+    #[test]
+    fn infer_module_expr_types_include_function_arg_and_match_binding_spans() {
+        let src = "(let inspect {input}\n\
+                     (match 1\n\
+                       value ~> (+ value input)))";
+        let expr_types = infer_module_expr_types(
+            "main",
+            src,
+            HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+
+        let find_type = |needle: &str, nth: usize| -> Option<String> {
+            src.match_indices(needle)
+                .nth(nth)
+                .and_then(|(start, needle)| {
+                    expr_types
+                        .iter()
+                        .filter(|(span, _)| span.start <= start && start + needle.len() <= span.end)
+                        .min_by_key(|(span, _)| span.end.saturating_sub(span.start))
+                        .map(|(_, ty)| ty.clone())
+                })
+        };
+
+        assert_eq!(find_type("input", 0).as_deref(), Some("Int"));
+        assert_eq!(find_type("value", 0).as_deref(), Some("Int"));
+        assert_eq!(find_type("input", 1).as_deref(), Some("Int"));
     }
 }

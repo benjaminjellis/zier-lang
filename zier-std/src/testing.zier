@@ -1,8 +1,7 @@
 (use result)
 
 ;; Returns Ok if cond is True, Error with a message otherwise.
-(pub let assert {cond}
-  (if cond (Ok ()) (Error "assertion failed")))
+(pub let assert {cond} (if cond (Ok ()) (Error "assertion failed")))
 
 ;; Returns Ok if a equals b, Error with a formatted message otherwise.
 (pub extern let assert_eq ~ ('a -> 'a -> (Result Unit String)) zier_testing_helpers/assert_eq)

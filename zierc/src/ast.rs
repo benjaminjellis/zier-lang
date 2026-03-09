@@ -32,6 +32,7 @@ pub enum Declaration {
     /// or  (extern let name {} ~ ReturnType module/function)  -- nullary Erlang function
     ExternLet {
         name: String,
+        name_span: Range<usize>,
         is_pub: bool,
         is_nullary: bool,
         ty: TypeSig,
@@ -100,12 +101,15 @@ pub enum Expr {
         is_pub: bool,
         name: String,
         args: Vec<String>,
+        arg_spans: Vec<Range<usize>>,
+        name_span: Range<usize>,
         value: Box<Expr>,
         span: Range<usize>,
     },
     /// (let [name value ...] body) — sequential local bindings
     LetLocal {
         name: String,
+        name_span: Range<usize>,
         value: Box<Expr>,
         body: Box<Expr>,
         span: Range<usize>,
@@ -141,6 +145,7 @@ pub enum Expr {
     /// (f {x y} -> body) — anonymous function
     Lambda {
         args: Vec<String>,
+        arg_spans: Vec<Range<usize>>,
         body: Box<Expr>,
         span: Range<usize>,
     },
