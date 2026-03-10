@@ -12,6 +12,8 @@
   - [List](./lists.md)
   - [If / Else](./if_else.md)
   - [Match](./match.md)
+  - [Currying](./currying.md)
+  - [Pipe](./pipe.md)
 - [The Standard Library](./the_standard_library.md)
  - [Testing](./testing.md)
   - [Erlang FFI](./erlang_ffi.md)

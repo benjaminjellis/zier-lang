@@ -5,7 +5,6 @@ mod gitignore;
 mod manifest;
 mod new;
 mod release;
-mod resolve;
 mod test;
 mod ui;
 mod utils;

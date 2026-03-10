@@ -306,6 +306,79 @@ fn collect_unqualified_free_vars(
     }
 }
 
+fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
+    use ast::Expr;
+    match expr {
+        Expr::Literal(_, _) | Expr::Variable(_, _) => {}
+        Expr::List(items, _) => {
+            for item in items {
+                collect_qualified_module_refs(item, out);
+            }
+        }
+        Expr::LetFunc { value, .. } => {
+            collect_qualified_module_refs(value, out);
+        }
+        Expr::LetLocal { value, body, .. } => {
+            collect_qualified_module_refs(value, out);
+            collect_qualified_module_refs(body, out);
+        }
+        Expr::If {
+            cond, then, els, ..
+        } => {
+            collect_qualified_module_refs(cond, out);
+            collect_qualified_module_refs(then, out);
+            collect_qualified_module_refs(els, out);
+        }
+        Expr::Call { func, args, .. } => {
+            collect_qualified_module_refs(func, out);
+            for arg in args {
+                collect_qualified_module_refs(arg, out);
+            }
+        }
+        Expr::Match { targets, arms, .. } => {
+            for target in targets {
+                collect_qualified_module_refs(target, out);
+            }
+            for (_, body) in arms {
+                collect_qualified_module_refs(body, out);
+            }
+        }
+        Expr::FieldAccess { record, .. } => {
+            collect_qualified_module_refs(record, out);
+        }
+        Expr::RecordConstruct { fields, .. } => {
+            for (_, value) in fields {
+                collect_qualified_module_refs(value, out);
+            }
+        }
+        Expr::Lambda { body, .. } => {
+            collect_qualified_module_refs(body, out);
+        }
+        Expr::QualifiedCall { module, args, .. } => {
+            out.insert(module.clone());
+            for arg in args {
+                collect_qualified_module_refs(arg, out);
+            }
+        }
+    }
+}
+
+fn used_qualified_modules(decls: &[ast::Declaration]) -> HashSet<String> {
+    let mut used = HashSet::new();
+    for decl in decls {
+        match decl {
+            ast::Declaration::Expression(ast::Expr::LetFunc { value, .. }) => {
+                collect_qualified_module_refs(value, &mut used);
+            }
+            ast::Declaration::Test { body, .. } => {
+                collect_qualified_module_refs(body, &mut used);
+            }
+            _ => {}
+        }
+    }
+    used
+}
+
 fn collect_type_usage_names(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
     match ty {
         ast::TypeUsage::Named(name) => {
@@ -486,40 +559,113 @@ fn collect_expr_type_decl_refs(
     }
 }
 
-pub(crate) fn duplicate_import_diagnostics(
+enum TopLevelValueOrigin {
+    Function,
+    Extern,
+    Import { module: String },
+}
+
+impl TopLevelValueOrigin {
+    fn first_message(&self) -> String {
+        match self {
+            TopLevelValueOrigin::Function => "first defined here".to_string(),
+            TopLevelValueOrigin::Extern => "first declared here".to_string(),
+            TopLevelValueOrigin::Import { module } => {
+                format!("first imported from `{module}` here")
+            }
+        }
+    }
+
+    fn second_message(&self) -> String {
+        match self {
+            TopLevelValueOrigin::Function => "redefined here".to_string(),
+            TopLevelValueOrigin::Extern => "redeclared here".to_string(),
+            TopLevelValueOrigin::Import { module } => {
+                format!("also imported from `{module}` here")
+            }
+        }
+    }
+}
+
+pub(crate) fn duplicate_top_level_value_diagnostics(
     decls: &[ast::Declaration],
     file_id: usize,
     module_exports: &HashMap<String, Vec<String>>,
 ) -> Vec<Diagnostic<usize>> {
-    let mut imported: HashMap<String, (String, std::ops::Range<usize>)> = HashMap::new();
+    let mut seen: HashMap<String, (TopLevelValueOrigin, std::ops::Range<usize>)> = HashMap::new();
     let mut diags = Vec::new();
 
     for decl in decls {
-        let ast::Declaration::Use {
-            path: (_, mod_name),
-            unqualified,
-            span,
-            ..
-        } = decl
-        else {
-            continue;
-        };
-
-        for name in imported_names_for_use_decl(mod_name, unqualified, module_exports) {
-            if let Some((first_module, first_span)) = imported.get(&name) {
-                diags.push(
-                    Diagnostic::error()
-                        .with_message(format!("duplicate import `{name}`"))
-                        .with_labels(vec![
-                            Label::primary(file_id, span.clone())
-                                .with_message(format!("`{name}` also imported here")),
-                            Label::secondary(file_id, first_span.clone())
-                                .with_message(format!("first imported from `{first_module}`")),
-                        ]),
-                );
-            } else {
-                imported.insert(name, (mod_name.clone(), span.clone()));
+        match decl {
+            ast::Declaration::Expression(ast::Expr::LetFunc {
+                name, name_span, ..
+            }) => {
+                if let Some((first_origin, first_span)) = seen.get(name) {
+                    diags.push(
+                        Diagnostic::error()
+                            .with_message(format!("duplicate top-level name `{name}`"))
+                            .with_labels(vec![
+                                Label::primary(file_id, name_span.clone())
+                                    .with_message(format!("`{name}` redefined here")),
+                                Label::secondary(file_id, first_span.clone())
+                                    .with_message(first_origin.first_message()),
+                            ]),
+                    );
+                } else {
+                    seen.insert(
+                        name.clone(),
+                        (TopLevelValueOrigin::Function, name_span.clone()),
+                    );
+                }
             }
+            ast::Declaration::ExternLet {
+                name, name_span, ..
+            } => {
+                if let Some((first_origin, first_span)) = seen.get(name) {
+                    diags.push(
+                        Diagnostic::error()
+                            .with_message(format!("duplicate top-level name `{name}`"))
+                            .with_labels(vec![
+                                Label::primary(file_id, name_span.clone())
+                                    .with_message(format!("`{name}` redeclared here")),
+                                Label::secondary(file_id, first_span.clone())
+                                    .with_message(first_origin.first_message()),
+                            ]),
+                    );
+                } else {
+                    seen.insert(
+                        name.clone(),
+                        (TopLevelValueOrigin::Extern, name_span.clone()),
+                    );
+                }
+            }
+            ast::Declaration::Use {
+                path: (_, mod_name),
+                unqualified,
+                span,
+                ..
+            } => {
+                for name in imported_names_for_use_decl(mod_name, unqualified, module_exports) {
+                    let origin = TopLevelValueOrigin::Import {
+                        module: mod_name.clone(),
+                    };
+                    if let Some((first_origin, first_span)) = seen.get(&name) {
+                        diags.push(
+                            Diagnostic::error()
+                                .with_message(format!("duplicate top-level name `{name}`"))
+                                .with_labels(vec![
+                                    Label::primary(file_id, span.clone())
+                                        .with_message(origin.second_message()),
+                                    Label::secondary(file_id, first_span.clone())
+                                        .with_message(first_origin.first_message()),
+                                ]),
+                        );
+                    } else {
+                        seen.insert(name, (origin, span.clone()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -722,6 +868,7 @@ pub(crate) fn unused_unqualified_import_diagnostics(
     imported_type_decls: &[ast::TypeDecl],
 ) -> Vec<Diagnostic<usize>> {
     let used = used_unqualified_names(decls);
+    let used_modules = used_qualified_modules(decls);
     let mut diags = Vec::new();
 
     for decl in decls {
@@ -736,7 +883,18 @@ pub(crate) fn unused_unqualified_import_diagnostics(
         };
 
         match unqualified {
-            ast::UnqualifiedImports::None => {}
+            ast::UnqualifiedImports::None => {
+                if !used_modules.contains(mod_name.as_str()) {
+                    diags.push(
+                        Diagnostic::warning()
+                            .with_message(format!("unused import `{mod_name}`"))
+                            .with_labels(vec![
+                                Label::primary(file_id, span.clone())
+                                    .with_message("this module import is never used"),
+                            ]),
+                    );
+                }
+            }
             ast::UnqualifiedImports::Specific(names) => {
                 let unused: Vec<String> = names
                     .iter()

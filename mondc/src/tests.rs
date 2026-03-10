@@ -62,6 +62,60 @@ fn duplicate_unqualified_imports_error() {
 }
 
 #[test]
+fn duplicate_top_level_function_defs_error() {
+    let src = "(let hello {} 1)\n(let hello {} 2)";
+    let result = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &HashMap::new(),
+    );
+    assert!(result.is_none());
+}
+
+#[test]
+fn top_level_function_conflicts_with_unqualified_import() {
+    let mut module_exports = HashMap::new();
+    module_exports.insert("greetings".to_string(), vec!["hello".to_string()]);
+
+    let src = "(use greetings [hello])\n(let hello {} 1)";
+    let result = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &module_exports,
+        HashMap::new(),
+        &[],
+        &HashMap::new(),
+    );
+    assert!(result.is_none());
+}
+
+#[test]
+fn top_level_function_does_not_conflict_with_qualified_only_import() {
+    let mut module_exports = HashMap::new();
+    module_exports.insert("greetings".to_string(), vec!["hello".to_string()]);
+
+    let src = "(use greetings)\n(let hello {} 1)";
+    let result = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &module_exports,
+        HashMap::new(),
+        &[],
+        &HashMap::new(),
+    );
+    assert!(result.is_some());
+}
+
+#[test]
 fn duplicate_module_use_without_unqualified_imports_is_allowed() {
     let mut module_exports = HashMap::new();
     module_exports.insert("io".to_string(), vec!["println".to_string()]);
@@ -382,7 +436,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
     assert!(
         labels
             .iter()
-            .any(|msg| msg.contains("`bind` expects `(Unit -> Result")),
+            .any(|msg| msg.contains("`bind` expects `Unit -> Result")),
         "unexpected labels: {labels:?}"
     );
 }
@@ -512,7 +566,7 @@ fn compile_emits_unused_local_binding_warning() {
 
 #[test]
 fn unqualified_import_warnings_skip_qualified_only_use() {
-    let src = "(use std/io)\n(let main {} ())";
+    let src = "(use std/io)\n(let main {} (io/println \"hello\"))";
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(src).lex();
     let file_id = lowerer.add_file("scan.mond".into(), src.into());
@@ -526,6 +580,29 @@ fn unqualified_import_warnings_skip_qualified_only_use() {
     let warnings =
         warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
     assert!(warnings.is_empty());
+}
+
+#[test]
+fn qualified_only_import_warning_flags_unused_module_import() {
+    let src = "(use std/io)\n(let main {} ())";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut module_exports = HashMap::new();
+    module_exports.insert("io".to_string(), vec!["println".to_string()]);
+    let warnings =
+        warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].message.contains("unused import `io`"),
+        "unexpected warning: {:?}",
+        warnings[0].message
+    );
 }
 
 #[test]
@@ -552,8 +629,12 @@ fn unqualified_import_warnings_flag_unused_specific_and_wildcard() {
     );
     let warnings =
         warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
-    assert_eq!(warnings.len(), 2);
+    assert_eq!(warnings.len(), 3);
     let messages: Vec<String> = warnings.into_iter().map(|d| d.message).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("unused import `io`")),
+        "missing qualified import warning: {messages:?}"
+    );
     assert!(
         messages
             .iter()

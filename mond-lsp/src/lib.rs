@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -46,27 +46,11 @@ struct ModuleSource {
     source: String,
 }
 
-#[derive(Clone)]
-struct ProjectAnalysis {
-    module_exports: HashMap<String, Vec<String>>,
-    module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>>,
-    all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv>,
-    std_aliases: HashMap<String, String>,
-}
-
-struct ResolvedImports {
-    imports: HashMap<String, String>,
-    import_origins: HashMap<String, String>,
-    imported_schemes: mondc::typecheck::TypeEnv,
-    imported_type_decls: Vec<mondc::ast::TypeDecl>,
-    module_aliases: HashMap<String, String>,
-}
-
 struct DocumentAnalysis {
     diagnostics: Vec<Diagnostic>,
     bindings: mondc::typecheck::TypeEnv,
     expr_types: Vec<(std::ops::Range<usize>, String)>,
-    imports: ResolvedImports,
+    imports: mondc::ResolvedImports,
 }
 
 #[derive(Debug)]
@@ -764,7 +748,7 @@ struct Project {
     std_modules: BTreeMap<String, ModuleSource>,
     src_modules: BTreeMap<String, ModuleSource>,
     test_modules: BTreeMap<String, ModuleSource>,
-    analysis: ProjectAnalysis,
+    analysis: mondc::ProjectAnalysis,
 }
 
 impl Project {
@@ -1104,8 +1088,11 @@ impl Project {
         doc: &ModuleSource,
     ) -> std::result::Result<DocumentAnalysis, String> {
         let visible_exports = visible_exports(&self.analysis, &self.test_modules, &doc.name);
-        let imports =
-            resolve_imports_for_source(doc.source.as_str(), &visible_exports, &self.analysis);
+        let imports = mondc::resolve_imports_for_source(
+            doc.source.as_str(),
+            &visible_exports,
+            &self.analysis,
+        );
         let report = mondc::compile_with_imports_report(
             &doc.name,
             &doc.source,
@@ -1148,84 +1135,17 @@ impl Project {
 
 fn build_project_analysis(
     src_modules: &BTreeMap<String, ModuleSource>,
-) -> std::result::Result<ProjectAnalysis, String> {
+) -> std::result::Result<mondc::ProjectAnalysis, String> {
     let std_mods = std_modules();
-    let mut module_exports = HashMap::new();
-    let mut module_type_decls = HashMap::new();
-
-    for (user_name, _, source) in &std_mods {
-        module_exports.insert(user_name.clone(), mondc::exported_names(source));
-        module_type_decls.insert(user_name.clone(), mondc::exported_type_decls(source));
-    }
-    for (module_name, module) in src_modules {
-        module_exports.insert(module_name.clone(), mondc::exported_names(&module.source));
-        module_type_decls.insert(
-            module_name.clone(),
-            mondc::exported_type_decls(&module.source),
-        );
-    }
-
-    let std_aliases: HashMap<String, String> = std_mods
+    let src_module_sources: Vec<(String, String)> = src_modules
         .iter()
-        .map(|(user_name, erlang_name, _)| (user_name.clone(), erlang_name.clone()))
+        .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect();
-
-    let mut all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv> = HashMap::new();
-    for (user_name, _, source) in &std_mods {
-        let imports = resolve_imports_for_source(
-            source,
-            &module_exports,
-            &ProjectAnalysis {
-                module_exports: module_exports.clone(),
-                module_type_decls: module_type_decls.clone(),
-                all_module_schemes: all_module_schemes.clone(),
-                std_aliases: std_aliases.clone(),
-            },
-        );
-        let schemes = mondc::infer_module_exports(
-            user_name,
-            source,
-            imports.imports,
-            &module_exports,
-            &imports.imported_type_decls,
-            &imports.imported_schemes,
-        );
-        all_module_schemes.insert(user_name.clone(), schemes);
-    }
-
-    for module_name in ordered_module_names(src_modules)? {
-        let module = &src_modules[&module_name];
-        let imports = resolve_imports_for_source(
-            &module.source,
-            &module_exports,
-            &ProjectAnalysis {
-                module_exports: module_exports.clone(),
-                module_type_decls: module_type_decls.clone(),
-                all_module_schemes: all_module_schemes.clone(),
-                std_aliases: std_aliases.clone(),
-            },
-        );
-        let schemes = mondc::infer_module_exports(
-            &module.name,
-            &module.source,
-            imports.imports,
-            &module_exports,
-            &imports.imported_type_decls,
-            &imports.imported_schemes,
-        );
-        all_module_schemes.insert(module.name.clone(), schemes);
-    }
-
-    Ok(ProjectAnalysis {
-        module_exports,
-        module_type_decls,
-        all_module_schemes,
-        std_aliases,
-    })
+    mondc::build_project_analysis(&std_mods, &src_module_sources)
 }
 
 fn visible_exports(
-    analysis: &ProjectAnalysis,
+    analysis: &mondc::ProjectAnalysis,
     test_modules: &BTreeMap<String, ModuleSource>,
     current_module: &str,
 ) -> HashMap<String, Vec<String>> {
@@ -1237,74 +1157,6 @@ fn visible_exports(
         exports.insert(module_name.clone(), mondc::exported_names(&module.source));
     }
     exports
-}
-
-fn resolve_imports_for_source(
-    source: &str,
-    analysis_exports: &HashMap<String, Vec<String>>,
-    project: &ProjectAnalysis,
-) -> ResolvedImports {
-    let mut imports = HashMap::new();
-    let mut import_origins = HashMap::new();
-    let mut imported_schemes = HashMap::new();
-
-    for (_, mod_name, unqualified) in mondc::used_modules(source) {
-        let erlang_name = project
-            .std_aliases
-            .get(&mod_name)
-            .cloned()
-            .unwrap_or_else(|| mod_name.clone());
-
-        if let Some(exports) = analysis_exports.get(&mod_name) {
-            for fn_name in exports {
-                if unqualified.includes(fn_name) {
-                    imports.insert(fn_name.clone(), erlang_name.clone());
-                    import_origins.insert(fn_name.clone(), mod_name.clone());
-                }
-            }
-        }
-
-        if let Some(mod_schemes) = project.all_module_schemes.get(&mod_name) {
-            for (fn_name, scheme) in mod_schemes {
-                if unqualified.includes(fn_name) {
-                    imported_schemes.insert(fn_name.clone(), scheme.clone());
-                }
-                imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
-            }
-        }
-    }
-
-    let imported_type_decls: Vec<mondc::ast::TypeDecl> = referenced_modules(source)
-        .into_iter()
-        .flat_map(|mod_name| {
-            project
-                .module_type_decls
-                .get(&mod_name)
-                .cloned()
-                .unwrap_or_default()
-        })
-        .collect();
-
-    ResolvedImports {
-        imports,
-        import_origins,
-        imported_schemes,
-        imported_type_decls,
-        module_aliases: project.std_aliases.clone(),
-    }
-}
-
-fn referenced_modules(source: &str) -> HashSet<String> {
-    let mut referenced: HashSet<String> = mondc::used_modules(source)
-        .into_iter()
-        .map(|(_, mod_name, _)| mod_name)
-        .collect();
-    for tok in mondc::lexer::Lexer::new(source).lex() {
-        if let mondc::lexer::TokenKind::QualifiedIdent((module, _)) = tok.kind {
-            referenced.insert(module);
-        }
-    }
-    referenced
 }
 
 fn collect_modules(
@@ -1362,88 +1214,28 @@ fn collect_mond_files_from_dir(dir: &Path, modules: &mut BTreeMap<String, Module
     }
 }
 
-fn ordered_module_names(
-    modules: &BTreeMap<String, ModuleSource>,
-) -> std::result::Result<Vec<String>, String> {
-    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (module_name, module) in modules {
-        let mut deps = BTreeSet::new();
-        for (namespace, dep, _) in mondc::used_modules(&module.source) {
-            if namespace.is_empty() && modules.contains_key(&dep) {
-                deps.insert(dep);
-            }
-        }
-        graph.insert(module_name.clone(), deps.into_iter().collect());
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        Visiting,
-        Done,
-    }
-
-    fn dfs(
-        node: &str,
-        graph: &BTreeMap<String, Vec<String>>,
-        marks: &mut HashMap<String, Mark>,
-        stack: &mut Vec<String>,
-        out: &mut Vec<String>,
-    ) -> std::result::Result<(), String> {
-        match marks.get(node).copied() {
-            Some(Mark::Done) => return Ok(()),
-            Some(Mark::Visiting) => {
-                let start = stack.iter().position(|n| n == node).unwrap_or(0);
-                let mut cycle = stack[start..].to_vec();
-                cycle.push(node.to_string());
-                return Err(format!(
-                    "cyclic module dependency detected: {}",
-                    cycle.join(" -> ")
-                ));
-            }
-            None => {}
-        }
-        marks.insert(node.to_string(), Mark::Visiting);
-        stack.push(node.to_string());
-        for dep in graph.get(node).cloned().unwrap_or_default() {
-            dfs(&dep, graph, marks, stack, out)?;
-        }
-        stack.pop();
-        marks.insert(node.to_string(), Mark::Done);
-        out.push(node.to_string());
-        Ok(())
-    }
-
-    let mut marks = HashMap::new();
-    let mut stack = Vec::new();
-    let mut out = Vec::new();
-    for node in graph.keys() {
-        dfs(node, &graph, &mut marks, &mut stack, &mut out)?;
-    }
-    Ok(out)
-}
-
 fn std_modules() -> Vec<(String, String, String)> {
-    let lib_src = STD_DIR
-        .get_file("lib.mond")
-        .and_then(|f| f.contents_utf8())
-        .unwrap_or("");
-    let mut result = vec![(
-        "std".to_string(),
-        "mond_std".to_string(),
-        lib_src.to_string(),
-    )];
+    let mut std_sources: BTreeMap<String, String> = STD_DIR
+        .files()
+        .filter_map(|file| {
+            let path = file.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("mond") {
+                return None;
+            }
+            let module_name = path.file_stem()?.to_str()?;
+            if module_name == "lib" {
+                return None;
+            }
+            Some((module_name.to_string(), file.contents_utf8()?.to_string()))
+        })
+        .collect();
 
-    for mod_name in mondc::pub_reexports(lib_src) {
-        let file_name = format!("{mod_name}.mond");
-        if let Some(src) = STD_DIR.get_file(&file_name).and_then(|f| f.contents_utf8()) {
-            result.push((
-                mod_name.clone(),
-                format!("mond_{mod_name}"),
-                src.to_string(),
-            ));
-        }
+    if let Some(lib_src) = STD_DIR.get_file("lib.mond").and_then(|f| f.contents_utf8()) {
+        std_sources.insert("std".to_string(), lib_src.to_string());
     }
-    result
+
+    mondc::std_modules_from_sources(&std_sources.into_iter().collect::<Vec<(String, String)>>())
+        .expect("embedded std modules should form a valid dependency graph")
 }
 
 fn collect_std_modules() -> BTreeMap<String, ModuleSource> {
@@ -1853,7 +1645,7 @@ fn symbol_at(
     source_path: &Path,
     source: &str,
     current_module: &str,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
     offset: usize,
 ) -> std::result::Result<Option<Symbol>, String> {
     let occurrences = collect_symbol_occurrences(source_path, source, current_module, imports)?;
@@ -1922,7 +1714,7 @@ fn signature_target_at(
     source_path: &Path,
     source: &str,
     current_module: &str,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
     offset: usize,
 ) -> std::result::Result<Option<SignatureTarget>, String> {
     let (_, decls) = parse_module(source_path, source)?;
@@ -1946,7 +1738,7 @@ fn signature_target_in_decl(
     decl: &mondc::ast::Declaration,
     current_module: &str,
     top_level: &HashSet<String>,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
     offset: usize,
     locals: &HashSet<String>,
 ) -> Option<SignatureTarget> {
@@ -1965,7 +1757,7 @@ fn signature_target_in_expr(
     expr: &mondc::ast::Expr,
     current_module: &str,
     top_level: &HashSet<String>,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
     offset: usize,
     locals: &HashSet<String>,
 ) -> Option<SignatureTarget> {
@@ -2133,7 +1925,7 @@ fn collect_symbol_occurrences(
     source_path: &Path,
     source: &str,
     current_module: &str,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
 ) -> std::result::Result<Vec<SymbolOccurrence>, String> {
     let (sexprs, decls) = parse_module(source_path, source)?;
     let top_level = top_level_bindings(&decls);
@@ -2403,7 +2195,7 @@ fn collect_decl_occurrences(
     decl: &mondc::ast::Declaration,
     current_module: &str,
     top_level: &HashSet<String>,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
     out: &mut Vec<SymbolOccurrence>,
 ) {
     match decl {
@@ -2445,7 +2237,7 @@ fn collect_expr_occurrences(
     expr: &mondc::ast::Expr,
     current_module: &str,
     top_level: &HashSet<String>,
-    imports: &ResolvedImports,
+    imports: &mondc::ResolvedImports,
     locals: &HashSet<String>,
     out: &mut Vec<SymbolOccurrence>,
 ) {
@@ -2994,7 +2786,7 @@ mod tests {
     #[test]
     fn symbol_at_resolves_top_level_definition_site() {
         let src = "(let add_one {x} (+ x 1))\n(let main {} (add_one 2))";
-        let imports = ResolvedImports {
+        let imports = mondc::ResolvedImports {
             imports: HashMap::new(),
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
@@ -3019,7 +2811,7 @@ mod tests {
         let src = "(use std/testing [assert_eq])\n(let main {} (assert_eq 1 1))";
         let mut import_origins = HashMap::new();
         import_origins.insert("assert_eq".to_string(), "testing".to_string());
-        let imports = ResolvedImports {
+        let imports = mondc::ResolvedImports {
             imports: HashMap::new(),
             import_origins,
             imported_schemes: HashMap::new(),
@@ -3044,7 +2836,7 @@ mod tests {
         let src = "(use util [map])\n(let map {x} x)\n(let main {} (util/map (map 1)))";
         let mut import_origins = HashMap::new();
         import_origins.insert("map".to_string(), "util".to_string());
-        let imports = ResolvedImports {
+        let imports = mondc::ResolvedImports {
             imports: HashMap::new(),
             import_origins,
             imported_schemes: HashMap::new(),
@@ -3169,7 +2961,7 @@ mod tests {
     #[test]
     fn signature_target_finds_unqualified_call_argument_index() {
         let src = "(let add {a b} (+ a b))\n(let main {} (add 1 2))";
-        let imports = ResolvedImports {
+        let imports = mondc::ResolvedImports {
             imports: HashMap::new(),
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
@@ -3188,7 +2980,7 @@ mod tests {
     #[test]
     fn signature_target_finds_qualified_call_argument_index() {
         let src = "(use std/io)\n(let main {} (io/println \"hello\"))";
-        let imports = ResolvedImports {
+        let imports = mondc::ResolvedImports {
             imports: HashMap::new(),
             import_origins: HashMap::new(),
             imported_schemes: HashMap::new(),
@@ -3202,6 +2994,25 @@ mod tests {
         assert_eq!(target.symbol.module, "io");
         assert_eq!(target.symbol.function, "println");
         assert_eq!(target.arg_index, 0);
+    }
+
+    #[test]
+    fn std_modules_include_submodules_without_root_reexports() {
+        let std_mods = std_modules();
+        assert!(std_mods.iter().any(|(name, _, _)| name == "std"));
+        assert!(std_mods.iter().any(|(name, _, _)| name == "io"));
+    }
+
+    #[test]
+    fn resolve_imports_supports_std_submodules_without_root_reexports() {
+        let analysis = build_project_analysis(&BTreeMap::new()).expect("project analysis");
+        let imports = mondc::resolve_imports_for_source(
+            "(use std/io)\n(let main {} ())",
+            &analysis.module_exports,
+            &analysis,
+        );
+        assert!(analysis.module_exports.contains_key("io"));
+        assert!(imports.module_aliases.contains_key("io"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -7,10 +7,7 @@ use std::{
 use crate::{BIN_ENTRY_POINT, LIB_ROOT, TARGET_DIR, gitignore};
 use eyre::Context;
 
-use crate::{
-    DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, manifest, resolve::ResolveContext, ui,
-    utils::find_mond_files,
-};
+use crate::{DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, manifest, ui, utils::find_mond_files};
 
 // mond-std is embedded at compile time — std ships with mond,
 use include_dir::{Dir, include_dir};
@@ -25,26 +22,30 @@ pub(crate) fn std_dir() -> &'static Dir<'static> {
 ///   - erlang_name: the compiled Erlang module name → "mond_io"
 ///     Prefixed with "mond_" to avoid shadowing Erlang/OTP built-in modules.
 pub(crate) fn std_modules() -> Vec<(String, String, String)> {
-    let lib_src = STD_DIR
+    let mut std_sources: Vec<(String, String)> = STD_DIR
+        .files()
+        .filter_map(|file| {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mond") {
+                return None;
+            }
+            let module_name = path.file_stem()?.to_str()?;
+            if module_name == "lib" {
+                return None;
+            }
+            Some((module_name.to_string(), file.contents_utf8()?.to_string()))
+        })
+        .collect();
+
+    if let Some(lib_src) = STD_DIR
         .get_file("lib.mond")
-        .and_then(|f| f.contents_utf8())
-        .unwrap_or("");
-
-    let mut result = Vec::new();
-    result.push((
-        "std".to_string(),
-        "mond_std".to_string(),
-        lib_src.to_string(),
-    ));
-
-    for mod_name in mondc::pub_reexports(lib_src) {
-        let file_name = format!("{mod_name}.mond");
-        if let Some(src) = STD_DIR.get_file(&file_name).and_then(|f| f.contents_utf8()) {
-            let erlang_name = format!("mond_{mod_name}");
-            result.push((mod_name, erlang_name, src.to_string()));
-        }
+        .and_then(|file| file.contents_utf8())
+    {
+        std_sources.push(("std".to_string(), lib_src.to_string()));
     }
-    result
+
+    mondc::std_modules_from_sources(&std_sources)
+        .expect("embedded std modules should form a valid dependency graph")
 }
 
 pub(crate) struct ErlSources {
@@ -98,83 +99,24 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         module_type_decls.insert(module_name.clone(), type_decls);
         module_sources.push((module_name, source));
     }
-    let ordered_module_sources = ordered_user_modules(&module_sources)?;
+    let ordered_module_sources =
+        mondc::ordered_module_sources(&module_sources).map_err(|err| eyre::eyre!(err))?;
 
     // Phase 1b: seed module_exports with embedded std modules so the compiler's
     // `use` validation and import building treats them identically to local modules.
     let std_mods = std_modules();
-    for (user_name, _, source) in &std_mods {
-        let exports = mondc::exported_names(source);
-        let type_decls = mondc::exported_type_decls(source);
-        module_exports.insert(user_name.clone(), exports);
-        module_type_decls.insert(user_name.clone(), type_decls);
-    }
-
-    // Phase 1c: infer real type schemes for each std module in order so that
-    // dependent modules (including user code) get proper type-checking.
-    let mut all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv> = HashMap::new();
-    let std_aliases: HashMap<String, String> = std_mods
-        .iter()
-        .map(|(u, e, _)| (u.clone(), e.clone()))
-        .collect();
-
-    for (user_name, _erlang_name, source) in &std_mods {
-        let mut std_imports: HashMap<String, String> = HashMap::new();
-        let mut std_imported_type_decls: Vec<mondc::ast::TypeDecl> = Vec::new();
-        let mut std_imported_schemes: mondc::typecheck::TypeEnv = HashMap::new();
-
-        for (_, mod_name, unqualified) in mondc::used_modules(source) {
-            let erl_name = std_aliases
-                .get(&mod_name)
-                .cloned()
-                .unwrap_or_else(|| mod_name.clone());
-            if let Some(exports) = module_exports.get(&mod_name) {
-                for fn_name in exports {
-                    if unqualified.includes(fn_name) {
-                        std_imports.insert(fn_name.clone(), erl_name.clone());
-                    }
-                }
-            }
-            if let Some(type_decls) = module_type_decls.get(&mod_name) {
-                std_imported_type_decls.extend(type_decls.clone());
-            }
-            if let Some(dep_schemes) = all_module_schemes.get(&mod_name) {
-                for (fn_name, scheme) in dep_schemes {
-                    if unqualified.includes(fn_name) {
-                        std_imported_schemes.insert(fn_name.clone(), scheme.clone());
-                    }
-                    std_imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
-                }
-            }
-        }
-
-        let std_module_exports: HashMap<String, Vec<String>> = std_mods
-            .iter()
-            .map(|(u, _, src)| (u.clone(), mondc::exported_names(src)))
-            .collect();
-
-        let schemes = mondc::infer_module_exports(
-            user_name,
-            source,
-            std_imports,
-            &std_module_exports,
-            &std_imported_type_decls,
-            &std_imported_schemes,
-        );
-        all_module_schemes.insert(user_name.clone(), schemes);
-    }
+    let analysis = mondc::build_project_analysis(&std_mods, &module_sources)
+        .map_err(|err| eyre::eyre!(err))?;
+    module_exports = analysis.module_exports.clone();
+    module_type_decls = analysis.module_type_decls.clone();
+    let all_module_schemes = analysis.all_module_schemes.clone();
+    let std_aliases = analysis.std_aliases.clone();
 
     // Phase 2: compile each user file with its resolved import map
     let mut erl_paths: Vec<PathBuf> = Vec::new();
     let mut had_error = false;
-    let resolver = ResolveContext {
-        all_module_schemes: &all_module_schemes,
-        module_type_decls: &module_type_decls,
-        std_aliases: &std_aliases,
-    };
-
     for (module_name, source) in &ordered_module_sources {
-        let resolved = resolver.resolve_for_source(source, &module_exports);
+        let resolved = mondc::resolve_imports_for_source(source, &module_exports, &analysis);
 
         let report = mondc::compile_with_imports_report(
             module_name,
@@ -217,60 +159,38 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         .map(|(_, m, _)| m)
         .collect();
 
+    let std_analysis =
+        mondc::build_project_analysis(&std_mods, &[]).map_err(|err| eyre::eyre!(err))?;
     let std_module_exports: HashMap<String, Vec<String>> = std_mods
         .iter()
-        .map(|(user_name, _, source)| (user_name.clone(), mondc::exported_names(source)))
+        .map(|(user_name, _, _)| {
+            (
+                user_name.clone(),
+                std_analysis
+                    .module_exports
+                    .get(user_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
 
     for (user_name, erlang_name, source) in &std_mods {
         if !used_std_names.contains(user_name.as_str()) {
             continue;
         }
-
-        let mut std_imports: HashMap<String, String> = HashMap::new();
-        let mut std_imported_schemes: mondc::typecheck::TypeEnv = HashMap::new();
-
-        for (_, mod_name, unqualified) in mondc::used_modules(source) {
-            let erl_name = std_aliases
-                .get(&mod_name)
-                .cloned()
-                .unwrap_or_else(|| mod_name.clone());
-            if let Some(exports) = std_module_exports.get(&mod_name) {
-                for fn_name in exports {
-                    if unqualified.includes(fn_name) {
-                        std_imports.insert(fn_name.clone(), erl_name.clone());
-                    }
-                }
-            }
-            if let Some(dep_schemes) = all_module_schemes.get(&mod_name) {
-                for (fn_name, scheme) in dep_schemes {
-                    if unqualified.includes(fn_name) {
-                        std_imported_schemes.insert(fn_name.clone(), scheme.clone());
-                    }
-                    std_imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
-                }
-            }
-        }
-
-        let std_imported_type_decls: Vec<mondc::ast::TypeDecl> = mondc::used_modules(source)
-            .into_iter()
-            .flat_map(|(_, mod_name, _)| {
-                module_type_decls
-                    .get(&mod_name)
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
+        let resolved =
+            mondc::resolve_imports_for_source(source, &std_module_exports, &std_analysis);
 
         let report = mondc::compile_with_imports_report(
             erlang_name,
             source,
             &format!("{erlang_name}.mond"),
-            std_imports,
+            resolved.imports,
             &std_module_exports,
-            std_aliases.clone(),
-            &std_imported_type_decls,
-            &std_imported_schemes,
+            std_analysis.std_aliases.clone(),
+            &resolved.imported_type_decls,
+            &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(
             &report,
@@ -320,84 +240,6 @@ pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::
         std_mods,
         std_aliases,
     })
-}
-
-fn ordered_user_modules(
-    module_sources: &[(String, String)],
-) -> eyre::Result<Vec<(String, String)>> {
-    let source_by_name: BTreeMap<String, String> = module_sources
-        .iter()
-        .map(|(name, src)| (name.clone(), src.clone()))
-        .collect();
-    if source_by_name.len() != module_sources.len() {
-        return Err(eyre::eyre!(
-            "duplicate module names found in src/: module file stems must be unique"
-        ));
-    }
-
-    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (module_name, source) in &source_by_name {
-        let mut deps: BTreeSet<String> = BTreeSet::new();
-        for (namespace, dep, _) in mondc::used_modules(source) {
-            if namespace.is_empty() && source_by_name.contains_key(&dep) {
-                deps.insert(dep);
-            }
-        }
-        graph.insert(module_name.clone(), deps.into_iter().collect());
-    }
-
-    let order = topo_sort_modules(&graph)?;
-    Ok(order
-        .into_iter()
-        .filter_map(|name| source_by_name.get(&name).cloned().map(|src| (name, src)))
-        .collect())
-}
-
-fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> eyre::Result<Vec<String>> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        Visiting,
-        Done,
-    }
-
-    fn dfs(
-        node: &str,
-        graph: &BTreeMap<String, Vec<String>>,
-        marks: &mut HashMap<String, Mark>,
-        stack: &mut Vec<String>,
-        out: &mut Vec<String>,
-    ) -> eyre::Result<()> {
-        match marks.get(node).copied() {
-            Some(Mark::Done) => return Ok(()),
-            Some(Mark::Visiting) => {
-                let start = stack.iter().position(|n| n == node).unwrap_or(0);
-                let mut cycle: Vec<String> = stack[start..].to_vec();
-                cycle.push(node.to_string());
-                return Err(eyre::eyre!(
-                    "cyclic module dependency detected: {}",
-                    cycle.join(" -> ")
-                ));
-            }
-            None => {}
-        }
-        marks.insert(node.to_string(), Mark::Visiting);
-        stack.push(node.to_string());
-        for dep in graph.get(node).cloned().unwrap_or_default() {
-            dfs(&dep, graph, marks, stack, out)?;
-        }
-        stack.pop();
-        marks.insert(node.to_string(), Mark::Done);
-        out.push(node.to_string());
-        Ok(())
-    }
-
-    let mut marks: HashMap<String, Mark> = HashMap::new();
-    let mut out = Vec::new();
-    let mut stack = Vec::new();
-    for node in graph.keys() {
-        dfs(node, graph, &mut marks, &mut stack, &mut out)?;
-    }
-    Ok(out)
 }
 
 fn validate_bin_entrypoint(
@@ -605,7 +447,7 @@ mod tests {
             ("util".to_string(), "(let util_fn {} 1)".to_string()),
             ("other".to_string(), "(let other {} 2)".to_string()),
         ];
-        let ordered = ordered_user_modules(&modules).expect("topo order");
+        let ordered = mondc::ordered_module_sources(&modules).expect("topo order");
         let names: Vec<String> = ordered.into_iter().map(|(n, _)| n).collect();
         let pos_main = names
             .iter()
@@ -624,12 +466,28 @@ mod tests {
             ("a".to_string(), "(use b)\n(let a {} 1)".to_string()),
             ("b".to_string(), "(use a)\n(let b {} 2)".to_string()),
         ];
-        let err = ordered_user_modules(&modules).expect_err("expected cycle error");
+        let err = mondc::ordered_module_sources(&modules).expect_err("expected cycle error");
         let msg = err.to_string();
         assert!(
             msg.contains("cyclic module dependency detected"),
             "unexpected error: {msg}"
         );
         assert!(msg.contains("a -> b -> a") || msg.contains("b -> a -> b"));
+    }
+
+    #[test]
+    fn std_modules_from_sources_discovers_files_without_lib_reexports() {
+        let modules = vec![
+            ("io".to_string(), "(let println {x} x)".to_string()),
+            ("extra".to_string(), "(let helper {} 1)".to_string()),
+            ("std".to_string(), "(let hello {} 1)".to_string()),
+        ];
+
+        let discovered = mondc::std_modules_from_sources(&modules).expect("std modules");
+        let names: Vec<String> = discovered.into_iter().map(|(name, _, _)| name).collect();
+
+        assert!(names.contains(&"io".to_string()));
+        assert!(names.contains(&"extra".to_string()));
+        assert!(names.contains(&"std".to_string()));
     }
 }

@@ -90,12 +90,13 @@ pub fn compile_with_imports_in_session(
         };
     }
 
-    let duplicate_imports = warnings::duplicate_import_diagnostics(&decls, file_id, module_exports);
-    for diag in &duplicate_imports {
+    let duplicate_top_level_values =
+        warnings::duplicate_top_level_value_diagnostics(&decls, file_id, module_exports);
+    for diag in &duplicate_top_level_values {
         diagnostics.push(diag.clone());
         sess.emit(&lowerer.files, diag);
     }
-    if !duplicate_imports.is_empty() {
+    if !duplicate_top_level_values.is_empty() {
         return session::CompileReport {
             output: None,
             files: lowerer.files,

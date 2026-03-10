@@ -15,7 +15,7 @@ We can do so by binding Erlang functions to `Mond` names with `extern let`. We s
 
 We can do something similar for opaque foreign-backed types.
 
-```opal
+```mond
 (pub extern type Pid)
 (pub extern type ['k 'v] Map maps/map)
 ```

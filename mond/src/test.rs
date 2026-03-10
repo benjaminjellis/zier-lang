@@ -5,7 +5,6 @@ use eyre::Context;
 use crate::{
     TARGET_DIR, TEST_BUILD_DIR,
     build::{ErlSources, generate_erl_sources},
-    resolve::ResolveContext,
     ui,
     utils::find_mond_files,
 };
@@ -73,16 +72,17 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
 
     // Compile each test file
     let mut had_error = false;
-    let resolver = ResolveContext {
-        all_module_schemes: &all_module_schemes,
-        module_type_decls: &module_type_decls,
-        std_aliases: &std_aliases,
+    let project = mondc::ProjectAnalysis {
+        module_exports: all_exports.clone(),
+        module_type_decls: module_type_decls.clone(),
+        all_module_schemes: all_module_schemes.clone(),
+        std_aliases: std_aliases.clone(),
     };
     // (module_name, Vec<(display_name, erlang_fn_name)>)
     let mut test_fns_by_module: Vec<(String, Vec<(String, String)>)> = Vec::new();
 
     for (module_name, source) in &test_module_sources {
-        let resolved = resolver.resolve_for_source(source, &all_exports);
+        let resolved = mondc::resolve_imports_for_source(source, &all_exports, &project);
 
         let report = mondc::compile_with_imports_report(
             module_name,
@@ -134,6 +134,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         }
     }
 
+    let std_analysis =
+        mondc::build_project_analysis(&std_mods, &[]).map_err(|err| eyre::eyre!(err))?;
     for (user_name, erlang_name, source) in &std_mods {
         if !needed_std.contains(user_name.as_str()) {
             continue;
@@ -143,50 +145,18 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             continue; // already compiled by generate_erl_sources
         }
 
-        let mut std_imports: HashMap<String, String> = HashMap::new();
-        let mut std_imported_schemes: mondc::typecheck::TypeEnv = HashMap::new();
-
-        for (_, mod_name, unqualified) in mondc::used_modules(source) {
-            let erl_name = std_aliases
-                .get(&mod_name)
-                .cloned()
-                .unwrap_or_else(|| mod_name.clone());
-            if let Some(exports) = std_module_exports.get(&mod_name) {
-                for fn_name in exports {
-                    if unqualified.includes(fn_name) {
-                        std_imports.insert(fn_name.clone(), erl_name.clone());
-                    }
-                }
-            }
-            if let Some(dep_schemes) = all_module_schemes.get(&mod_name) {
-                for (fn_name, scheme) in dep_schemes {
-                    if unqualified.includes(fn_name) {
-                        std_imported_schemes.insert(fn_name.clone(), scheme.clone());
-                    }
-                    std_imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
-                }
-            }
-        }
-
-        let std_imported_type_decls: Vec<mondc::ast::TypeDecl> = mondc::used_modules(source)
-            .into_iter()
-            .flat_map(|(_, mod_name, _)| {
-                module_type_decls
-                    .get(&mod_name)
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
+        let resolved =
+            mondc::resolve_imports_for_source(source, &std_module_exports, &std_analysis);
 
         let report = mondc::compile_with_imports_report(
             erlang_name,
             source,
             &format!("{erlang_name}.mond"),
-            std_imports,
+            resolved.imports,
             &std_module_exports,
-            std_aliases.clone(),
-            &std_imported_type_decls,
-            &std_imported_schemes,
+            std_analysis.std_aliases.clone(),
+            &resolved.imported_type_decls,
+            &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(
             &report,

@@ -173,6 +173,7 @@ fn fmt_round(items: &[SExpr], source: &str) -> Doc {
             TokenKind::Match => fmt_match(rest, source),
             TokenKind::Fn => fmt_fn(rest, source),
             TokenKind::Do => fmt_do(rest, source),
+            TokenKind::Operator if atom_text(kw_tok, source) == "|>" => fmt_pipe(rest, source),
             // use / extern — always stay on one line
             TokenKind::Use | TokenKind::Extern => fmt_inline(items, source),
             _ => fmt_generic(items, source),
@@ -437,6 +438,26 @@ fn fmt_do(rest: &[SExpr], source: &str) -> Doc {
                 .collect();
             concat_all([
                 text("(do "),
+                align(concat_all([fmt(first, source), concat_all(tail_docs)])),
+                text(")"),
+            ])
+        }
+    }
+}
+
+// ── |> ───────────────────────────────────────────────────────────────────────
+
+fn fmt_pipe(rest: &[SExpr], source: &str) -> Doc {
+    match rest {
+        [] => text("(|>)"),
+        [single] => group(concat_all([text("(|> "), fmt(single, source), text(")")])),
+        [first, tail @ ..] => {
+            let tail_docs: Vec<Doc> = tail
+                .iter()
+                .map(|e| concat(hardline(), fmt(e, source)))
+                .collect();
+            concat_all([
+                text("(|> "),
                 align(concat_all([fmt(first, source), concat_all(tail_docs)])),
                 text(")"),
             ])

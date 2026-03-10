@@ -199,6 +199,24 @@ fn call_breaks_when_long() {
     assert!(out.contains('\n'));
 }
 
+#[test]
+fn pipe_breaks_one_step_per_line() {
+    let src = "(let [x (|> 10 (add_two 1) (add_two 12) (add_two 20) (add_two 2) (add_two 90))] (io/debug x))";
+    let out = fmt(src);
+    assert!(
+        out.contains("(|> 10\n"),
+        "expected pipe to break after seed value:\n{out}"
+    );
+    assert!(
+        out.contains("\n            (add_two 1)"),
+        "expected first pipe step on its own line:\n{out}"
+    );
+    assert!(
+        out.contains("\n            (add_two 90))"),
+        "expected last pipe step on its own line:\n{out}"
+    );
+}
+
 // ── multiple top-level forms ──────────────────────────────────────────────
 
 #[test]

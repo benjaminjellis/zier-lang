@@ -2134,6 +2134,13 @@ impl Lowerer {
     }
 
     fn lower_call(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
+        if let Some(SExpr::Atom(token)) = items.first()
+            && matches!(token.kind, TokenKind::Operator)
+            && self.source_at(file_id, token.span.clone()) == "|>"
+        {
+            return self.lower_pipe(file_id, items, span);
+        }
+
         // 1. The first item is the function being called
         // We call lower_expr recursively because it might be a
         // variable (f x) or a nested list ((get_fn) x)
@@ -2146,6 +2153,31 @@ impl Lowerer {
         }
 
         Some(Expr::Call { func, args, span })
+    }
+
+    fn lower_pipe(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
+        if items.len() < 3 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("pipeline requires a value and at least one step")
+                    .with_labels(vec![
+                        Label::primary(file_id, span)
+                            .with_message("syntax: (|> value step1 step2 ...)"),
+                    ]),
+            );
+            return None;
+        }
+
+        let mut acc = self.lower_expr(file_id, &items[1])?;
+        for step in &items[2..] {
+            let func = Box::new(self.lower_expr(file_id, step)?);
+            acc = Expr::Call {
+                func,
+                args: vec![acc],
+                span: span.clone(),
+            };
+        }
+        Some(acc)
     }
 }
 
@@ -2587,6 +2619,68 @@ mod tests {
                 lowerer.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn test_pipe_desugars_to_nested_unary_calls() {
+        let (mut lowerer, file_id, sexprs) = setup("(|> x inc double)");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+
+        if let Expr::Call { func, args, .. } = expr {
+            assert!(matches!(*func, Expr::Variable(ref name, _) if name == "double"));
+            assert_eq!(args.len(), 1);
+            if let Expr::Call {
+                func: inner_func,
+                args: inner_args,
+                ..
+            } = &args[0]
+            {
+                assert!(matches!(inner_func.as_ref(), Expr::Variable(name, _) if name == "inc"));
+                assert_eq!(inner_args.len(), 1);
+                assert!(matches!(inner_args[0], Expr::Variable(ref name, _) if name == "x"));
+            } else {
+                panic!("expected nested call for first pipe step");
+            }
+        } else {
+            panic!("expected Call");
+        }
+    }
+
+    #[test]
+    fn test_pipe_accepts_partial_application_steps() {
+        let (mut lowerer, file_id, sexprs) = setup("(|> 3 (add 1) (mul 2))");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+
+        if let Expr::Call { func, args, .. } = expr {
+            assert_eq!(args.len(), 1);
+            assert!(matches!(*func, Expr::Call { .. }));
+        } else {
+            panic!("expected Call");
+        }
+    }
+
+    #[test]
+    fn test_pipe_requires_a_step() {
+        let (mut lowerer, file_id, sexprs) = setup("(|> x)");
+        let expr = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(expr.is_none(), "expected lowering to fail");
+        assert!(
+            lowerer.diagnostics.iter().any(|d| d
+                .message
+                .contains("pipeline requires a value and at least one step")),
+            "unexpected diagnostics: {:?}",
+            lowerer
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

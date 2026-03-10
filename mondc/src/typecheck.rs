@@ -366,11 +366,14 @@ fn type_display_inner(ty: &Type, var_names: &mut std::collections::HashMap<u64, 
                 .join(" ");
             format!("{name} {args_str}")
         }
-        Type::Fun(arg, ret) => format!(
-            "({} -> {})",
-            type_display_inner(arg, var_names),
-            type_display_inner(ret, var_names)
-        ),
+        Type::Fun(arg, ret) => {
+            let arg_s = match arg.as_ref() {
+                Type::Fun(..) => format!("({})", type_display_inner(arg, var_names)),
+                _ => type_display_inner(arg, var_names),
+            };
+            let ret_s = type_display_inner(ret, var_names);
+            format!("{arg_s} -> {ret_s}")
+        }
         Type::Var(id) => {
             let next = var_names.len();
             var_names
@@ -1673,6 +1676,18 @@ mod tests {
     fn infer_int_literal() {
         let ty = check_expr("42").unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn type_display_renders_curried_functions_without_extra_parens() {
+        let ty = Type::fun(Type::int(), Type::fun(Type::int(), Type::int()));
+        assert_eq!(type_display(&ty), "Int -> Int -> Int");
+    }
+
+    #[test]
+    fn type_display_keeps_parens_for_function_arguments() {
+        let ty = Type::fun(Type::fun(Type::int(), Type::int()), Type::int());
+        assert_eq!(type_display(&ty), "(Int -> Int) -> Int");
     }
 
     #[test]
