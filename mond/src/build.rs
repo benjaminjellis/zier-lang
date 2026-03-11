@@ -282,6 +282,8 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         return Err(eyre::eyre!("mond cannot run a library project"));
     }
 
+    crate::utils::verify_erlc_installed()?;
+
     // Run erlc on all .erl files at once
     let erlc = Command::new("erlc")
         .arg("-o")

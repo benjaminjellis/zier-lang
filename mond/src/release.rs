@@ -70,6 +70,8 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     std::fs::write(staging.join("rebar.config"), rebar_config)
         .context("could not write rebar.config")?;
 
+    crate::utils::verify_rebar3_installed()?;
+
     // Run rebar3 escriptize
     let rebar3 = Command::new("rebar3")
         .arg("escriptize")
