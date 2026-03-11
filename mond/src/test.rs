@@ -207,6 +207,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     std::fs::write(&runner_path, &runner_erl).context("could not write test runner")?;
     erl_paths.push(runner_path);
 
+    crate::utils::verify_erlc_installed()?;
+
     // Compile all .erl files
     let erlc = Command::new("erlc")
         .arg("-o")
