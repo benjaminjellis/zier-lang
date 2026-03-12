@@ -16,11 +16,50 @@ You should be able to do something similar on macOS with:
 brew install rustup erlang rebar3
 ```
 
-Once you have those installed, you can clone this repo and run this in the root:
-```
+Once you have those installed, you have two options:
 
+Clone and install
+
+```
+git clone git@github.com:benjaminjellis/mond.git 
+cd mond
 cargo install --path mond 
 ```
 
-Then you'll be able to use `Mond`.
+Or without cloning
+
+```
+cargo install --git https://github.com/benjaminjellis/mond.git --tag 0.0.1 mond
+```
+
+
+To verify installation
+```
+
+mond --help
+```
+
+And when you see something like below you should be all set
+
+```shell
+the build tool for the mond programming language
+
+Usage: mond <COMMAND>
+
+Commands:
+  run
+  test
+  deps
+  lsp
+  format
+  new
+  build
+  release
+  clean
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
 

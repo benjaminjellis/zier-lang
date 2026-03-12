@@ -6,17 +6,17 @@ The aim of Phase 1 is to have a stable and usable language. At completion the co
 - [x] language spec
 - [x] compiler pipeline
 - [x] basic tree sitter grammar
-- [ ] compilation and runtime bug free for toy and sample programs 
-- [ ] increase test coverage across entire compiler pipeline 
-- [ ] mvp standard library
+- [x] compilation and runtime bug free for toy and sample programs 
+- [x] mvp standard library
 
 ## Phase 2
 The aim of Phase 2 is to make `Mond` more usable, primarily through completing the standard library, adding package management to the CLI and a basic lsp.
 
 - [ ] complete standard library
-- [ ] CLI tool handles package engagement
+- [ ] mvp package management
 - [ ] http client lib
-- [ ] basic lsp (goto def, rename, errors)
+- [x] basic lsp (goto def, rename, errors)
+- [ ] increase test coverage across entire compiler pipeline 
 
 ## Phase 3
 The aim of Phase 3 is to make mond even more usable, primarily through further integration with OTP. 

@@ -1,12 +1,12 @@
 # The Standard Library
-`Mond`'s standard library is shipped with the CLI and its version is kept in lockstep. One release/version of the CLI will always use the same standard library.
+`Mond`'s standard library is just like any other dependency, it is specified in you `mond.toml` and can be pinned to a specific version. 
 
-The standard library is intended to provide the well tested building blocks the language and ecosystem needs to grow and succeed.
+The standard library is intended to be small but provide the essential building blocks for writing `mond`.
 
 ## Imports
 To get started with the standard library, we first need to introduce a new concept: imports. `Mond` defines the keyword `use`. Like everything in `Mond`, this lives inside an S-expression.
 
-`(use std)` at the top of the file brings the module `std` into scope.
+`(use std/io)` at the top of the file brings the module `io` from `std` into scope.
 
 Here's an example:
 
@@ -18,7 +18,7 @@ Here's an example:
   (io/println (string/to_upper "hello")))
 ```
 
-`(use std/io)` imports a single module `io`, and brings its functions and types into scope in a qualified manner (with the `io/` prefix).
+All of `io`'s functions and type defs are in-scope using the `io/` qualifier.
 
 If you only want to bring in a subset of what's defined in a module and use it in an unqualified manner, you can use square brackets to do so.
 
@@ -32,7 +32,7 @@ If you only want to bring in a subset of what's defined in a module and use it i
 
 ## Monadic Types
 
-The standard library also provides some useful types like `Option` and `Result`. It is idiomatic to import these in an unqualified manner. This also imports constructors like `None` and `Some`.
+The standard library also provides some useful types like `Option` and `Result`. It is idiomatic to import these in an unqualified manner. This also imports these type's constructor (i.e. `None`, `Some`, `Ok` and `Error`).
 
 ```mond
 (use std/result [Result])
@@ -67,3 +67,4 @@ This desugars to `(bind (might_fail) (f {a} -> (bind (also_might_fail a) (f {b} 
 Because `Mond` targets the `BEAM` we can leverage it's model of concurrency. The basic building block of this are `processes`. 
 
 ## Unknown
+TODO
