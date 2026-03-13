@@ -149,30 +149,30 @@ fn nested_match_arm_body_breaks_after_arrow() {
 
 #[test]
 fn type_variant_inline() {
-    let src = "(type ['a] Option (None (Some ~ 'a)))";
+    let src = "(type ['a] Option [None (Some ~ 'a)])";
     let out = fmt(src);
-    assert_eq!(out, "(type ['a] Option (\n  None\n  (Some ~ 'a)))\n");
+    assert_eq!(out, "(type ['a] Option [\n  None\n  (Some ~ 'a)])\n");
 }
 
 #[test]
 fn type_record_inline() {
-    let src = "(type Point ((:x ~ Int) (:y ~ Int)))";
+    let src = "(type Point [(:x ~ Int) (:y ~ Int)])";
     let out = fmt(src);
-    assert_eq!(out, "(type Point (\n  (:x ~ Int)\n  (:y ~ Int)))\n");
+    assert_eq!(out, "(type Point [\n  (:x ~ Int)\n  (:y ~ Int)])\n");
 }
 
 #[test]
 fn type_pub() {
-    let src = "(pub type Foo (A B))";
+    let src = "(pub type Foo [A B])";
     let out = fmt(src);
-    assert_eq!(out, "(pub type Foo (\n  A\n  B))\n");
+    assert_eq!(out, "(pub type Foo [\n  A\n  B])\n");
 }
 
 #[test]
 fn type_variants_break_onto_new_lines() {
-    let src = "(type LotsOVariants ( One Two (Three ~ Int) Four Five (Six ~ String) ))";
+    let src = "(type LotsOVariants [ One Two (Three ~ Int) Four Five (Six ~ String) ])";
     let out = fmt(src);
-    let expected = "(type LotsOVariants (\n  One\n  Two\n  (Three ~ Int)\n  Four\n  Five\n  (Six ~ String)))\n";
+    let expected = "(type LotsOVariants [\n  One\n  Two\n  (Three ~ Int)\n  Four\n  Five\n  (Six ~ String)])\n";
     assert_eq!(out, expected);
 }
 
@@ -273,7 +273,7 @@ fn idempotent_match() {
 
 #[test]
 fn idempotent_type() {
-    let src = "(type ['a] Option (None (Some ~ 'a)))";
+    let src = "(type ['a] Option [None (Some ~ 'a)])";
     let once = fmt(src);
     let twice = fmt(once.trim());
     assert_eq!(
@@ -343,10 +343,10 @@ fn formats_real_program() {
     (Error "division by zero")
     (Ok (/ a b))))
 
-(type SimpleRecord (
+(type SimpleRecord [
   (:a ~ Int)
   (:b ~ Int)
-))
+])
 
 (let main {}
   (let [a (SimpleRecord :a 10 :b 10)] (io/debug a))

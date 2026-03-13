@@ -326,11 +326,11 @@ fn fmt_type(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Do
     let prefix = concat(join(text(" "), mods_and_kw), text(" "));
 
     match rest {
-        // (type ['a 'b] Name (body...))
+        // (type ['a 'b] Name [body...])
         [
             params @ SExpr::Square(..),
             SExpr::Atom(name),
-            SExpr::Round(body, _),
+            SExpr::Square(body, _),
         ] => concat_all([
             text("("),
             prefix,
@@ -342,8 +342,8 @@ fn fmt_type(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Do
             text(")"),
         ]),
 
-        // (type Name (body...))
-        [SExpr::Atom(name), SExpr::Round(body, _)] => concat_all([
+        // (type Name [body...])
+        [SExpr::Atom(name), SExpr::Square(body, _)] => concat_all([
             text("("),
             prefix,
             text(atom_text(name, source)),
@@ -356,18 +356,14 @@ fn fmt_type(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Do
     }
 }
 
-/// Format the body of a type declaration, including the outer `()`.
-///
-/// Preserving the outer parens is essential for idempotency: without them the
-/// SExpr structure changes on re-parse and the second pass would produce
-/// different output.
+/// Format the body of a type declaration, including the outer `[]`.
 fn fmt_type_body(items: &[SExpr], source: &str) -> Doc {
     if items.is_empty() {
-        return text("()");
+        return text("[]");
     }
     let entries: Vec<Doc> = items.iter().map(|i| fmt(i, source)).collect();
     let inner = join(hardline(), entries);
-    concat_all([text("("), nest(2, concat(hardline(), inner)), text(")")])
+    concat_all([text("["), nest(2, concat(hardline(), inner)), text("]")])
 }
 
 // ── if ────────────────────────────────────────────────────────────────────────

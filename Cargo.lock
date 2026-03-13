@@ -523,7 +523,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "mond"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "codespan-reporting",
@@ -540,14 +540,14 @@ dependencies = [
 
 [[package]]
 name = "mond-format"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "mondc",
 ]
 
 [[package]]
 name = "mond-lsp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "codespan-reporting",
  "mond-format",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "mondc"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "codespan-reporting",
  "logos",

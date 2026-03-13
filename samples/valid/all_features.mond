@@ -12,9 +12,9 @@
 (pub extern type ['k 'v] Dict maps/map)
 
 ;; type declarations: generic variant and generic record
-(pub type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
 
-(pub type ['a] Box ( (:value ~ 'a) (:label ~ String) ))
+(pub type ['a] Box [(:value ~ 'a) (:label ~ String)])
 
 ;; top-level function (`let`) with recursion + `if`
 (let factorial {n} (if (= n 0) 1 (* n (factorial (- n 1)))))

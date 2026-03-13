@@ -1,6 +1,6 @@
 (extern let println ~ (String -> Unit) io/format)
 
-(type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
 
 (let safe_div {a b} (if (= b 0) (Error "division by zero") (Ok (/ a b))))
 

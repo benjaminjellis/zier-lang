@@ -60,117 +60,119 @@ impl Lowerer {
         };
         cursor += 1;
 
-        // 3. Peak at the first item in the body to determine the Kind
-        // We expect a list like (:field ~ Type) or (Constructor ~ Type)
-        let body_items = &items[cursor..];
-        let first_body_item = body_items.first()?;
-
-        // Determine if we are building a Record or a Variant based on the first token
-        let is_record = if let SExpr::Round(inner, _) = first_body_item {
-            // Look at the very first thing inside the first definition
-            match inner.first() {
-                Some(SExpr::Round(nested_inner, _)) => {
-                    if let Some(SExpr::Atom(t)) = nested_inner.first() {
-                        matches!(t.kind, TokenKind::NamedField(_))
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
+        // 3. Parse the type body group.
+        // Types now require bracket bodies: [ ... ]
+        let body_group = match items.get(cursor) {
+            Some(group) => group,
+            None => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("type declaration is missing a body")
+                        .with_labels(vec![Label::primary(file_id, span.clone())])
+                        .with_notes(vec!["expected a bracket body like `[Ctor ...]`".into()]),
+                );
+                return None;
             }
-        } else {
-            false
         };
+        let body_items: &[SExpr] = match body_group {
+            SExpr::Square(items, _) => items.as_slice(),
+            other => {
+                self.error(
+                    Diagnostic::error()
+                        .with_message("type body must be wrapped in square brackets")
+                        .with_labels(vec![Label::primary(file_id, other.span())])
+                        .with_notes(vec![
+                            "example variant: (type ExitReason [Normal Killed (Abnormal ~ Dynamic)])"
+                                .into(),
+                            "example record:  (type ExitMessage [(:pid ~ Pid) (:reason ~ ExitReason)])"
+                                .into(),
+                        ]),
+                );
+                return None;
+            }
+        };
+
+        // Determine if we are building a Record or a Variant based on the first body item.
+        let is_record = matches!(
+            body_items.first(),
+            Some(SExpr::Round(field_items, _))
+                if matches!(field_items.first(), Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::NamedField(_)))
+        );
 
         if is_record {
             // --- Lowering as a Record (Product Type) ---
             let mut fields = Vec::new();
             let mut seen_fields: HashMap<String, Range<usize>> = HashMap::new();
             for item in body_items {
-                if let SExpr::Round(inner, _) = item {
-                    for i in inner {
-                        let SExpr::Round(field_items, field_span) = i else {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message(
-                                        "each record field must be wrapped in parentheses",
-                                    )
-                                    .with_labels(vec![
-                                        Label::primary(file_id, i.span())
-                                            .with_message("expected `(:field ~ Type)`"),
-                                    ])
-                                    .with_notes(vec!["example: `(:x ~ Int)`".into()]),
-                            );
-                            return None;
-                        };
-                        let Some(SExpr::Atom(name_token)) = field_items.first() else {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("expected field name as first item in field spec")
-                                    .with_labels(vec![Label::primary(file_id, field_span.clone())])
-                                    .with_notes(vec![
-                                        "field names must start with `:`, e.g. `:x`".into(),
-                                    ]),
-                            );
-                            return None;
-                        };
-                        let TokenKind::NamedField(field_name) = &name_token.kind else {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("field name must start with `:`")
-                                    .with_labels(vec![
-                                        Label::primary(file_id, name_token.span.clone())
-                                            .with_message("expected `:field_name`"),
-                                    ])
-                                    .with_notes(vec!["example: `(:x ~ Int)`".into()]),
-                            );
-                            return None;
-                        };
-                        let Some(SExpr::Atom(tilde_token)) = field_items.get(1) else {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("expected `~` after field name")
-                                    .with_labels(vec![Label::primary(file_id, field_span.clone())])
-                                    .with_notes(vec!["example: `(:x ~ Int)`".into()]),
-                            );
-                            return None;
-                        };
-                        if !matches!(tilde_token.kind, TokenKind::Tilde) {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message("expected `~` after field name")
-                                    .with_labels(vec![Label::primary(
-                                        file_id,
-                                        tilde_token.span.clone(),
-                                    )]),
-                            );
-                            return None;
-                        }
-                        let type_usage = self.lower_type_usage_atoms(
-                            file_id,
-                            &field_items[2..],
-                            field_span.clone(),
-                        )?;
-                        if let Some(first_span) =
-                            seen_fields.insert(field_name.clone(), name_token.span.clone())
-                        {
-                            self.error(
-                                Diagnostic::error()
-                                    .with_message(format!("duplicate record field `:{field_name}`"))
-                                    .with_labels(vec![
-                                        Label::primary(file_id, name_token.span.clone())
-                                            .with_message(format!(
-                                                "`:{field_name}` is declared again here"
-                                            )),
-                                        Label::secondary(file_id, first_span)
-                                            .with_message("first declared here"),
-                                    ]),
-                            );
-                            return None;
-                        }
-                        fields.push((field_name.clone(), type_usage));
-                    }
+                let SExpr::Round(field_items, field_span) = item else {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("each record field must be wrapped in parentheses")
+                            .with_labels(vec![
+                                Label::primary(file_id, item.span())
+                                    .with_message("expected `(:field ~ Type)`"),
+                            ])
+                            .with_notes(vec!["example: `(:x ~ Int)`".into()]),
+                    );
+                    return None;
+                };
+                let Some(SExpr::Atom(name_token)) = field_items.first() else {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected field name as first item in field spec")
+                            .with_labels(vec![Label::primary(file_id, field_span.clone())])
+                            .with_notes(vec!["field names must start with `:`, e.g. `:x`".into()]),
+                    );
+                    return None;
+                };
+                let TokenKind::NamedField(field_name) = &name_token.kind else {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("field name must start with `:`")
+                            .with_labels(vec![
+                                Label::primary(file_id, name_token.span.clone())
+                                    .with_message("expected `:field_name`"),
+                            ])
+                            .with_notes(vec!["example: `(:x ~ Int)`".into()]),
+                    );
+                    return None;
+                };
+                let Some(SExpr::Atom(tilde_token)) = field_items.get(1) else {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected `~` after field name")
+                            .with_labels(vec![Label::primary(file_id, field_span.clone())])
+                            .with_notes(vec!["example: `(:x ~ Int)`".into()]),
+                    );
+                    return None;
+                };
+                if !matches!(tilde_token.kind, TokenKind::Tilde) {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected `~` after field name")
+                            .with_labels(vec![Label::primary(file_id, tilde_token.span.clone())]),
+                    );
+                    return None;
                 }
+                let type_usage =
+                    self.lower_type_usage_atoms(file_id, &field_items[2..], field_span.clone())?;
+                if let Some(first_span) =
+                    seen_fields.insert(field_name.clone(), name_token.span.clone())
+                {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message(format!("duplicate record field `:{field_name}`"))
+                            .with_labels(vec![
+                                Label::primary(file_id, name_token.span.clone()).with_message(
+                                    format!("`:{field_name}` is declared again here"),
+                                ),
+                                Label::secondary(file_id, first_span)
+                                    .with_message("first declared here"),
+                            ]),
+                    );
+                    return None;
+                }
+                fields.push((field_name.clone(), type_usage));
             }
             Some(TypeDecl::Record {
                 is_pub,
@@ -183,17 +185,6 @@ impl Lowerer {
             // --- Lowering as a Variant (Sum Type) ---
             let mut constructors = Vec::new();
             let mut seen_ctors: HashMap<String, Range<usize>> = HashMap::new();
-            let Some(SExpr::Round(body_items, _)) = body_items.first() else {
-                self.error(
-                    Diagnostic::error()
-                        .with_message("variant body must be wrapped in parentheses")
-                        .with_labels(vec![Label::primary(file_id, span.clone())])
-                        .with_notes(vec![
-                            "expected `(Constructor1 (Constructor2 ~ Type) ...)`".into(),
-                        ]),
-                );
-                return None;
-            };
             for item in body_items {
                 match item {
                     // Case: (Some ~ 'a) or (Error ~ 'e) or (Wrap ~ Map 'k 'v)
@@ -2296,9 +2287,9 @@ mod tests {
     #[test]
     fn test_variant_type() {
         let (mut lowerer, file_id, sexprs) = setup(
-            r#"(type ['a] Option (
+            r#"(type ['a] Option [
                         None
-                        (Some ~ 'a)))
+                        (Some ~ 'a)])
                     "#,
         );
 
@@ -2309,10 +2300,10 @@ mod tests {
     fn test_record_type_with_generics() {
         let (mut lowerer, file_id, sexprs) = setup(
             "
-                (type ['t] MyGenericType (
+                (type ['t] MyGenericType [
                     (:name ~ String)
                     (:data ~ 't)
-                ))",
+                ])",
         );
 
         let exprs = lowerer.lower_file(file_id, &sexprs);
@@ -2340,11 +2331,11 @@ mod tests {
     #[test]
     fn test_record_type() {
         let (mut lowerer, file_id, sexprs) = setup(
-            "(type MyType (
+            "(type MyType [
                         (:field_one ~ String)
                         (:field_two ~ Int)
                         (:field_three ~ Bool)
-                        ))",
+                        ])",
         );
 
         let exprs = lowerer.lower_file(file_id, &sexprs);
@@ -2367,6 +2358,36 @@ mod tests {
             );
         } else {
             panic!("expected a type not an expression")
+        }
+    }
+
+    #[test]
+    fn test_record_type_square_bracket_body() {
+        let (mut lowerer, file_id, sexprs) =
+            setup("(pub type ExitMessage [(:pid ~ Pid) (:reason ~ ExitReason)])");
+
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Declaration::Type(TypeDecl::Record {
+            is_pub,
+            name,
+            params,
+            fields,
+            ..
+        }) = &exprs[0]
+        {
+            assert!(*is_pub);
+            assert_eq!(name, "ExitMessage");
+            assert!(params.is_empty());
+            assert_eq!(
+                fields,
+                &vec![
+                    ("pid".into(), TypeUsage::Named("Pid".into())),
+                    ("reason".into(), TypeUsage::Named("ExitReason".into())),
+                ]
+            );
+        } else {
+            panic!("expected a record type declaration");
         }
     }
 
@@ -2635,7 +2656,7 @@ mod tests {
     #[test]
     fn test_variant_type_multiple_constructors() {
         let (mut lowerer, file_id, sexprs) =
-            setup("(type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))");
+            setup("(type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])");
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert_eq!(exprs.len(), 1);
         if let Declaration::Type(TypeDecl::Variant {
@@ -2654,6 +2675,37 @@ mod tests {
             let (err_name, err_payload) = &constructors[1];
             assert_eq!(err_name, "Error");
             assert!(err_payload.is_some());
+        } else {
+            panic!("expected Variant type declaration");
+        }
+    }
+
+    #[test]
+    fn test_variant_type_square_bracket_body() {
+        let (mut lowerer, file_id, sexprs) =
+            setup("(pub type ['a] ExitReason [Normal Killed (Abnormal ~ 'a)])");
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert_eq!(exprs.len(), 1);
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Declaration::Type(TypeDecl::Variant {
+            is_pub,
+            name,
+            params,
+            constructors,
+            ..
+        }) = &exprs[0]
+        {
+            assert!(*is_pub);
+            assert_eq!(name, "ExitReason");
+            assert_eq!(params, &vec!["'a".to_string()]);
+            assert_eq!(
+                constructors,
+                &vec![
+                    ("Normal".into(), None),
+                    ("Killed".into(), None),
+                    ("Abnormal".into(), Some(TypeUsage::Generic("'a".into()))),
+                ]
+            );
         } else {
             panic!("expected Variant type declaration");
         }
@@ -3085,7 +3137,7 @@ mod tests {
 
     #[test]
     fn test_pub_type_is_pub() {
-        let (mut lowerer, file_id, sexprs) = setup("(pub type ['a] Option (None (Some ~ 'a)))");
+        let (mut lowerer, file_id, sexprs) = setup("(pub type ['a] Option [None (Some ~ 'a)])");
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(lowerer.diagnostics.is_empty());
         if let Declaration::Type(TypeDecl::Variant { is_pub, name, .. }) = &exprs[0] {
@@ -3098,7 +3150,7 @@ mod tests {
 
     #[test]
     fn test_pub_record_type_is_pub() {
-        let (mut lowerer, file_id, sexprs) = setup("(pub type Point ((:x ~ Int) (:y ~ Int)))");
+        let (mut lowerer, file_id, sexprs) = setup("(pub type Point [(:x ~ Int) (:y ~ Int)])");
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(lowerer.diagnostics.is_empty());
         if let Declaration::Type(TypeDecl::Record { is_pub, name, .. }) = &exprs[0] {
@@ -3111,7 +3163,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_record_field_rejected() {
-        let src = "(type LotsOfFields ((:record ~ String) (:record ~ String)))";
+        let src = "(type LotsOfFields [(:record ~ String) (:record ~ String)])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let decls = lowerer.lower_file(file_id, &sexprs);
         assert!(decls.is_empty(), "expected lowering to fail");
@@ -3124,7 +3176,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_variant_constructor_rejected() {
-        let src = "(type LotsOVariants (One One Two))";
+        let src = "(type LotsOVariants [One One Two])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let decls = lowerer.lower_file(file_id, &sexprs);
         assert!(decls.is_empty(), "expected lowering to fail");
@@ -3330,7 +3382,7 @@ mod tests {
     #[test]
     fn test_variant_spurious_atom_rejected() {
         // `None x` — `x` is not a valid constructor name (lowercase)
-        let src = "(type ['a] Option (None x (Some ~ 'a)))";
+        let src = "(type ['a] Option [None x (Some ~ 'a)])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty(), "expected lowering to fail");
@@ -3344,7 +3396,7 @@ mod tests {
     #[test]
     fn test_variant_lowercase_constructor_rejected() {
         // Constructor names must start with uppercase
-        let src = "(type ['a] Option (none (Some ~ 'a)))";
+        let src = "(type ['a] Option [none (Some ~ 'a)])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty(), "expected lowering to fail");
@@ -3357,7 +3409,7 @@ mod tests {
     #[test]
     fn test_variant_constructor_missing_tilde_rejected() {
         // (Some 'a) instead of (Some ~ 'a)
-        let src = "(type ['a] Option (None (Some 'a)))";
+        let src = "(type ['a] Option [None (Some 'a)])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty(), "expected lowering to fail");
@@ -3365,9 +3417,24 @@ mod tests {
     }
 
     #[test]
+    fn test_variant_square_payload_requires_parentheses() {
+        // In square-body form, payload constructors still require parens:
+        // [Normal Killed (Abnormal ~ 'a)]
+        let src = "(type ['a] ExitReason [Normal Killed Abnormal ~ 'a])";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "invalid variant constructor"
+        );
+    }
+
+    #[test]
     fn test_variant_constructor_lowercase_name_in_payload_rejected() {
         // (some ~ 'a) — constructor name is lowercase
-        let src = "(type ['a] Option (None (some ~ 'a)))";
+        let src = "(type ['a] Option [None (some ~ 'a)])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty(), "expected lowering to fail");
@@ -3380,11 +3447,24 @@ mod tests {
     #[test]
     fn test_variant_integer_in_body_rejected() {
         // A literal in the variant body is not a constructor
-        let src = "(type Foo (Bar 42))";
+        let src = "(type Foo [Bar 42])";
         let (mut lowerer, file_id, sexprs) = setup(src);
         let exprs = lowerer.lower_file(file_id, &sexprs);
         assert!(exprs.is_empty(), "expected lowering to fail");
         assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_type_round_body_rejected() {
+        let src = "(type Flag (On Off))";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        assert!(exprs.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "type body must be wrapped in square brackets"
+        );
     }
 
     #[test]

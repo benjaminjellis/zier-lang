@@ -183,6 +183,18 @@ fn flatten_top_level_alternatives(pat: &ast::Pattern) -> Vec<&ast::Pattern> {
     }
 }
 
+fn pattern_is_wildcard_like(pat: &ast::Pattern) -> bool {
+    match pat {
+        ast::Pattern::Any(_) | ast::Pattern::Variable(_, _) => true,
+        ast::Pattern::Or(pats, _) => pats.iter().all(pattern_is_wildcard_like),
+        ast::Pattern::Literal(_, _)
+        | ast::Pattern::Constructor(_, _, _)
+        | ast::Pattern::EmptyList(_)
+        | ast::Pattern::Cons(_, _, _)
+        | ast::Pattern::Record { .. } => false,
+    }
+}
+
 fn pattern_summary(
     pat: &ast::Pattern,
     constructor_families: &HashMap<String, String>,
@@ -206,17 +218,26 @@ fn pattern_summary(
                 is_catch_all: false,
             }
         }
-        ast::Pattern::Constructor(name, _, span) => PatternSummary {
-            span: span.clone(),
-            key: Some(PatternKey::Constructor(name.clone())),
-            family_member: constructor_families.get(name).map(|type_name| {
-                (
-                    MatchFamily::Variant(type_name.clone()),
-                    MatchMember::Constructor(name.clone()),
-                )
-            }),
-            is_catch_all: false,
-        },
+        ast::Pattern::Constructor(name, args, span) => {
+            // `Ctor _`/`Ctor x` covers all values for that constructor branch, but
+            // `Ctor (Nested ...)` and literal payload patterns do not.
+            let covers_constructor = args.iter().all(pattern_is_wildcard_like);
+            PatternSummary {
+                span: span.clone(),
+                key: covers_constructor.then(|| PatternKey::Constructor(name.clone())),
+                family_member: if covers_constructor {
+                    constructor_families.get(name).map(|type_name| {
+                        (
+                            MatchFamily::Variant(type_name.clone()),
+                            MatchMember::Constructor(name.clone()),
+                        )
+                    })
+                } else {
+                    None
+                },
+                is_catch_all: false,
+            }
+        }
         ast::Pattern::EmptyList(span) => PatternSummary {
             span: span.clone(),
             key: Some(PatternKey::EmptyList),

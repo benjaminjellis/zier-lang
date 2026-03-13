@@ -22,14 +22,14 @@ pub(crate) struct Package {
     pub(crate) mond_version: Version,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DependencySpec {
     pub(crate) git: String,
     #[serde(flatten)]
     pub(crate) reference: GitReference,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GitReference {
     #[serde(rename = "tag")]
     Tag(String),

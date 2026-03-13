@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 pub(crate) const MANIFEST_NAME: &str = "mond.toml";
+pub(crate) const LOCKFILE_NAME: &str = "mond.lock";
 pub(crate) const TARGET_DIR: &str = "target";
 pub(crate) const DEBUG_BUILD_DIR: &str = "debug";
 pub(crate) const TEST_BUILD_DIR: &str = "tests";

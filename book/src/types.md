@@ -6,8 +6,8 @@ e.g. `Result` and `Option`
 
 ```
 (type ['a] Option
-  (None
-   (Some ~ 'a)))
+  [None
+   (Some ~ 'a)])
 
 
 (let greet {name}
@@ -25,8 +25,8 @@ The constructors can be nullary (like `None`) or encompass data (like `Some`). T
 ## Product / Record Types
 ```
 (type Point
-  ((:x ~ Int)
-   (:y ~ Int)))
+  [(:x ~ Int)
+   (:y ~ Int)])
 
 (let origin {} (Point :x 0 :y 0))
 
@@ -38,7 +38,7 @@ Record types have fields which, by convention, are `snake_case` identifiers. Eac
 e.g.
 ```mond
 (type ['a] Point
-  ((:x ~ 'a)
-   (:y ~ 'a)))
+  [(:x ~ 'a)
+   (:y ~ 'a)])
 ```
 By convention all type names are `PascalCase` identifiers.

@@ -4,7 +4,7 @@ members = ["mondc", "mond-lsp", "mond", "mond-format"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.1"
+version = "0.0.2"
 
 [workspace.dependencies]
 codespan-reporting = "0.13"

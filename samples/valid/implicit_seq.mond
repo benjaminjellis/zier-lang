@@ -1,4 +1,4 @@
-(type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
 
 (let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
 

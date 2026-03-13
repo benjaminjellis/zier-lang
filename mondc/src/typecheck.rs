@@ -1994,7 +1994,7 @@ mod tests {
 
     #[test]
     fn infer_constructor_binding_is_polymorphic_under_value_restriction() {
-        let src = "(type ['a] Option (None (Some ~ 'a)))\n(let get_none {dummy} (let [none None a none b none] a))\n(let main {} (get_none 0))";
+        let src = "(type ['a] Option [None (Some ~ 'a)])\n(let get_none {dummy} (let [none None a none b none] a))\n(let main {} (get_none 0))";
         let ty = check(src).unwrap();
         match ty.as_ref() {
             Type::Con(name, args) => {
@@ -2076,7 +2076,7 @@ mod tests {
 
     #[test]
     fn nullary_constructor_call_has_helpful_diagnostic() {
-        let src = "(type ['a] Option (None (Some ~ 'a)))\n(let always_none {x} (None x))";
+        let src = "(type ['a] Option [None (Some ~ 'a)])\n(let always_none {x} (None x))";
         let tokens = crate::lexer::Lexer::new(src).lex();
         let mut lowerer = crate::lower::Lowerer::new();
         let file_id = lowerer.add_file("test.mond".into(), src.into());
@@ -2111,7 +2111,7 @@ mod tests {
     #[test]
     fn call_mismatch_mentions_inferred_callee_type() {
         let src = r#"
-            (type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))
+            (type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
             (extern let println ~ (String -> Unit) io/format)
             (let match_and_print {val}
               (match val
@@ -2159,7 +2159,7 @@ mod tests {
     #[test]
     fn infer_option_none() {
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let get_none {} None)
         "#;
         let ty = check(src).unwrap();
@@ -2176,7 +2176,7 @@ mod tests {
     #[test]
     fn infer_option_some() {
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let get_some {} (Some 42))
         "#;
         let ty = check(src).unwrap();
@@ -2187,7 +2187,7 @@ mod tests {
     #[test]
     fn infer_match_option() {
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let safe_add {opt n}
               (match opt
                 None ~> 0
@@ -2201,7 +2201,7 @@ mod tests {
     #[test]
     fn infer_record_construction() {
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let main {} (Point :x 0 :y 0))
         "#;
         let ty = check(src).unwrap();
@@ -2211,7 +2211,7 @@ mod tests {
     #[test]
     fn infer_generic_record_construction() {
         let src = r#"
-            (type ['t] Box ((:value ~ 't)))
+            (type ['t] Box [(:value ~ 't)])
             (let main {} (Box :value 42))
         "#;
         let ty = check(src).unwrap();
@@ -2221,7 +2221,7 @@ mod tests {
     #[test]
     fn infer_record_construction_field_type_error() {
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let main {} (Point :x True :y 0))
         "#;
         assert!(
@@ -2261,9 +2261,9 @@ mod tests {
     fn infer_let_bind() {
         // let? desugars to bind; define a Result bind and use it
         let src = r#"
-            (type ['a 'e] Result (
+            (type ['a 'e] Result [
                 (Ok ~ 'a)
-                (Error ~ 'e)))
+                (Error ~ 'e)])
             (let bind {m func}
                 (match m
                     (Ok x) ~> (func x)
@@ -2284,7 +2284,7 @@ mod tests {
     #[test]
     fn infer_field_access() {
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let get_x {p} (:x p))
             (let main {} (get_x (Point :x 5 :y 10)))
         "#;
@@ -2295,7 +2295,7 @@ mod tests {
     #[test]
     fn infer_field_access_generic_record() {
         let src = r#"
-            (type ['t] Box ((:value ~ 't)))
+            (type ['t] Box [(:value ~ 't)])
             (let get_val {b} (:value b))
             (let main {} (get_val (Box :value 42)))
         "#;
@@ -2306,7 +2306,7 @@ mod tests {
     #[test]
     fn infer_result_type() {
         let src = r#"
-            (type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))
+            (type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
             (let identity {r} r)
             (let main {} (identity (Ok 42)))
         "#;
@@ -2341,7 +2341,7 @@ mod tests {
     #[test]
     fn field_access_wrong_type() {
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let test {} (:x 42))
         "#;
         let result = check(src);
@@ -2448,7 +2448,7 @@ mod tests {
     #[test]
     fn infer_wildcard_pattern() {
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let is_some {opt}
               (match opt
                 None ~> False
@@ -2493,7 +2493,7 @@ mod tests {
     #[test]
     fn infer_chained_field_access() {
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let sum_coords {p} (+ (:x p) (:y p)))
             (let main {} (sum_coords (Point 3 4)))
         "#;
@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     fn infer_nullary_variant_in_match() {
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let identity {x} x)
             (let main {} (identity None))
         "#;
@@ -2623,7 +2623,7 @@ mod tests {
     #[test]
     fn infer_variant_in_match_with_binding() {
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let unwrap_or {opt default}
               (match opt
                 (Some x) ~> x
@@ -2637,7 +2637,7 @@ mod tests {
     #[test]
     fn infer_record_pattern_with_partial_destructuring() {
         let src = r#"
-            (type Person ((:name ~ String) (:age ~ Int)))
+            (type Person [(:name ~ String) (:age ~ Int)])
             (let age_of {person}
               (match person
                 (Person :age age) ~> age))
@@ -2650,8 +2650,8 @@ mod tests {
     #[test]
     fn infer_nested_record_pattern() {
         let src = r#"
-            (type Address ((:city ~ String)))
-            (type Person ((:name ~ String) (:address ~ Address)))
+            (type Address [(:city ~ String)])
+            (type Person [(:name ~ String) (:address ~ Address)])
             (let city_of {person}
               (match person
                 (Person :address (Address :city city)) ~> city))
@@ -2664,7 +2664,7 @@ mod tests {
     #[test]
     fn reject_unknown_field_in_record_pattern() {
         let src = r#"
-            (type Person ((:name ~ String) (:age ~ Int)))
+            (type Person [(:name ~ String) (:age ~ Int)])
             (let age_of {person}
               (match person
                 (Person :height h) ~> h))
@@ -2679,7 +2679,7 @@ mod tests {
     #[test]
     fn reject_non_exhaustive_variant_match() {
         let src = r#"
-            (type LotsOVariants (One Two (Three ~ Int) Four Five (Six ~ String)))
+            (type LotsOVariants [One Two (Three ~ Int) Four Five (Six ~ String)])
             (let main {}
               (let [x One]
                 (match x
@@ -2698,7 +2698,7 @@ mod tests {
     #[test]
     fn accept_exhaustive_variant_match_with_or_pattern() {
         let src = r#"
-            (type TrafficLight (Red Yellow Green))
+            (type TrafficLight [Red Yellow Green])
             (let to_int {light}
               (match light
                 Red or Yellow ~> 0
@@ -3037,7 +3037,7 @@ mod tests {
     fn reject_field_access_on_non_record() {
         // Accessing :x on an Int literal must fail
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let test {} (:x 42))
         "#;
         let result = check(src);
@@ -3048,7 +3048,7 @@ mod tests {
     fn reject_unknown_field_on_record() {
         // :z is not a field of Point — fails during the function's type-check
         let src = r#"
-            (type Point ((:x ~ Int) (:y ~ Int)))
+            (type Point [(:x ~ Int) (:y ~ Int)])
             (let get_z {p} (:z p))
         "#;
         let result = check(src);
@@ -3062,7 +3062,7 @@ mod tests {
     fn reject_wrong_constructor_arg_type() {
         // (+ s True) — s is Int (from Some 1), True is Bool — type error
         let src = r#"
-            (type ['a] Option (None (Some ~ 'a)))
+            (type ['a] Option [None (Some ~ 'a)])
             (let bad_match {x} (match x (Some s) ~> (+ s True) None ~> 0))
         "#;
         let result = check(src);

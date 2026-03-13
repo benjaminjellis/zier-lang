@@ -1,4 +1,4 @@
-(pub type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
 
 ;; bnd for let?
 (pub let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))

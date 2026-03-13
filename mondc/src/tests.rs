@@ -7,7 +7,7 @@ use crate::{
 };
 
 const RESULT_STD_SRC: &str = r#"
-(pub type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
 (pub let bind {m func} (match m (Ok x) ~> (func x) (Error e) ~> (Error e)))
 "#;
 
@@ -100,7 +100,7 @@ fn duplicate_top_level_function_defs_error() {
 
 #[test]
 fn duplicate_record_fields_error() {
-    let src = "(type LotsOfFields ((:record ~ String) (:record ~ String)))";
+    let src = "(type LotsOfFields [(:record ~ String) (:record ~ String)])";
     let result = compile_with_imports(
         "main",
         src,
@@ -117,7 +117,7 @@ fn duplicate_record_fields_error() {
 
 #[test]
 fn duplicate_variant_constructors_error() {
-    let src = "(type LotsOVariants (One One Two (Three ~ Int)))";
+    let src = "(type LotsOVariants [One One Two (Three ~ Int)])";
     let result = compile_with_imports(
         "main",
         src,
@@ -135,8 +135,8 @@ fn duplicate_variant_constructors_error() {
 #[test]
 fn duplicate_variant_constructors_across_types_error() {
     let src = r#"
-        (type DiffVariant (One Five (Six ~ String)))
-        (type LotsOVariants (One Two (Three ~ Int) Four Five (Six ~ String)))
+        (type DiffVariant [One Five (Six ~ String)])
+        (type LotsOVariants [One Two (Three ~ Int) Four Five (Six ~ String)])
     "#;
     let result = compile_with_imports(
         "main",
@@ -215,7 +215,7 @@ fn duplicate_module_use_without_unqualified_imports_is_allowed() {
 #[test]
 fn qualified_only_use_does_not_import_variant_constructors_unqualified() {
     let result_src =
-        "(pub type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))\n(pub let bind {m f} (f m))";
+        "(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])\n(pub let bind {m f} (f m))";
     let std_mods = vec![(
         "result".to_string(),
         "mond_result".to_string(),
@@ -253,7 +253,7 @@ fn qualified_only_use_does_not_import_variant_constructors_unqualified() {
 #[test]
 fn importing_type_name_brings_variant_constructors_into_scope() {
     let result_src =
-        "(pub type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))\n(pub let bind {m f} (f m))";
+        "(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])\n(pub let bind {m f} (f m))";
     let std_mods = vec![(
         "result".to_string(),
         "mond_result".to_string(),
@@ -286,7 +286,7 @@ fn importing_type_name_brings_variant_constructors_into_scope() {
 
 #[test]
 fn qualified_only_use_keeps_record_field_accessors_available() {
-    let map_src = "(pub type ['a 'b] TakeResult ((:value ~ 'a) (:rest ~ 'b)))\n(pub let take {} (TakeResult :value \"mond\" :rest \"std\"))";
+    let map_src = "(pub type ['a 'b] TakeResult [(:value ~ 'a) (:rest ~ 'b)])\n(pub let take {} (TakeResult :value \"mond\" :rest \"std\"))";
     let std_mods = vec![(
         "map".to_string(),
         "mond_map".to_string(),
@@ -350,7 +350,7 @@ fn extern_signature_accepts_type_imported_unqualified() {
     let src = "(use option [Option])\n(pub extern let nth ~ (Int -> (List 'a) -> Option 'a) mond_list_helpers/nth)\n(let main {} ())";
     let mut module_exports = HashMap::new();
     module_exports.insert("option".to_string(), vec![]);
-    let imported_type_decls = exported_type_decls("(pub type ['a] Option ((Some ~ 'a) None))");
+    let imported_type_decls = exported_type_decls("(pub type ['a] Option [(Some ~ 'a) None])");
     let report = compile_with_imports_report(
         "main",
         src,
@@ -843,8 +843,47 @@ fn redundant_match_analysis_flags_duplicate_or_alternative() {
 }
 
 #[test]
+fn redundant_match_analysis_does_not_flag_nested_constructor_as_full_coverage() {
+    let src =
+        "(let main {result} (match result (Ok (Some x)) ~> 1 (Ok None) ~> 2 (Error err) ~> 3))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected redundancy warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn redundant_match_analysis_flags_duplicate_constructor_with_wildcard_payload() {
+    let src = "(let main {result} (match result (Ok x) ~> 1 (Ok y) ~> 2 (Error err) ~> 3))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "unreachable match arm");
+}
+
+#[test]
 fn redundant_match_analysis_flags_constructor_after_family_coverage() {
-    let src = "(type Light (Red Amber Green))\n(let main {light} (match light Red ~> 0 Amber ~> 1 Green ~> 2 Red ~> 3))";
+    let src = "(type Light [Red Amber Green])\n(let main {light} (match light Red ~> 0 Amber ~> 1 Green ~> 2 Red ~> 3))";
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(src).lex();
     let file_id = lowerer.add_file("scan.mond".into(), src.into());
@@ -968,7 +1007,7 @@ fn unqualified_import_warnings_flag_unused_specific_and_wildcard() {
 #[test]
 fn unqualified_import_warnings_count_type_decl_usage() {
     let src =
-        "(use std/option [Option])\n(type Attributes ((:max_age ~ Option Int)))\n(let main {} ())";
+        "(use std/option [Option])\n(type Attributes [(:max_age ~ Option Int)])\n(let main {} ())";
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(src).lex();
     let file_id = lowerer.add_file("scan.mond".into(), src.into());
@@ -1011,7 +1050,7 @@ fn unqualified_import_warnings_count_variant_constructor_usage_for_type_import()
         vec!["Result".to_string(), "bind".to_string()],
     );
     let imported_type_decls =
-        exported_type_decls("(pub type ['a 'e] Result ((Ok ~ 'a) (Error ~ 'e)))");
+        exported_type_decls("(pub type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])");
     let warnings = warnings::unused_unqualified_import_diagnostics(
         &decls,
         file_id,
@@ -1042,7 +1081,7 @@ fn unqualified_import_warnings_count_record_constructor_usage_for_type_import() 
     let mut module_exports = HashMap::new();
     module_exports.insert("unknown".to_string(), vec!["DecodeError".to_string()]);
     let imported_type_decls =
-        exported_type_decls("(pub type DecodeError ((:expected ~ String) (:found ~ String)))");
+        exported_type_decls("(pub type DecodeError [(:expected ~ String) (:found ~ String)])");
     let warnings = warnings::unused_unqualified_import_diagnostics(
         &decls,
         file_id,
@@ -1061,7 +1100,7 @@ fn unqualified_import_warnings_count_record_constructor_usage_for_type_import() 
 
 #[test]
 fn unused_type_analysis_marks_private_unreferenced_type() {
-    let src = "(type Attributes ((:max_age ~ Int)))\n(let main {} ())";
+    let src = "(type Attributes [(:max_age ~ Int)])\n(let main {} ())";
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(src).lex();
     let file_id = lowerer.add_file("scan.mond".into(), src.into());
@@ -1080,7 +1119,7 @@ fn unused_type_analysis_marks_private_unreferenced_type() {
 
 #[test]
 fn unused_type_analysis_counts_variant_constructor_usage() {
-    let src = "(type Flag (On Off))\n(let main {} On)";
+    let src = "(type Flag [On Off])\n(let main {} On)";
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(src).lex();
     let file_id = lowerer.add_file("scan.mond".into(), src.into());

@@ -3026,7 +3026,7 @@ mod tests {
 
     #[test]
     fn top_level_symbols_collect_functions_and_types() {
-        let src = "(type Option (None))\n\
+        let src = "(type Option [None])\n\
                    (extern let debug {} ~ String io/debug)\n\
                    (let main {} (debug))";
         let symbols = top_level_symbols(Path::new("src/main.mond"), src).unwrap();

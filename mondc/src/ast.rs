@@ -73,7 +73,7 @@ pub enum TypeSig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDecl {
-    /// (type MyType ( (:field ~ Type) ... ))
+    /// (type MyType [(:field ~ Type) ...])
     Record {
         is_pub: bool,
         name: String,
@@ -81,7 +81,7 @@ pub enum TypeDecl {
         fields: Vec<(String, TypeUsage)>, // (field_name, type)
         span: Range<usize>,
     },
-    /// (type ['a 'e] Result ( (Ok ~ 'a) (Error ~ 'e) ))
+    /// (type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
     Variant {
         is_pub: bool,
         name: String,
