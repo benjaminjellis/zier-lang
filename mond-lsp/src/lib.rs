@@ -125,16 +125,44 @@ impl Backend {
         let diagnostics = match self.analyze_document(&uri) {
             Ok(Some(analysis)) => analysis.diagnostics,
             Ok(None) => Vec::new(),
-            Err(err) => vec![Diagnostic {
-                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: err,
-                ..Diagnostic::default()
-            }],
+            Err(err) => vec![lsp_error_diagnostic(err)],
         };
         self.client
             .publish_diagnostics(uri, diagnostics, None)
             .await;
+    }
+
+    async fn publish_project_diagnostics(&self, focus_uri: Url) {
+        let path = match focus_uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
+                self.publish_document_diagnostics(focus_uri).await;
+                return;
+            }
+        };
+        let root = find_project_root(&path);
+        let batches =
+            match project_diagnostic_batches_for_uri(root.as_deref(), &self.state, &focus_uri) {
+                Ok(Some(batches)) => batches,
+                Ok(None) => {
+                    self.publish_document_diagnostics(focus_uri).await;
+                    return;
+                }
+                Err(err) => {
+                    self.client
+                        .publish_diagnostics(focus_uri, vec![lsp_error_diagnostic(err)], None)
+                        .await;
+                    return;
+                }
+            };
+
+        for (module, diagnostics) in batches {
+            if let Ok(uri) = Url::from_file_path(&module.path) {
+                self.client
+                    .publish_diagnostics(uri, diagnostics, None)
+                    .await;
+            }
+        }
     }
 
     fn analyze_document(&self, uri: &Url) -> std::result::Result<Option<DocumentAnalysis>, String> {
@@ -172,6 +200,26 @@ impl Backend {
         let root = find_project_root(&path);
         Project::load(root.as_deref(), &self.state, &uri).map(Some)
     }
+}
+
+type ProjectDiagnostic = Vec<(ModuleSource, Vec<Diagnostic>)>;
+
+fn project_diagnostic_batches_for_uri(
+    root: Option<&Path>,
+    state: &Arc<Mutex<ServerState>>,
+    focus_uri: &Url,
+) -> std::result::Result<Option<ProjectDiagnostic>, String> {
+    let project = Project::load(root, state, focus_uri)?;
+    let project_modules = project
+        .src_modules
+        .values()
+        .chain(project.test_modules.values())
+        .cloned()
+        .collect::<Vec<_>>();
+    if project_modules.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(project_diagnostic_batches(&project, project_modules)))
 }
 
 #[tower_lsp::async_trait]
@@ -222,7 +270,7 @@ impl LanguageServer for Backend {
                 },
             );
         }
-        self.publish_document_diagnostics(params.text_document.uri)
+        self.publish_project_diagnostics(params.text_document.uri)
             .await;
     }
 
@@ -235,12 +283,12 @@ impl LanguageServer for Backend {
                 doc.text = text;
             }
         }
-        self.publish_document_diagnostics(params.text_document.uri)
+        self.publish_project_diagnostics(params.text_document.uri)
             .await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        self.publish_document_diagnostics(params.text_document.uri)
+        self.publish_project_diagnostics(params.text_document.uri)
             .await;
     }
 
@@ -1453,6 +1501,31 @@ fn diagnostic_to_lsp(source: &str, diag: &CodeDiagnostic<usize>) -> Diagnostic {
         message,
         ..Diagnostic::default()
     }
+}
+
+fn lsp_error_diagnostic(message: String) -> Diagnostic {
+    Diagnostic {
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        severity: Some(DiagnosticSeverity::ERROR),
+        message,
+        ..Diagnostic::default()
+    }
+}
+
+fn project_diagnostic_batches(
+    project: &Project,
+    modules: Vec<ModuleSource>,
+) -> Vec<(ModuleSource, Vec<Diagnostic>)> {
+    modules
+        .into_iter()
+        .map(|module| {
+            let diagnostics = match project.analyze_document(&module) {
+                Ok(analysis) => analysis.diagnostics,
+                Err(err) => vec![lsp_error_diagnostic(err)],
+            };
+            (module, diagnostics)
+        })
+        .collect()
 }
 
 fn byte_range_to_lsp_range(source: &str, start: usize, end: usize) -> Range {
@@ -3132,6 +3205,51 @@ mod tests {
         let def_start = src.find("value").unwrap();
         assert_eq!(symbol.name, "value");
         assert_eq!(symbol.def_range, def_start..def_start + "value".len());
+    }
+
+    #[test]
+    fn project_diagnostics_include_non_focused_module() {
+        let src_modules = BTreeMap::from([
+            (
+                "main".to_string(),
+                ModuleSource {
+                    name: "main".to_string(),
+                    path: PathBuf::from("src/main.mond"),
+                    source: "(use helper)\n(let main {} (helper/value))".to_string(),
+                },
+            ),
+            (
+                "helper".to_string(),
+                ModuleSource {
+                    name: "helper".to_string(),
+                    path: PathBuf::from("src/helper.mond"),
+                    source: "(let broken {} unknown)".to_string(),
+                },
+            ),
+        ]);
+        let project = Project {
+            root: None,
+            std_modules: BTreeMap::new(),
+            src_modules: src_modules.clone(),
+            test_modules: BTreeMap::new(),
+            analysis: build_project_analysis(&BTreeMap::new(), &src_modules, None)
+                .expect("project analysis"),
+        };
+
+        let batches =
+            project_diagnostic_batches(&project, project.src_modules.values().cloned().collect());
+
+        let helper_diags = batches
+            .iter()
+            .find(|(module, _)| module.name == "helper")
+            .map(|(_, diags)| diags)
+            .expect("helper diagnostics");
+        assert!(
+            helper_diags
+                .iter()
+                .any(|diag| diag.message.contains("unbound variable `unknown`")),
+            "expected helper diagnostics, got {helper_diags:?}"
+        );
     }
 
     #[test]
