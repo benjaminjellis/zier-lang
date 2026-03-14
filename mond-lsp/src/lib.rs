@@ -1466,7 +1466,7 @@ fn std_source_root(root: Option<&Path>) -> Option<PathBuf> {
 
 fn package_name_from_manifest(root: Option<&Path>) -> Option<String> {
     let root = root?;
-    let manifest_path = root.join("mond.toml");
+    let manifest_path = root.join("bahn.toml");
     let manifest_source = fs::read_to_string(manifest_path).ok()?;
     let manifest: toml::Value = toml::from_str(&manifest_source).ok()?;
     manifest
@@ -1620,7 +1620,7 @@ fn find_top_level_definition_range(
 fn find_project_root(path: &Path) -> Option<PathBuf> {
     let mut current = path.parent()?;
     loop {
-        if current.join("mond.toml").exists() {
+        if current.join("bahn.toml").exists() {
             return Some(current.to_path_buf());
         }
         current = current.parent()?;

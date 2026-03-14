@@ -5,7 +5,7 @@ use eyre::Context;
 use crate::{
     TARGET_DIR, TEST_BUILD_DIR, TEST_DIR,
     build::{ErlSources, generate_erl_sources_with_roots, reachable_dependency_modules},
-    ui,
+    manifest, ui,
     utils::find_mond_files,
 };
 
@@ -98,6 +98,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         test_module_sources.push((module_name, source));
     }
 
+    let manifest = manifest::read_manifest(project_dir.into())?;
+
     // Compile src/ modules and get compilation state.
     let ErlSources {
         mut erl_paths,
@@ -110,6 +112,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         module_aliases,
         ..
     } = generate_erl_sources_with_roots(
+        manifest,
         project_dir,
         &erl_dir,
         &extra_src_roots.into_iter().collect::<Vec<_>>(),

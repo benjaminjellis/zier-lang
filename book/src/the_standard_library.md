@@ -1,5 +1,5 @@
 # The Standard Library
-`Mond`'s standard library is just like any other dependency, it is specified in you `mond.toml` and can be pinned to a specific version. 
+`Mond`'s standard library is just like any other dependency, it is specified in your `bahn.toml` and can be pinned to a specific version. 
 
 The standard library is intended to be small but provide the essential building blocks for writing `mond`.
 

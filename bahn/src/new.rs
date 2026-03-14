@@ -12,7 +12,7 @@ pub(crate) fn create_new_project(name: String, root: &Path, lib: bool) -> eyre::
     std::fs::create_dir_all(&project_dir)
         .context(format!("could not create {project_dir:?} dir"))?;
 
-    // create mond.toml with default
+    // create bahn.toml with default
     let manliest_path = project_dir.join(MANIFEST_NAME);
 
     let manifest = manifest::create_new_manifest(name.clone());
@@ -38,7 +38,8 @@ pub(crate) fn create_new_project(name: String, root: &Path, lib: bool) -> eyre::
 
 const MOND_HELLO_WORLD: &str = r#"(use std/io)
 
-(let main {} (io/println "hello world"))"#;
+(let main {}
+  (io/println "hello world"))"#;
 
 const MOND_LIB: &str = r#""#;
 

@@ -134,7 +134,7 @@ fn read_lockfile(project_dir: &Path) -> eyre::Result<Option<MondLock>> {
         .with_context(|| format!("failed to read {LOCKFILE_NAME} at {}", lock_path.display()))?;
     let lock: MondLock = toml::from_slice(&lock_src).map_err(|err| {
         eyre::eyre!(
-            "failed to parse {LOCKFILE_NAME}: {err}\n{LOCKFILE_NAME} format changed; delete {LOCKFILE_NAME} or run `mond deps --update` to regenerate it"
+            "failed to parse {LOCKFILE_NAME}: {err}\n{LOCKFILE_NAME} format changed; delete {LOCKFILE_NAME} or run `bahn deps --update` to regenerate it"
         )
     })?;
     if lock.version != LOCKFILE_FORMAT_VERSION {
@@ -181,7 +181,7 @@ fn lock_roots_by_alias(lock: &MondLock) -> eyre::Result<BTreeMap<String, LockedR
     Ok(by_alias)
 }
 
-fn lock_matches_manifest(lock: &MondLock, manifest: &manifest::MondManifest) -> eyre::Result<bool> {
+fn lock_matches_manifest(lock: &MondLock, manifest: &manifest::BahnManifest) -> eyre::Result<bool> {
     let mut root_from_manifest: Vec<String> = manifest.dependencies.keys().cloned().collect();
     root_from_manifest.sort();
 
@@ -258,7 +258,7 @@ fn current_dependency_rev(checkout_dir: &Path) -> eyre::Result<String> {
 
 fn resolve_dependencies(
     project_dir: &Path,
-    manifest: &manifest::MondManifest,
+    manifest: &manifest::BahnManifest,
     refresh: bool,
 ) -> eyre::Result<ResolvedGraph> {
     if !refresh
@@ -349,7 +349,7 @@ fn resolve_dependencies_from_lockfile(
 
 fn resolve_dependencies_from_manifests(
     project_dir: &Path,
-    manifest: &manifest::MondManifest,
+    manifest: &manifest::BahnManifest,
     refresh: bool,
 ) -> eyre::Result<ResolvedGraph> {
     #[derive(Clone, Debug)]
@@ -486,7 +486,7 @@ fn resolve_dependencies_from_manifests(
 // TODO: we should be much smarter in when we actually reload deps / do git ops
 pub(crate) fn load_dependencies(
     project_dir: &Path,
-    manifest: &manifest::MondManifest,
+    manifest: &manifest::BahnManifest,
 ) -> eyre::Result<LoadedDependencies> {
     let mut loaded = LoadedDependencies::default();
     let mut module_owner: HashMap<String, String> = HashMap::new();
@@ -798,11 +798,11 @@ mod tests {
 
     #[test]
     fn load_dependencies_returns_empty_without_dependencies() {
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::new(),
         };
@@ -822,7 +822,7 @@ mod tests {
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "std"
 version = "0.0.1"
@@ -869,11 +869,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "std".to_string(),
@@ -922,7 +922,7 @@ mond_version = "0.1.0"
         let dep_src_dir = dep_repo.join("src");
         std::fs::create_dir_all(&dep_src_dir).expect("create dependency src");
         std::fs::write(
-            dep_repo.join("mond.toml"),
+            dep_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "time"
 version = "0.0.1"
@@ -963,11 +963,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "time".to_string(),
@@ -1003,7 +1003,7 @@ mond_version = "0.1.0"
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "std"
 version = "0.0.1"
@@ -1043,11 +1043,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "std".to_string(),
@@ -1083,7 +1083,7 @@ mond_version = "0.1.0"
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "std"
 version = "0.0.1"
@@ -1123,11 +1123,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let mut manifest = manifest::MondManifest {
+        let mut manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "std".to_string(),
@@ -1198,7 +1198,7 @@ mond_version = "0.1.0"
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "std"
 version = "0.0.1"
@@ -1239,11 +1239,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "std".to_string(),
@@ -1291,7 +1291,7 @@ mond_version = "0.1.0"
             let dep_src_dir = dep_repo.join("src");
             std::fs::create_dir_all(&dep_src_dir).expect("create dependency src");
             std::fs::write(
-                dep_repo.join("mond.toml"),
+                dep_repo.join(crate::MANIFEST_NAME),
                 format!(
                     "[package]\nname = \"{name}\"\nversion = \"0.0.1\"\nmond_version = \"0.1.0\"\n\n[dependencies]\n"
                 ),
@@ -1333,11 +1333,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([
                 (
@@ -1376,7 +1376,7 @@ mond_version = "0.1.0"
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "not_std"
 version = "0.0.1"
@@ -1416,11 +1416,11 @@ mond_version = "0.1.0"
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "std".to_string(),
@@ -1450,7 +1450,7 @@ mond_version = "0.1.0"
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "std"
 version = "0.0.1"
@@ -1493,7 +1493,7 @@ mond_version = "0.1.0"
         let time_src_dir = time_repo.join("src");
         std::fs::create_dir_all(&time_src_dir).expect("create time src");
         std::fs::write(
-            time_repo.join("mond.toml"),
+            time_repo.join(crate::MANIFEST_NAME),
             format!(
                 r#"[package]
 name = "time"
@@ -1535,11 +1535,11 @@ std = {{ git = "file://{}", tag = "0.0.1" }}
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "time".to_string(),
@@ -1604,7 +1604,7 @@ std = {{ git = "file://{}", tag = "0.0.1" }}
         let util_src_dir = util_repo.join("src");
         std::fs::create_dir_all(&util_src_dir).expect("create util src");
         std::fs::write(
-            util_repo.join("mond.toml"),
+            util_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "util"
 version = "0.0.1"
@@ -1669,7 +1669,7 @@ mond_version = "0.1.0"
             let dep_src_dir = dep_repo.join("src");
             std::fs::create_dir_all(&dep_src_dir).expect("create dep src");
             std::fs::write(
-                dep_repo.join("mond.toml"),
+                dep_repo.join(crate::MANIFEST_NAME),
                 format!(
                     r#"[package]
 name = "{name}"
@@ -1716,11 +1716,11 @@ util = {{ git = "file://{}", tag = "{util_tag}" }}
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([
                 (
@@ -1759,7 +1759,7 @@ util = {{ git = "file://{}", tag = "{util_tag}" }}
         let std_src_dir = std_repo.join("src");
         std::fs::create_dir_all(&std_src_dir).expect("create std src");
         std::fs::write(
-            std_repo.join("mond.toml"),
+            std_repo.join(crate::MANIFEST_NAME),
             r#"[package]
 name = "std"
 version = "0.0.1"
@@ -1800,7 +1800,7 @@ mond_version = "0.1.0"
         let time_src_dir = time_repo.join("src");
         std::fs::create_dir_all(&time_src_dir).expect("create time src");
         std::fs::write(
-            time_repo.join("mond.toml"),
+            time_repo.join(crate::MANIFEST_NAME),
             format!(
                 r#"[package]
 name = "time"
@@ -1842,11 +1842,11 @@ std = {{ git = "file://{}", tag = "0.0.1" }}
 
         let project_dir = root.join("app");
         std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::MondManifest {
+        let manifest = manifest::BahnManifest {
             package: manifest::Package {
                 name: "app".to_string(),
                 version: Version::new(0, 1, 0),
-                mond_version: Version::new(0, 1, 0),
+                min_mond_version: None,
             },
             dependencies: std::collections::HashMap::from([(
                 "time".to_string(),

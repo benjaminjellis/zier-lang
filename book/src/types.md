@@ -42,3 +42,18 @@ e.g.
    (:y ~ 'a)])
 ```
 By convention all type names are `PascalCase` identifiers.
+
+### Record update 
+`Mond` allows for easy updating of record with the keyword `with`.
+
+```mond
+(let update_x {point new_x}
+  (with point
+    :x new_x))
+
+(let main {}
+  (let [my_point (Point :x 10 :y 12)]
+    (io/debug my_point)
+    (let [updated_point (update_x my_point 50)]
+      (io/debug updated_point))))
+```

@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-pub(crate) const MANIFEST_NAME: &str = "mond.toml";
-pub(crate) const LOCKFILE_NAME: &str = "mond.lock";
+pub(crate) const MANIFEST_NAME: &str = "bahn.toml";
+pub(crate) const LOCKFILE_NAME: &str = "bahn.lock";
 pub(crate) const TARGET_DIR: &str = "target";
 pub(crate) const DEBUG_BUILD_DIR: &str = "debug";
 pub(crate) const TEST_BUILD_DIR: &str = "tests";
@@ -23,6 +23,7 @@ pub(crate) const SOURCE_DIR: &str = "src";
 pub(crate) const TEST_DIR: &str = "tests";
 pub(crate) const BIN_ENTRY_POINT: &str = "main.mond";
 pub(crate) const LIB_ROOT: &str = "lib.mond";
+/// banh and mond version
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // TODO: cargo calls them crates, what are they for mond?
@@ -32,7 +33,7 @@ pub(crate) enum ProjectType {
 }
 
 #[derive(Parser)]
-#[command(name = "mond")]
+#[command(name = "bahn")]
 #[command(version = VERSION)]
 #[command(about = "the build tool for the mond programming language")]
 struct Cli {
@@ -104,7 +105,7 @@ fn main() -> eyre::Result<()> {
                 }
             } else {
                 ui::info(
-                    "dependency cache is offline by default; run `mond deps --update` to refresh",
+                    "dependency cache is offline by default; run `bahn deps --update` to refresh",
                 );
             }
         }

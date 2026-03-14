@@ -1,5 +1,5 @@
 [package]
-name = "mond"
+name = "bahn"
 edition.workspace = true
 version.workspace = true
 
@@ -9,6 +9,7 @@ eyre = { workspace = true }
 mondc = { path = "../mondc" }
 mond-format = { path = "../mond-format" }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 serde = { workspace = true }
 semver = { workspace = true, features = [ "serde" ] }
 walkdir = { workspace = true }

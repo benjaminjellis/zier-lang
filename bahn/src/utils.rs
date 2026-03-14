@@ -28,7 +28,7 @@ pub(crate) fn verify_rebar3_installed() -> Result<(), eyre::Report> {
     let is_installed = check_dep("rebar3").unwrap_or(false);
     if !is_installed {
         Err(eyre::eyre!(
-            "rebar3 is not installed, to create a mond release please install it"
+            "rebar3 is not installed, to create a bahn release please install it"
         ))
     } else {
         Ok(())

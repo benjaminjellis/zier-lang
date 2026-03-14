@@ -23,20 +23,20 @@ Clone and install
 ```
 git clone git@github.com:benjaminjellis/mond.git 
 cd mond
-cargo install --path mond 
+cargo install --path bahn 
 ```
 
 Or without cloning
 
 ```
-cargo install --git https://github.com/benjaminjellis/mond.git --tag 0.0.1 mond
+cargo install --git https://github.com/benjaminjellis/mond.git --tag 0.0.1 bahn
 ```
 
 
 To verify installation
 ```
 
-mond --help
+bahn --help
 ```
 
 And when you see something like below you should be all set
@@ -44,7 +44,7 @@ And when you see something like below you should be all set
 ```shell
 the build tool for the mond programming language
 
-Usage: mond <COMMAND>
+Usage: bahn <COMMAND>
 
 Commands:
   run
@@ -62,4 +62,3 @@ Options:
   -h, --help     Print help
   -V, --version  Print version
 ```
-

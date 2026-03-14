@@ -4,8 +4,9 @@ use std::{
     process::Command,
 };
 
-use crate::{BIN_ENTRY_POINT, LIB_ROOT, TARGET_DIR, gitignore};
+use crate::{BIN_ENTRY_POINT, LIB_ROOT, TARGET_DIR, gitignore, manifest::BahnManifest};
 use eyre::Context;
+use semver::Version;
 use walkdir::WalkDir;
 
 use crate::{DEBUG_BUILD_DIR, ProjectType, SOURCE_DIR, deps, manifest, ui, utils::find_mond_files};
@@ -177,9 +178,9 @@ fn collect_local_helper_erls(src_dir: &Path) -> eyre::Result<Vec<deps::HelperErl
 
 pub(crate) struct ErlSources {
     pub erl_paths: Vec<PathBuf>,
-    pub manifest: manifest::MondManifest,
+    pub manifest: manifest::BahnManifest,
     pub project_type: ProjectType,
-    // Compilation state exposed for `mond test`
+    // Compilation state exposed for `bahn test`
     pub module_exports: HashMap<String, Vec<String>>,
     pub module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>>,
     pub module_extern_types: HashMap<String, Vec<String>>,
@@ -246,16 +247,29 @@ pub(crate) fn reachable_dependency_modules(
 
 /// Compile all Mond source files and write `.erl` output into `erl_dir`.
 /// Returns the generated file paths, the project manifest, and detected project type.
-pub(crate) fn generate_erl_sources(project_dir: &Path, erl_dir: &Path) -> eyre::Result<ErlSources> {
-    generate_erl_sources_with_roots(project_dir, erl_dir, &[])
+pub(crate) fn generate_erl_sources(
+    manifest: BahnManifest,
+    project_dir: &Path,
+    erl_dir: &Path,
+) -> eyre::Result<ErlSources> {
+    let mond_version = Version::parse(crate::VERSION).context("Failed to parse mond version no")?;
+    if let Some(min_mond_version) = &manifest.package.min_mond_version
+        && &mond_version < min_mond_version
+    {
+        return Err(eyre::eyre!(format!(
+            "Cannot build current package. Package has a min mond version of {min_mond_version} but the current mond version is {mond_version}"
+        )));
+    }
+
+    generate_erl_sources_with_roots(manifest, project_dir, erl_dir, &[])
 }
 
 pub(crate) fn generate_erl_sources_with_roots(
+    manifest: BahnManifest,
     project_dir: &Path,
     erl_dir: &Path,
     extra_roots: &[String],
 ) -> eyre::Result<ErlSources> {
-    let manifest = manifest::read_manifest(project_dir.into())?;
     let loaded_dependencies = deps::load_dependencies(project_dir, &manifest)?;
     let dependency_mods = loaded_dependencies.modules.clone();
 
@@ -518,16 +532,18 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         .context(format!("could not create {DEBUG_BUILD_DIR} dir"))?;
     gitignore::write_gitignore(project_dir.into())?;
 
+    let manifest = manifest::read_manifest(project_dir.into())?;
+
     let ErlSources {
         erl_paths,
         manifest,
         project_type,
         module_aliases,
         ..
-    } = generate_erl_sources(project_dir, &erl_dir)?;
+    } = generate_erl_sources(manifest, project_dir, &erl_dir)?;
 
     if matches!(project_type, ProjectType::Lib) && run {
-        return Err(eyre::eyre!("mond cannot run a library project"));
+        return Err(eyre::eyre!("bahn cannot run a library project"));
     }
 
     crate::utils::verify_erlc_installed()?;
@@ -658,7 +674,11 @@ mod tests {
         )
         .expect("write main");
 
-        let err = match generate_erl_sources(&project_dir, &project_dir.join("target/test-build")) {
+        let err = match generate_erl_sources(
+            manifest,
+            &project_dir,
+            &project_dir.join("target/test-build"),
+        ) {
             Ok(_) => panic!("malformed main should fail compilation first"),
             Err(err) => err,
         };
@@ -860,7 +880,8 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let generated = generate_erl_sources(&project_dir, &out_dir).expect("generate sources");
+        let generated =
+            generate_erl_sources(manifest, &project_dir, &out_dir).expect("generate sources");
         let helper_path = out_dir.join("mond_local_helpers.erl");
         assert!(helper_path.exists(), "local helper should be copied");
         assert!(
@@ -903,7 +924,8 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let generated = generate_erl_sources(&project_dir, &out_dir).expect("generate sources");
+        let generated =
+            generate_erl_sources(manifest, &project_dir, &out_dir).expect("generate sources");
         assert!(
             generated.erl_paths.iter().any(|p| {
                 p.file_name()
@@ -951,7 +973,8 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let generated = generate_erl_sources(&project_dir, &out_dir).expect("generate sources");
+        let generated =
+            generate_erl_sources(manifest, &project_dir, &out_dir).expect("generate sources");
         assert!(generated.module_exports.contains_key("lib"));
         assert!(generated.module_exports.contains_key("time"));
         assert_eq!(
@@ -987,7 +1010,7 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let err = match generate_erl_sources(&project_dir, &out_dir) {
+        let err = match generate_erl_sources(manifest, &project_dir, &out_dir) {
             Ok(_) => panic!("expected alias collision"),
             Err(err) => err,
         };

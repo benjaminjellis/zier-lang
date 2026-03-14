@@ -5,7 +5,7 @@ use eyre::Context;
 use crate::{
     ProjectType, TARGET_DIR,
     build::{ErlSources, generate_erl_sources},
-    ui,
+    manifest, ui,
 };
 
 fn sanitize_erlang_component(name: &str) -> String {
@@ -33,16 +33,18 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     let src_dir = staging.join("src");
     std::fs::create_dir_all(&src_dir).context("could not create release staging dir")?;
 
+    let manifest = manifest::read_manifest(project_dir.into())?;
+
     let ErlSources {
         erl_paths: _,
         manifest,
         project_type,
         module_aliases,
         ..
-    } = generate_erl_sources(project_dir, &src_dir)?;
+    } = generate_erl_sources(manifest, project_dir, &src_dir)?;
 
     if matches!(project_type, ProjectType::Lib) {
-        return Err(eyre::eyre!("mond cannot release a library project"));
+        return Err(eyre::eyre!("bahn cannot release a library project"));
     }
 
     // Sanitise project name to a valid Erlang atom component.

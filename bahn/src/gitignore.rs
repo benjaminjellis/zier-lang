@@ -6,7 +6,7 @@ const GITIGNORE_CONTENTS: &str = "# Compiled output
 /target
 
 # Dependency lock file for libraries (optional)
-# mond.lock";
+# bahn.lock";
 
 pub(crate) fn write_gitignore(root: PathBuf) -> eyre::Result<()> {
     let path = root.join(".gitignore");

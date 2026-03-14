@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["mondc", "mond-lsp", "mond", "mond-format"]
+members = ["mondc", "mond-lsp", "bahn", "mond-format"]
 
 [workspace.package]
 edition = "2024"
-version = "0.0.4"
+version = "0.0.5"
 
 [workspace.dependencies]
 codespan-reporting = "0.13"
@@ -13,6 +13,7 @@ eyre = "0.6.12"
 include_dir = "0.7"
 logos = "0.16"
 toml = "1.0"
+toml_edit = "0.22.27"
 serde = { version = "1", features = ["derive"] }
 tower-lsp = "0.20.0"
 semver = "1.0.27"

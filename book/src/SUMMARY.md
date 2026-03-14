@@ -3,7 +3,7 @@
 [The Mond Programming Language](./the_mond_programming_language.md)
 - [Getting Started](./getting_started.md)
   - [Installation](./installation.md)
-  - [The CLI](./cli.md)
+  - [Bahn](./bahn.md)
 - [Language Tour](./language_tour.md)
   - [Primitive Types](./primitive_types.md)
   - [Functions](./functions.md)
