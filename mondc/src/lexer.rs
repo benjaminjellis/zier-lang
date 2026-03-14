@@ -88,6 +88,8 @@ pub enum TokenKind {
     Test,
     #[token("do")]
     Do,
+    #[token("with")]
+    With,
     #[regex(":[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice()[1..].to_string())]
     NamedField(String),
 
@@ -160,6 +162,7 @@ impl TokenKind {
             TokenKind::Use => "keyword 'use'",
             TokenKind::Test => "keyword 'test'",
             TokenKind::Do => "keyword 'do'",
+            TokenKind::With => "keyword 'with'",
             TokenKind::NamedField(_) => "field name (e.g. :name)",
             TokenKind::Float(_) => "float literal",
             TokenKind::Int(_) => "integer literal",
@@ -480,11 +483,11 @@ mod tests {
     }
 
     #[test]
-    fn keywords_or_and_rec() {
-        let source = "or and";
+    fn keywords_or_and_with() {
+        let source = "or and with";
         let lexer = TokenKind::lexer(source);
         let tokens: Vec<_> = lexer.into_iter().map(|t| t.unwrap()).collect();
-        assert_eq!(tokens, vec![Or, And]);
+        assert_eq!(tokens, vec![Or, And, With]);
     }
 
     #[test]

@@ -213,6 +213,31 @@ fn call_breaks_when_long() {
 }
 
 #[test]
+fn record_constructor_keeps_named_field_pairs_together_when_wrapped() {
+    let src = "(pub let selecting {initialised selector} (Initalised :state (:state initialised) :selector selector :return (:return initialised)))";
+    let out = format(src, 40);
+    assert!(
+        out.contains(":state (:state initialised)\n")
+            && out.contains("    :selector selector\n")
+            && out.contains("    :return (:return initialised)"),
+        "expected each named field/value pair on the same line:\n{out}"
+    );
+}
+
+#[test]
+fn with_record_update_breaks_one_field_per_line() {
+    let src = "(pub let selecting {initialised selector} (with initialised :state (:state initialised) :selector selector :return (:return initialised)))";
+    let out = format(src, 100);
+    assert!(
+        out.contains("(with initialised\n")
+            && out.contains("    :state (:state initialised)\n")
+            && out.contains("    :selector selector\n")
+            && out.contains("    :return (:return initialised))"),
+        "expected one updated field per line with consistent indentation:\n{out}"
+    );
+}
+
+#[test]
 fn pipe_breaks_one_step_per_line() {
     let src = "(let [x (|> 10 (add_two 1) (add_two 12) (add_two 20) (add_two 2) (add_two 90))] (io/debug x))";
     let out = fmt(src);

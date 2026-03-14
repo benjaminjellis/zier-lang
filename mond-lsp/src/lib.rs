@@ -1333,6 +1333,7 @@ impl Project {
             imports.imports.clone(),
             &visible_exports,
             &imports.imported_type_decls,
+            &imports.imported_extern_types,
             &imports.imported_schemes,
         );
         let expr_types = mondc::infer_module_expr_types(
@@ -1341,6 +1342,7 @@ impl Project {
             imports.imports.clone(),
             &visible_exports,
             &imports.imported_type_decls,
+            &imports.imported_extern_types,
             &imports.imported_schemes,
         );
         Ok(DocumentAnalysis {
@@ -2069,6 +2071,15 @@ fn local_names_in_expr(
             .iter()
             .find_map(|(_, value)| local_names_in_expr(value, offset, locals))
             .or_else(|| Some(locals.clone())),
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => local_names_in_expr(record, offset, locals)
+            .or_else(|| {
+                updates
+                    .iter()
+                    .find_map(|(_, value)| local_names_in_expr(value, offset, locals))
+            })
+            .or_else(|| Some(locals.clone())),
         Expr::Lambda { args, body, .. } => {
             let mut inner = locals.clone();
             inner.extend(args.iter().cloned());
@@ -2308,6 +2319,21 @@ fn signature_target_in_expr(
         Expr::RecordConstruct { fields, .. } => fields.iter().find_map(|(_, value)| {
             signature_target_in_expr(value, current_module, top_level, imports, offset, locals)
         }),
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => signature_target_in_expr(record, current_module, top_level, imports, offset, locals)
+            .or_else(|| {
+                updates.iter().find_map(|(_, value)| {
+                    signature_target_in_expr(
+                        value,
+                        current_module,
+                        top_level,
+                        imports,
+                        offset,
+                        locals,
+                    )
+                })
+            }),
         Expr::Lambda { args, body, .. } => {
             let mut inner = locals.clone();
             inner.extend(args.iter().cloned());
@@ -2778,6 +2804,14 @@ fn collect_expr_occurrences(
                 collect_expr_occurrences(value, current_module, top_level, imports, locals, out);
             }
         }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_expr_occurrences(record, current_module, top_level, imports, locals, out);
+            for (_, value) in updates {
+                collect_expr_occurrences(value, current_module, top_level, imports, locals, out);
+            }
+        }
         Expr::Lambda { args, body, .. } => {
             let mut inner = locals.clone();
             inner.extend(args.iter().cloned());
@@ -2907,6 +2941,13 @@ fn hover_target_in_expr(
         Expr::RecordConstruct { fields, .. } => fields
             .iter()
             .find_map(|(_, value)| hover_target_in_expr(value, offset, locals)),
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => hover_target_in_expr(record, offset, locals).or_else(|| {
+            updates
+                .iter()
+                .find_map(|(_, value)| hover_target_in_expr(value, offset, locals))
+        }),
         Expr::Lambda { args, body, .. } => {
             let mut inner = locals.clone();
             inner.extend(args.iter().cloned());
@@ -3068,6 +3109,14 @@ fn collect_local_occurrences_in_expr(
         }
         Expr::RecordConstruct { fields, .. } => {
             for (_, value) in fields {
+                collect_local_occurrences_in_expr(value, locals, out);
+            }
+        }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_local_occurrences_in_expr(record, locals, out);
+            for (_, value) in updates {
                 collect_local_occurrences_in_expr(value, locals, out);
             }
         }

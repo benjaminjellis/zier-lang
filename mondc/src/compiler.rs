@@ -35,7 +35,41 @@ fn collect_type_usage_names(usage: &ast::TypeUsage, out: &mut HashSet<String>) {
                 collect_type_usage_names(arg, out);
             }
         }
+        ast::TypeUsage::Fun(arg, ret, _) => {
+            collect_type_usage_names(arg, out);
+            collect_type_usage_names(ret, out);
+        }
     }
+}
+
+fn type_decl_name(type_decl: &ast::TypeDecl) -> &str {
+    match type_decl {
+        ast::TypeDecl::Record { name, .. } => name,
+        ast::TypeDecl::Variant { name, .. } => name,
+    }
+}
+
+fn is_qualified_type_name(name: &str) -> bool {
+    name.contains('/')
+}
+
+fn build_qualified_type_aliases(
+    imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for type_decl in imported_type_decls {
+        let name = type_decl_name(type_decl);
+        if let Some((_, local_name)) = name.split_once('/') {
+            aliases.insert(name.to_string(), local_name.to_string());
+        }
+    }
+    for name in imported_extern_types {
+        if let Some((_, local_name)) = name.split_once('/') {
+            aliases.insert(name.clone(), local_name.to_string());
+        }
+    }
+    aliases
 }
 
 fn known_type_arities(
@@ -102,6 +136,10 @@ fn collect_type_usage_arity_errors(
             for arg in args {
                 collect_type_usage_arity_errors(arg, known_arities, generic_params, out);
             }
+        }
+        ast::TypeUsage::Fun(arg, ret, _) => {
+            collect_type_usage_arity_errors(arg, known_arities, generic_params, out);
+            collect_type_usage_arity_errors(ret, known_arities, generic_params, out);
         }
     }
 }
@@ -400,11 +438,24 @@ pub fn compile_with_imports_in_session(
         };
     }
 
+    let qualified_type_aliases =
+        build_qualified_type_aliases(imported_type_decls, imported_extern_types);
+    let imported_type_decls_unqualified: Vec<ast::TypeDecl> = imported_type_decls
+        .iter()
+        .filter(|type_decl| !is_qualified_type_name(type_decl_name(type_decl)))
+        .cloned()
+        .collect();
+
     let mut checker = typecheck::TypeChecker::new();
+    checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
+    checker.seed_imported_type_info(&imported_type_decls_unqualified);
     let mut env = typecheck::primitive_env();
 
-    for type_decl in imported_type_decls {
-        env.extend(typecheck::constructor_schemes(type_decl));
+    for type_decl in &imported_type_decls_unqualified {
+        env.extend(typecheck::constructor_schemes_with_aliases(
+            type_decl,
+            &qualified_type_aliases,
+        ));
     }
     env.extend(imported_schemes.clone());
 

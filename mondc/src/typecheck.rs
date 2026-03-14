@@ -111,6 +111,19 @@ pub enum TypeError {
         /// The file and span of the type definition, if known
         def: Option<(usize, std::ops::Range<usize>)>,
     },
+    DuplicateRecordField {
+        record: String,
+        field: String,
+        span: std::ops::Range<usize>,
+    },
+    DuplicateRecordUpdateField {
+        field: String,
+        span: std::ops::Range<usize>,
+    },
+    MissingRecordFields {
+        record: String,
+        missing: Vec<String>,
+    },
     NonExhaustiveMatch {
         missing: Vec<String>,
     },
@@ -323,6 +336,39 @@ impl TypeError {
                 }
                 diags
             }
+            TypeError::DuplicateRecordField {
+                record,
+                field,
+                span,
+            } => vec![
+                Diagnostic::error()
+                    .with_message(format!(
+                        "duplicate field `:{field}` in record construction of `{record}`"
+                    ))
+                    .with_labels(vec![
+                        Label::primary(file_id, span.clone())
+                            .with_message("each field may only be provided once"),
+                    ]),
+            ],
+            TypeError::DuplicateRecordUpdateField { field, span } => vec![
+                Diagnostic::error()
+                    .with_message(format!("duplicate field `:{field}` in record update"))
+                    .with_labels(vec![
+                        Label::primary(file_id, span.clone())
+                            .with_message("each field may only be updated once"),
+                    ]),
+            ],
+            TypeError::MissingRecordFields { record, missing } => vec![
+                Diagnostic::error()
+                    .with_message(format!(
+                        "record construction of `{record}` is missing fields"
+                    ))
+                    .with_labels(vec![
+                        Label::primary(file_id, span)
+                            .with_message("provide values for all declared record fields"),
+                    ])
+                    .with_notes(vec![format!("missing: {}", missing.join(", "))]),
+            ],
             TypeError::NonExhaustiveMatch { missing } => vec![
                 Diagnostic::error()
                     .with_message("non-exhaustive match")
@@ -521,6 +567,7 @@ fn is_non_expansive(expr: &Expr) -> bool {
         | Expr::If { .. }
         | Expr::Match { .. }
         | Expr::FieldAccess { .. }
+        | Expr::RecordUpdate { .. }
         | Expr::LetFunc { .. }
         | Expr::LetLocal { .. } => false,
     }
@@ -575,6 +622,19 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
     }
 }
 
+fn mismatch_with_span(error: TypeError, span: std::ops::Range<usize>) -> TypeError {
+    match error {
+        TypeError::Mismatch { mismatch } => {
+            let mut mismatch = *mismatch;
+            mismatch.span = Some(span);
+            TypeError::Mismatch {
+                mismatch: Box::new(mismatch),
+            }
+        }
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TypeChecker Implementation
 // ---------------------------------------------------------------------------
@@ -588,10 +648,14 @@ pub struct TypeChecker {
     variant_constructors: HashMap<String, Vec<String>>,
     /// Maps record type name -> field names in declaration order.
     record_fields: HashMap<String, Vec<String>>,
+    /// Maps record type name -> number of type parameters.
+    record_param_arity: HashMap<String, usize>,
     /// Maps value/function name → (file_id, definition span) for error reporting.
     value_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
     /// Best-effort inferred types for expression spans, used by editor tooling.
     expr_types: Vec<(std::ops::Range<usize>, Rc<Type>)>,
+    /// Maps qualified type names (`module/Type`) to canonical local names (`Type`).
+    qualified_type_aliases: HashMap<String, String>,
 }
 
 impl TypeChecker {
@@ -601,8 +665,41 @@ impl TypeChecker {
             type_def_spans: HashMap::new(),
             variant_constructors: HashMap::new(),
             record_fields: HashMap::new(),
+            record_param_arity: HashMap::new(),
             value_def_spans: HashMap::new(),
             expr_types: Vec::new(),
+            qualified_type_aliases: HashMap::new(),
+        }
+    }
+
+    pub fn seed_qualified_type_aliases(&mut self, aliases: HashMap<String, String>) {
+        self.qualified_type_aliases = aliases;
+    }
+
+    pub fn seed_imported_type_info(&mut self, imported_type_decls: &[TypeDecl]) {
+        for type_decl in imported_type_decls {
+            match type_decl {
+                TypeDecl::Variant {
+                    name, constructors, ..
+                } => {
+                    self.variant_constructors.insert(
+                        name.clone(),
+                        constructors.iter().map(|(name, _)| name.clone()).collect(),
+                    );
+                }
+                TypeDecl::Record {
+                    name,
+                    fields,
+                    params,
+                    ..
+                } => {
+                    self.record_fields.insert(
+                        name.clone(),
+                        fields.iter().map(|(field, _)| field.clone()).collect(),
+                    );
+                    self.record_param_arity.insert(name.clone(), params.len());
+                }
+            }
         }
     }
 
@@ -833,7 +930,8 @@ impl TypeChecker {
                     // Apply both accumulated subst and item subst so the
                     // constrained elem_ty is visible when unifying the next item.
                     let known_elem = apply_subst(&compose_subst(&s, &subst), &elem_ty);
-                    let s_unify = unify(&known_elem, &t)?;
+                    let s_unify =
+                        unify(&known_elem, &t).map_err(|e| mismatch_with_span(e, item.span()))?;
                     subst = compose_subst(&compose_subst(&s_unify, &s), &subst);
                 }
                 let ty = Type::array(apply_subst(&subst, &elem_ty));
@@ -1002,7 +1100,8 @@ impl TypeChecker {
                 );
 
                 let (s1, t_val) = self.infer(&inner_env, value)?;
-                let s2 = unify(&apply_subst(&s1, &ret_ty), &t_val)?;
+                let s2 = unify(&apply_subst(&s1, &ret_ty), &t_val)
+                    .map_err(|e| mismatch_with_span(e, value.span()))?;
                 let s12 = compose_subst(&s2, &s1);
 
                 for (span, ty) in arg_spans.iter().zip(arg_tys.iter()) {
@@ -1119,7 +1218,8 @@ impl TypeChecker {
                 let s2 = unify(
                     &apply_subst(&s1, &accessor_ty),
                     &Type::fun(t_record, ret_ty.clone()),
-                )?;
+                )
+                .map_err(|e| mismatch_with_span(e, record.span()))?;
                 let s12 = compose_subst(&s2, &s1);
 
                 let ty = apply_subst(&s12, &ret_ty);
@@ -1167,11 +1267,82 @@ impl TypeChecker {
                 Ok((s, ty))
             }
 
-            Expr::RecordConstruct { fields, span, .. } => {
-                // For each :field val pair, look up the field accessor in the env.
-                // Accessor type is `RecordType -> FieldType`.
-                // Unify all accessor record-sides against a single result_ty so the
-                // record type is determined by the fields provided.
+            Expr::RecordConstruct { name, fields, span } => {
+                // When we know the record declaration, enforce named-field construction rules:
+                // - all declared fields must be present
+                // - no unknown fields
+                // - no duplicate fields
+                // - field order at call sites is irrelevant
+                if let Some(layout) = self.record_fields.get(name).cloned() {
+                    let ctor_scheme = env
+                        .get(name)
+                        .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
+                    let mut ctor_ty = self.instantiate(ctor_scheme);
+                    let mut ctor_arg_tys = Vec::new();
+                    while let Type::Fun(arg, ret) = ctor_ty.as_ref() {
+                        ctor_arg_tys.push(arg.clone());
+                        ctor_ty = ret.clone();
+                    }
+                    let record_ty = ctor_ty;
+
+                    let mut by_name: HashMap<String, &Expr> = HashMap::new();
+                    for (field_name, value_expr) in fields {
+                        if by_name.insert(field_name.clone(), value_expr).is_some() {
+                            return Err(TypeError::DuplicateRecordField {
+                                record: name.clone(),
+                                field: field_name.clone(),
+                                span: value_expr.span(),
+                            });
+                        }
+                        if !layout.iter().any(|declared| declared == field_name) {
+                            return Err(TypeError::UnknownField {
+                                field: field_name.clone(),
+                                record_ty: record_ty.clone(),
+                                field_span: value_expr.span(),
+                                def: self.type_def_spans.get(name).cloned(),
+                            });
+                        }
+                    }
+
+                    let mut missing = Vec::new();
+                    for declared in &layout {
+                        if !by_name.contains_key(declared) {
+                            missing.push(declared.clone());
+                        }
+                    }
+                    if !missing.is_empty() {
+                        return Err(TypeError::MissingRecordFields {
+                            record: name.clone(),
+                            missing,
+                        });
+                    }
+
+                    let mut subst = HashMap::new();
+                    for (idx, field_name) in layout.iter().enumerate() {
+                        let value_expr = *by_name.get(field_name).expect("field validated above");
+                        let value_span = value_expr.span();
+                        let expected_ty = ctor_arg_tys
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| self.fresh());
+                        let (s_val, t_val) =
+                            self.infer(&apply_subst_env(&subst, env), value_expr)?;
+                        subst = compose_subst(&s_val, &subst);
+                        let s_field = unify(
+                            &apply_subst(&subst, &expected_ty),
+                            &apply_subst(&subst, &t_val),
+                        )
+                        .map_err(|e| mismatch_with_span(e, value_span))?;
+                        subst = compose_subst(&s_field, &subst);
+                    }
+
+                    let ty = apply_subst(&subst, &record_ty);
+                    self.record_expr_type(expr.span(), ty.clone());
+                    return Ok((subst.clone(), ty));
+                }
+
+                // Fallback path (e.g. imported records where local layout metadata is unavailable):
+                // infer from accessors only.
                 let result_ty = self.fresh();
                 let mut subst = HashMap::new();
 
@@ -1181,8 +1352,8 @@ impl TypeChecker {
                         TypeError::UnboundVariable(accessor_name.clone(), span.clone())
                     })?;
                     let accessor_ty = self.instantiate(scheme);
+                    let value_span = value_expr.span();
 
-                    // accessor_ty = RecordType -> FieldType; unify record-side with result_ty
                     let field_ty = self.fresh();
                     let s_acc = unify(
                         &apply_subst(&subst, &accessor_ty),
@@ -1196,11 +1367,181 @@ impl TypeChecker {
                     let s_field = unify(
                         &apply_subst(&subst, &field_ty),
                         &apply_subst(&subst, &t_val),
-                    )?;
+                    )
+                    .map_err(|e| mismatch_with_span(e, value_span))?;
                     subst = compose_subst(&s_field, &subst);
                 }
 
                 let ty = apply_subst(&subst, &result_ty);
+                self.record_expr_type(expr.span(), ty.clone());
+                Ok((subst.clone(), ty))
+            }
+
+            Expr::RecordUpdate {
+                record,
+                updates,
+                span: _,
+            } => {
+                let (s_record, t_record) = self.infer(env, record)?;
+                let mut subst = s_record;
+                let resolved_record = apply_subst(&subst, &t_record);
+
+                let mut seen_fields: HashSet<String> = HashSet::new();
+                let mut updates_by_name: HashMap<String, &Expr> = HashMap::new();
+                for (field_name, value_expr) in updates {
+                    let value_span = value_expr.span();
+                    if !seen_fields.insert(field_name.clone()) {
+                        return Err(TypeError::DuplicateRecordUpdateField {
+                            field: field_name.clone(),
+                            span: value_span,
+                        });
+                    }
+                    updates_by_name.insert(field_name.clone(), value_expr);
+                }
+
+                // Preferred path: infer/resolve a concrete record layout so updates can
+                // change type parameters for updated fields while preserving unchanged ones.
+                let inferred_layout = if let Type::Con(record_name, args) = resolved_record.as_ref()
+                {
+                    self.record_fields.get(record_name).cloned().map(|layout| {
+                        (
+                            record_name.clone(),
+                            args.len(),
+                            apply_subst(&subst, &t_record),
+                            layout,
+                        )
+                    })
+                } else {
+                    let updated: HashSet<&str> =
+                        updates_by_name.keys().map(String::as_str).collect();
+                    let mut candidates: Vec<(String, Vec<String>, usize)> = self
+                        .record_fields
+                        .iter()
+                        .filter_map(|(name, layout)| {
+                            let layout_set: HashSet<&str> =
+                                layout.iter().map(String::as_str).collect();
+                            if updated.iter().all(|field| layout_set.contains(field)) {
+                                Some((
+                                    name.clone(),
+                                    layout.clone(),
+                                    *self.record_param_arity.get(name).unwrap_or(&0),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if candidates.len() == 1 {
+                        let (record_name, layout, arity) = candidates.pop().expect("checked len");
+                        let input_args: Vec<Rc<Type>> = (0..arity).map(|_| self.fresh()).collect();
+                        let inferred_input = Type::con(record_name.clone(), input_args);
+                        let s_infer = unify(&apply_subst(&subst, &t_record), &inferred_input)?;
+                        subst = compose_subst(&s_infer, &subst);
+                        Some((
+                            record_name,
+                            arity,
+                            apply_subst(&subst, &inferred_input),
+                            layout,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((record_name, param_arity, input_record_ty, layout)) = inferred_layout {
+                    let layout_set: HashSet<&str> = layout.iter().map(String::as_str).collect();
+                    for (field_name, value_expr) in &updates_by_name {
+                        if !layout_set.contains(field_name.as_str()) {
+                            return Err(TypeError::UnknownField {
+                                field: field_name.clone(),
+                                record_ty: input_record_ty.clone(),
+                                field_span: value_expr.span(),
+                                def: self.type_def_spans.get(&record_name).cloned(),
+                            });
+                        }
+                    }
+
+                    let output_args: Vec<Rc<Type>> =
+                        (0..param_arity).map(|_| self.fresh()).collect();
+                    let output_record_ty = Type::con(record_name.clone(), output_args);
+                    let record_span = record.span();
+
+                    for field_name in &layout {
+                        let accessor_name = format!(":{field_name}");
+                        let accessor_scheme = env.get(&accessor_name).ok_or_else(|| {
+                            TypeError::UnboundVariable(accessor_name.clone(), record_span.clone())
+                        })?;
+                        let accessor_in_ty = self.instantiate(accessor_scheme);
+                        let accessor_out_ty = self.instantiate(accessor_scheme);
+
+                        let in_field_ty = self.fresh();
+                        let out_field_ty = self.fresh();
+                        let s_in_acc = unify(
+                            &apply_subst(&subst, &accessor_in_ty),
+                            &Type::fun(apply_subst(&subst, &input_record_ty), in_field_ty.clone()),
+                        )?;
+                        subst = compose_subst(&s_in_acc, &subst);
+                        let s_out_acc = unify(
+                            &apply_subst(&subst, &accessor_out_ty),
+                            &Type::fun(
+                                apply_subst(&subst, &output_record_ty),
+                                out_field_ty.clone(),
+                            ),
+                        )?;
+                        subst = compose_subst(&s_out_acc, &subst);
+
+                        if let Some(value_expr) = updates_by_name.get(field_name) {
+                            let value_span = value_expr.span();
+                            let (s_val, t_val) =
+                                self.infer(&apply_subst_env(&subst, env), value_expr)?;
+                            subst = compose_subst(&s_val, &subst);
+                            let s_field = unify(
+                                &apply_subst(&subst, &out_field_ty),
+                                &apply_subst(&subst, &t_val),
+                            )
+                            .map_err(|e| mismatch_with_span(e, value_span))?;
+                            subst = compose_subst(&s_field, &subst);
+                        } else {
+                            let s_same = unify(
+                                &apply_subst(&subst, &in_field_ty),
+                                &apply_subst(&subst, &out_field_ty),
+                            )
+                            .map_err(|e| mismatch_with_span(e, record_span.clone()))?;
+                            subst = compose_subst(&s_same, &subst);
+                        }
+                    }
+
+                    let ty = apply_subst(&subst, &output_record_ty);
+                    self.record_expr_type(expr.span(), ty.clone());
+                    return Ok((subst.clone(), ty));
+                }
+
+                // Fallback for unresolved record layouts: preserve the input record type.
+                for (field_name, value_expr) in updates {
+                    let value_span = value_expr.span();
+                    let accessor_name = format!(":{field_name}");
+                    let scheme = env.get(&accessor_name).ok_or_else(|| {
+                        TypeError::UnboundVariable(accessor_name.clone(), value_span.clone())
+                    })?;
+                    let accessor_ty = self.instantiate(scheme);
+                    let field_ty = self.fresh();
+                    let s_acc = unify(
+                        &apply_subst(&subst, &accessor_ty),
+                        &Type::fun(apply_subst(&subst, &t_record), field_ty.clone()),
+                    )?;
+                    subst = compose_subst(&s_acc, &subst);
+
+                    let (s_val, t_val) = self.infer(&apply_subst_env(&subst, env), value_expr)?;
+                    subst = compose_subst(&s_val, &subst);
+                    let s_field = unify(
+                        &apply_subst(&subst, &field_ty),
+                        &apply_subst(&subst, &t_val),
+                    )
+                    .map_err(|e| mismatch_with_span(e, value_span))?;
+                    subst = compose_subst(&s_field, &subst);
+                }
+
+                let ty = apply_subst(&subst, &t_record);
                 self.record_expr_type(expr.span(), ty.clone());
                 Ok((subst.clone(), ty))
             }
@@ -1509,13 +1850,23 @@ impl TypeChecker {
                             name.clone(),
                             constructors.iter().map(|(name, _)| name.clone()).collect(),
                         );
-                    } else if let crate::ast::TypeDecl::Record { name, fields, .. } = type_decl {
+                    } else if let crate::ast::TypeDecl::Record {
+                        name,
+                        fields,
+                        params,
+                        ..
+                    } = type_decl
+                    {
                         self.record_fields.insert(
                             name.clone(),
                             fields.iter().map(|(field, _)| field.clone()).collect(),
                         );
+                        self.record_param_arity.insert(name.clone(), params.len());
                     }
-                    env.extend(constructor_schemes(type_decl));
+                    env.extend(constructor_schemes_with_aliases(
+                        type_decl,
+                        &self.qualified_type_aliases,
+                    ));
                 }
                 Declaration::Expression(expr) => {
                     match self.infer(env, expr) {
@@ -1549,7 +1900,7 @@ impl TypeChecker {
                     ty,
                     ..
                 } => {
-                    let mut scheme = type_sig_to_scheme(ty);
+                    let mut scheme = type_sig_to_scheme(ty, &self.qualified_type_aliases);
                     if *is_nullary {
                         // Nullary externs are declared as Unit -> ReturnType in source and
                         // lowered to a 0-arity function internally, so wrap back here.
@@ -1705,28 +2056,44 @@ fn collect_sig_generics(sig: &crate::ast::TypeSig, out: &mut Vec<String>) {
     }
 }
 
+fn resolve_type_name(name: &str, aliases: &HashMap<String, String>) -> String {
+    aliases
+        .get(name)
+        .cloned()
+        .unwrap_or_else(|| name.to_string())
+}
+
 /// Build a `Type` from a `TypeSig`, replacing `Generic` names with `Var` IDs
 /// from the provided map.
-fn type_sig_with_vars(sig: &crate::ast::TypeSig, vars: &HashMap<String, u64>) -> Rc<Type> {
+fn type_sig_with_vars(
+    sig: &crate::ast::TypeSig,
+    vars: &HashMap<String, u64>,
+    aliases: &HashMap<String, String>,
+) -> Rc<Type> {
     use crate::ast::TypeSig;
     match sig {
-        TypeSig::Named(name) => Type::con(name, vec![]),
+        TypeSig::Named(name) => Type::con(resolve_type_name(name, aliases), vec![]),
         TypeSig::Generic(name) => vars
             .get(name)
             .copied()
             .map(|id| Rc::new(Type::Var(id)))
             .unwrap_or_else(|| Type::con(name, vec![])),
         TypeSig::App(head, args) => Type::con(
-            head,
-            args.iter().map(|a| type_sig_with_vars(a, vars)).collect(),
+            resolve_type_name(head, aliases),
+            args.iter()
+                .map(|a| type_sig_with_vars(a, vars, aliases))
+                .collect(),
         ),
-        TypeSig::Fun(a, b) => Type::fun(type_sig_with_vars(a, vars), type_sig_with_vars(b, vars)),
+        TypeSig::Fun(a, b) => Type::fun(
+            type_sig_with_vars(a, vars, aliases),
+            type_sig_with_vars(b, vars, aliases),
+        ),
     }
 }
 
 /// Convert a `TypeSig` to a properly quantified `Scheme`.
 /// Generic type variables (`'k`, `'v`, `'a` etc.) become universally quantified.
-fn type_sig_to_scheme(sig: &crate::ast::TypeSig) -> Scheme {
+fn type_sig_to_scheme(sig: &crate::ast::TypeSig, aliases: &HashMap<String, String>) -> Scheme {
     // Use high var IDs to avoid colliding with the TypeChecker's inference counter.
     const EXTERN_VAR_BASE: u64 = u64::MAX - 2048;
     let mut generics: Vec<String> = Vec::new();
@@ -1736,22 +2103,33 @@ fn type_sig_to_scheme(sig: &crate::ast::TypeSig) -> Scheme {
         .enumerate()
         .map(|(i, name)| (name.clone(), EXTERN_VAR_BASE - i as u64))
         .collect();
-    let ty = type_sig_with_vars(sig, &var_map);
+    let ty = type_sig_with_vars(sig, &var_map, aliases);
     let vars = generics.iter().map(|n| var_map[n]).collect();
     Scheme { vars, ty }
 }
 
-fn type_usage_to_type(usage: &TypeUsage, params: &HashMap<String, Rc<Type>>) -> Rc<Type> {
+fn type_usage_to_type(
+    usage: &TypeUsage,
+    params: &HashMap<String, Rc<Type>>,
+    aliases: &HashMap<String, String>,
+) -> Rc<Type> {
     match usage {
-        TypeUsage::Named(name, _) => Type::con(name, vec![]),
+        TypeUsage::Named(name, _) => Type::con(resolve_type_name(name, aliases), vec![]),
         TypeUsage::Generic(name, _) => params
             .get(name)
             .cloned()
             .unwrap_or_else(|| Type::con(name, vec![])),
         TypeUsage::App(head, args, _) => {
-            let arg_tys = args.iter().map(|a| type_usage_to_type(a, params)).collect();
-            Type::con(head, arg_tys)
+            let arg_tys = args
+                .iter()
+                .map(|a| type_usage_to_type(a, params, aliases))
+                .collect();
+            Type::con(resolve_type_name(head, aliases), arg_tys)
         }
+        TypeUsage::Fun(arg, ret, _) => Type::fun(
+            type_usage_to_type(arg, params, aliases),
+            type_usage_to_type(ret, params, aliases),
+        ),
     }
 }
 
@@ -1762,6 +2140,13 @@ fn type_usage_to_type(usage: &TypeUsage, params: &HashMap<String, Rc<Type>>) -> 
 /// Given a type declaration, generate all the scheme entries for the TypeEnv.
 /// This includes constructor functions and field accessor functions for records.
 pub fn constructor_schemes(decl: &TypeDecl) -> TypeEnv {
+    constructor_schemes_with_aliases(decl, &HashMap::new())
+}
+
+pub fn constructor_schemes_with_aliases(
+    decl: &TypeDecl,
+    aliases: &HashMap<String, String>,
+) -> TypeEnv {
     let mut env = TypeEnv::new();
 
     // Use high var IDs for scheme-bound params to avoid colliding with
@@ -1797,7 +2182,7 @@ pub fn constructor_schemes(decl: &TypeDecl) -> TypeEnv {
                     None => result_ty.clone(),
                     // Constructor with payload: Some ~ 'a  ->  'a -> Option<'a>
                     Some(usage) => {
-                        let payload_ty = type_usage_to_type(usage, &param_map);
+                        let payload_ty = type_usage_to_type(usage, &param_map, aliases);
                         Type::fun(payload_ty, result_ty.clone())
                     }
                 };
@@ -1838,7 +2223,7 @@ pub fn constructor_schemes(decl: &TypeDecl) -> TypeEnv {
                 .iter()
                 .rev()
                 .fold(result_ty.clone(), |acc, (_, field_ty)| {
-                    let ft = type_usage_to_type(field_ty, &param_map);
+                    let ft = type_usage_to_type(field_ty, &param_map, aliases);
                     Type::fun(ft, acc)
                 });
             env.insert(
@@ -1851,7 +2236,7 @@ pub fn constructor_schemes(decl: &TypeDecl) -> TypeEnv {
 
             // Field accessors: ":field_name" -> result_ty -> field_type
             for (field_name, field_ty) in fields {
-                let ft = type_usage_to_type(field_ty, &param_map);
+                let ft = type_usage_to_type(field_ty, &param_map, aliases);
                 let accessor_ty = Type::fun(result_ty.clone(), ft);
                 env.insert(
                     format!(":{field_name}"),
@@ -2210,6 +2595,120 @@ mod tests {
     }
 
     #[test]
+    fn infer_record_construction_accepts_out_of_order_named_fields() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (Point :y 0 :x 0))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::con("Point", vec![]));
+    }
+
+    #[test]
+    fn infer_record_construction_rejects_missing_fields() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (Point :x 0))
+        "#;
+        let result = check(src);
+        assert!(
+            matches!(
+                result,
+                Err(TypeError::MissingRecordFields { ref record, ref missing })
+                    if record == "Point" && missing == &vec!["y".to_string()]
+            ),
+            "expected MissingRecordFields for Point.y, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn infer_record_construction_rejects_duplicate_fields() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (Point :x 0 :x 1 :y 2))
+        "#;
+        let result = check(src);
+        assert!(
+            matches!(
+                result,
+                Err(TypeError::DuplicateRecordField {
+                    ref record,
+                    ref field,
+                    ..
+                }) if record == "Point" && field == "x"
+            ),
+            "expected DuplicateRecordField for Point.x, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn infer_record_construction_rejects_unknown_field() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (Point :x 0 :z 1))
+        "#;
+        let result = check(src);
+        assert!(
+            matches!(result, Err(TypeError::UnknownField { ref field, .. }) if field == "z"),
+            "expected UnknownField for z, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn infer_record_update() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (with (Point :x 0 :y 1) :x 10))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::con("Point", vec![]));
+    }
+
+    #[test]
+    fn infer_record_update_can_change_generic_field_type() {
+        let src = r#"
+            (type ['s 'r] Initialised [(:state ~ 's) (:return ~ 'r)])
+            (let initialised {state} (Initialised :state state :return ()))
+            (let returning {result initialised} (with initialised :return result))
+            (let main {} (returning 1 (initialised True)))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(
+            ty,
+            Type::con("Initialised", vec![Type::bool(), Type::int()])
+        );
+    }
+
+    #[test]
+    fn infer_record_update_rejects_unknown_field() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (with (Point :x 0 :y 1) :z 10))
+        "#;
+        let result = check(src);
+        assert!(
+            matches!(result, Err(TypeError::UnknownField { ref field, .. }) if field == "z"),
+            "expected UnknownField for z, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn infer_record_update_rejects_duplicate_fields() {
+        let src = r#"
+            (type Point [(:x ~ Int) (:y ~ Int)])
+            (let main {} (with (Point :x 0 :y 1) :x 10 :x 20))
+        "#;
+        let result = check(src);
+        assert!(
+            matches!(
+                result,
+                Err(TypeError::DuplicateRecordUpdateField { ref field, .. }) if field == "x"
+            ),
+            "expected DuplicateRecordUpdateField for x, got {result:?}"
+        );
+    }
+
+    #[test]
     fn infer_generic_record_construction() {
         let src = r#"
             (type ['t] Box [(:value ~ 't)])
@@ -2229,6 +2728,16 @@ mod tests {
             check(src).is_err(),
             "expected type error: Bool used for Int field"
         );
+    }
+
+    #[test]
+    fn infer_record_function_field_and_call() {
+        let src = r#"
+            (type FnBox [(:run ~ (Int -> String))])
+            (let main {} ((:run (FnBox :run (f {n} -> "ok"))) 1))
+        "#;
+        let ty = check(src).unwrap();
+        assert_eq!(ty, Type::string());
     }
 
     #[test]

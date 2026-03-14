@@ -330,15 +330,66 @@ fn lower_expr_with_renames(
 
         ast::Expr::RecordConstruct { name, fields, .. } => {
             // {name, field1, field2, ...} — fields in declaration order
-            // Without type info we use declaration order as given at the call site
             let tag = ir::Expr::Atom(name.to_lowercase());
             let mut items = vec![tag];
-            items.extend(
-                fields
+            if let Some(layout) = ctx.record_layouts.get(name) {
+                let by_name: HashMap<String, &ast::Expr> = fields
                     .iter()
-                    .map(|(_, e)| lower_expr_with_renames(e, ctx, renames, fresh_idx)),
-            );
+                    .map(|(field, expr)| (field.clone(), expr))
+                    .collect();
+                let has_duplicates = by_name.len() != fields.len();
+                let has_unknown = fields
+                    .iter()
+                    .any(|(field, _)| !layout.iter().any(|declared| declared == field));
+                let has_missing = layout.iter().any(|field| !by_name.contains_key(field));
+
+                if !has_duplicates && !has_unknown && !has_missing {
+                    for field in layout {
+                        let expr = by_name
+                            .get(field)
+                            .expect("validated record layout field exists");
+                        items.push(lower_expr_with_renames(expr, ctx, renames, fresh_idx));
+                    }
+                } else {
+                    items.extend(
+                        fields
+                            .iter()
+                            .map(|(_, e)| lower_expr_with_renames(e, ctx, renames, fresh_idx)),
+                    );
+                }
+            } else {
+                items.extend(
+                    fields
+                        .iter()
+                        .map(|(_, e)| lower_expr_with_renames(e, ctx, renames, fresh_idx)),
+                );
+            }
             ir::Expr::Tuple(items)
+        }
+
+        ast::Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            // Evaluate the base record exactly once, then apply updates via setelement/3.
+            let record_var = format!("RUpd{}__", *fresh_idx);
+            *fresh_idx += 1;
+            let base_ir = lower_expr_with_renames(record, ctx, renames, fresh_idx);
+            let updated_ir =
+                updates
+                    .iter()
+                    .fold(ir::Expr::Var(record_var.clone()), |acc, (field, value)| {
+                        let idx = ctx.field_indices.get(field.as_str()).copied().unwrap_or(2);
+                        ir::Expr::RemoteCall(
+                            "erlang".into(),
+                            "setelement".into(),
+                            vec![
+                                ir::Expr::Int(idx as i64),
+                                acc,
+                                lower_expr_with_renames(value, ctx, renames, fresh_idx),
+                            ],
+                        )
+                    });
+            ir::Expr::Let(record_var, Box::new(base_ir), Box::new(updated_ir))
         }
 
         ast::Expr::QualifiedCall {
@@ -380,6 +431,22 @@ fn lower_call(
     renames: &HashMap<String, String>,
     fresh_idx: &mut usize,
 ) -> ir::Expr {
+    // Saturated curried call chain over a known local multi-arg function:
+    // ((f a) b) -> f(a, b)
+    // This keeps recursive calls on the direct N-arity path for BEAM TCO.
+    if let Some((name, flattened_args)) = flatten_call_chain(func, args)
+        && ctx.fn_names.contains(name)
+    {
+        let mond_arity = ctx.fn_arities.get(name).copied().unwrap_or(0);
+        if mond_arity >= 2 && flattened_args.len() == mond_arity {
+            let lowered = flattened_args
+                .iter()
+                .map(|a| lower_expr_with_renames(a, ctx, renames, fresh_idx))
+                .collect();
+            return ir::Expr::LocalCallMulti(name.to_string(), lowered);
+        }
+    }
+
     if let ast::Expr::Variable(name, _) = func {
         // Binary operator
         if args.len() == 2
@@ -476,6 +543,35 @@ fn lower_call(
         );
     }
     result
+}
+
+fn flatten_call_chain<'a>(
+    func: &'a ast::Expr,
+    args: &'a [ast::Expr],
+) -> Option<(&'a str, Vec<&'a ast::Expr>)> {
+    let mut arg_segments: Vec<&'a [ast::Expr]> = vec![args];
+    let mut current = func;
+
+    loop {
+        match current {
+            ast::Expr::Variable(name, _) => {
+                let mut flat_args = Vec::new();
+                for segment in arg_segments.iter().rev() {
+                    flat_args.extend(segment.iter());
+                }
+                return Some((name.as_str(), flat_args));
+            }
+            ast::Expr::Call {
+                func: inner_func,
+                args: inner_args,
+                ..
+            } => {
+                arg_segments.push(inner_args);
+                current = inner_func.as_ref();
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn lower_variable(name: &str, ctx: &Ctx, renames: &HashMap<String, String>) -> ir::Expr {
@@ -963,6 +1059,21 @@ mod tests {
     }
 
     #[test]
+    fn nested_curried_full_application_uses_multi_arg_call() {
+        let src = r#"
+(let sum {acc n}
+  (if (= n 0)
+    acc
+    ((sum (+ acc n)) (- n 1))))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("sum((Acc + N), (N - 1))") || erl.contains("sum((Acc + N),(N - 1))"),
+            "expected direct multi-arg recursive call:\n{erl}"
+        );
+    }
+
+    #[test]
     fn builtin_boolean_operator_can_appear_in_value_position() {
         let src = r#"
 (let choose_or {} or)
@@ -971,6 +1082,32 @@ mod tests {
         assert!(
             erl.contains("fun(A__) -> fun(B__) -> (A__ orelse B__) end end"),
             "expected first-class builtin operator lowering:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn record_constructor_named_fields_follow_declaration_order() {
+        let src = r#"
+(type Point [(:x ~ Int) (:y ~ Int)])
+(let main {} (:x (Point :y 2 :x 1)))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("{point, 1, 2}") || erl.contains("{point,1,2}"),
+            "expected tuple layout to follow record declaration order:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn record_update_lowers_to_setelement() {
+        let src = r#"
+(type Point [(:x ~ Int) (:y ~ Int)])
+(let main {} (:x (with (Point :x 1 :y 2) :x 10)))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("erlang:setelement(2"),
+            "expected record update lowering via setelement/3:\n{erl}"
         );
     }
 }

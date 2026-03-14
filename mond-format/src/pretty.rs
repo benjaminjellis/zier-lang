@@ -157,6 +157,10 @@ fn fmt_round(items: &[SExpr], source: &str) -> Doc {
         return text("()");
     }
 
+    if is_record_construct(items, source) {
+        return fmt_record_construct(items, source);
+    }
+
     // Strip leading modifier keywords (pub) to find the governing keyword.
     let mod_count = items
         .iter()
@@ -173,6 +177,7 @@ fn fmt_round(items: &[SExpr], source: &str) -> Doc {
             TokenKind::Match => fmt_match(rest, source),
             TokenKind::Fn => fmt_fn(rest, source),
             TokenKind::Do => fmt_do(rest, source),
+            TokenKind::With => fmt_with(rest, source),
             TokenKind::Operator if atom_text(kw_tok, source) == "|>" => fmt_pipe(rest, source),
             // use / extern — always stay on one line
             TokenKind::Use | TokenKind::Extern => fmt_inline(items, source),
@@ -246,6 +251,93 @@ fn fmt_let(all: &[SExpr], mod_count: usize, rest: &[SExpr], source: &str) -> Doc
 
         _ => fmt_generic(all, source),
     }
+}
+
+fn is_record_construct(items: &[SExpr], source: &str) -> bool {
+    let Some(SExpr::Atom(head)) = items.first() else {
+        return false;
+    };
+    if !matches!(head.kind, TokenKind::Ident) {
+        return false;
+    }
+    let head_text = atom_text(head, source);
+    if !head_text
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return false;
+    }
+    matches!(
+        items.get(1),
+        Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::NamedField(_))
+    )
+}
+
+fn fmt_record_construct(items: &[SExpr], source: &str) -> Doc {
+    let head = fmt(&items[0], source);
+    if items.len() == 1 {
+        return concat_all([text("("), head, text(")")]);
+    }
+
+    let Some(args) = fmt_named_field_pairs(&items[1..], source) else {
+        return fmt_generic(items, source);
+    };
+    let args_doc = join(line(), args);
+    group(concat_all([
+        text("("),
+        head,
+        nest(2, concat(line(), args_doc)),
+        text(")"),
+    ]))
+}
+
+fn fmt_with(rest: &[SExpr], source: &str) -> Doc {
+    let [record, updates @ ..] = rest else {
+        return fmt_generic_with_head("with", rest, source);
+    };
+    let Some(pairs) = fmt_named_field_pairs(updates, source) else {
+        return fmt_generic_with_head("with", rest, source);
+    };
+    if pairs.is_empty() {
+        return fmt_generic_with_head("with", rest, source);
+    }
+
+    let updates_doc = concat_all(
+        pairs
+            .into_iter()
+            .map(|pair| concat(hardline(), pair))
+            .collect::<Vec<_>>(),
+    );
+    concat_all([
+        text("(with "),
+        fmt(record, source),
+        nest(2, updates_doc),
+        text(")"),
+    ])
+}
+
+fn fmt_named_field_pairs(items: &[SExpr], source: &str) -> Option<Vec<Doc>> {
+    if items.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut pairs = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let field = items.get(i)?;
+        let value = items.get(i + 1)?;
+        if !matches!(field, SExpr::Atom(t) if matches!(t.kind, TokenKind::NamedField(_))) {
+            return None;
+        }
+        pairs.push(concat_all([
+            fmt(field, source),
+            text(" "),
+            fmt(value, source),
+        ]));
+        i += 2;
+    }
+    Some(pairs)
 }
 
 /// Format let-bindings `[name val name val ...]` as a group of pairs.

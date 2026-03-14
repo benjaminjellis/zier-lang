@@ -24,6 +24,47 @@ pub struct ResolvedImports {
     pub module_aliases: HashMap<String, String>,
 }
 
+fn type_decl_name(type_decl: &crate::ast::TypeDecl) -> &str {
+    match type_decl {
+        crate::ast::TypeDecl::Record { name, .. } => name,
+        crate::ast::TypeDecl::Variant { name, .. } => name,
+    }
+}
+
+fn clone_type_decl_with_name(
+    type_decl: &crate::ast::TypeDecl,
+    name: String,
+) -> crate::ast::TypeDecl {
+    match type_decl {
+        crate::ast::TypeDecl::Record {
+            is_pub,
+            params,
+            fields,
+            span,
+            ..
+        } => crate::ast::TypeDecl::Record {
+            is_pub: *is_pub,
+            name,
+            params: params.clone(),
+            fields: fields.clone(),
+            span: span.clone(),
+        },
+        crate::ast::TypeDecl::Variant {
+            is_pub,
+            params,
+            constructors,
+            span,
+            ..
+        } => crate::ast::TypeDecl::Variant {
+            is_pub: *is_pub,
+            name,
+            params: params.clone(),
+            constructors: constructors.clone(),
+            span: span.clone(),
+        },
+    }
+}
+
 pub fn build_project_analysis(
     std_mods: &[(String, String, String)],
     src_module_sources: &[(String, String)],
@@ -74,6 +115,7 @@ pub fn build_project_analysis_with_modules(
             imports.imports,
             &module_exports,
             &imports.imported_type_decls,
+            &imports.imported_extern_types,
             &imports.imported_schemes,
         );
         all_module_schemes.insert(user_name.clone(), schemes);
@@ -98,6 +140,7 @@ pub fn build_project_analysis_with_modules(
             imports.imports,
             &module_exports,
             &imports.imported_type_decls,
+            &imports.imported_extern_types,
             &imports.imported_schemes,
         );
         all_module_schemes.insert(module_name.clone(), schemes);
@@ -183,6 +226,8 @@ pub fn resolve_imports_for_source(
     let mut imported_field_indices: HashMap<String, usize> = HashMap::new();
     let mut imported_type_keys: HashSet<(String, String)> = HashSet::new();
     let mut imported_extern_type_keys: HashSet<(String, String)> = HashSet::new();
+    let mut imported_qualified_type_keys: HashSet<(String, String)> = HashSet::new();
+    let mut imported_qualified_extern_type_keys: HashSet<(String, String)> = HashSet::new();
 
     for (_, mod_name, unqualified) in crate::used_modules(source) {
         let erlang_name = project
@@ -210,6 +255,17 @@ pub fn resolve_imports_for_source(
         }
 
         if let Some(type_decls) = project.module_type_decls.get(&mod_name) {
+            // Always add qualified type aliases (module/TypeName) for modules in scope.
+            for type_decl in type_decls {
+                let type_name = type_decl_name(type_decl).to_string();
+                if imported_qualified_type_keys.insert((mod_name.clone(), type_name.clone())) {
+                    imported_type_decls.push(clone_type_decl_with_name(
+                        type_decl,
+                        format!("{mod_name}/{type_name}"),
+                    ));
+                }
+            }
+
             // Field accessors (for example `:value`) should remain usable when a module is
             // referenced, even if constructors require explicit unqualified type import.
             for type_decl in type_decls {
@@ -232,10 +288,7 @@ pub fn resolve_imports_for_source(
                 crate::ast::UnqualifiedImports::None => {}
                 crate::ast::UnqualifiedImports::Wildcard => {
                     for type_decl in type_decls {
-                        let type_name = match type_decl {
-                            crate::ast::TypeDecl::Record { name, .. } => name.clone(),
-                            crate::ast::TypeDecl::Variant { name, .. } => name.clone(),
-                        };
+                        let type_name = type_decl_name(type_decl).to_string();
                         let key = (mod_name.clone(), type_name);
                         if imported_type_keys.insert(key) {
                             imported_type_decls.push(type_decl.clone());
@@ -244,14 +297,11 @@ pub fn resolve_imports_for_source(
                 }
                 crate::ast::UnqualifiedImports::Specific(names) => {
                     for type_decl in type_decls {
-                        let type_name = match type_decl {
-                            crate::ast::TypeDecl::Record { name, .. } => name,
-                            crate::ast::TypeDecl::Variant { name, .. } => name,
-                        };
+                        let type_name = type_decl_name(type_decl);
                         if !names.iter().any(|n| n == type_name) {
                             continue;
                         }
-                        let key = (mod_name.clone(), type_name.clone());
+                        let key = (mod_name.clone(), type_name.to_string());
                         if imported_type_keys.insert(key) {
                             imported_type_decls.push(type_decl.clone());
                         }
@@ -261,6 +311,14 @@ pub fn resolve_imports_for_source(
         }
 
         if let Some(extern_types) = project.module_extern_types.get(&mod_name) {
+            // Always add qualified extern type aliases (module/TypeName) for modules in scope.
+            for type_name in extern_types {
+                if imported_qualified_extern_type_keys.insert((mod_name.clone(), type_name.clone()))
+                {
+                    imported_extern_types.push(format!("{mod_name}/{type_name}"));
+                }
+            }
+
             match &unqualified {
                 crate::ast::UnqualifiedImports::None => {}
                 crate::ast::UnqualifiedImports::Wildcard => {

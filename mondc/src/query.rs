@@ -12,6 +12,36 @@ fn parse_decls(source_path: &str, source: &str) -> Option<Vec<ast::Declaration>>
     Some(lowerer.lower_file(file_id, &sexprs))
 }
 
+fn type_decl_name(type_decl: &ast::TypeDecl) -> &str {
+    match type_decl {
+        ast::TypeDecl::Record { name, .. } => name,
+        ast::TypeDecl::Variant { name, .. } => name,
+    }
+}
+
+fn is_qualified_type_name(name: &str) -> bool {
+    name.contains('/')
+}
+
+fn build_qualified_type_aliases(
+    imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for type_decl in imported_type_decls {
+        let name = type_decl_name(type_decl);
+        if let Some((_, local_name)) = name.split_once('/') {
+            aliases.insert(name.to_string(), local_name.to_string());
+        }
+    }
+    for name in imported_extern_types {
+        if let Some((_, local_name)) = name.split_once('/') {
+            aliases.insert(name.clone(), local_name.to_string());
+        }
+    }
+    aliases
+}
+
 pub fn exported_names(source: &str) -> Vec<String> {
     parse_decls("scan.mond", source)
         .unwrap_or_default()
@@ -113,6 +143,7 @@ pub fn infer_module_bindings(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
     let mut sess = session::CompilerSession::new(session::SessionOptions {
@@ -132,11 +163,24 @@ pub fn infer_module_bindings(
         return HashMap::new();
     }
 
+    let qualified_type_aliases =
+        build_qualified_type_aliases(imported_type_decls, imported_extern_types);
+    let imported_type_decls_unqualified: Vec<ast::TypeDecl> = imported_type_decls
+        .iter()
+        .filter(|type_decl| !is_qualified_type_name(type_decl_name(type_decl)))
+        .cloned()
+        .collect();
+
     let mut checker = typecheck::TypeChecker::new();
+    checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
+    checker.seed_imported_type_info(&imported_type_decls_unqualified);
     let mut env = typecheck::primitive_env();
 
-    for type_decl in imported_type_decls {
-        env.extend(typecheck::constructor_schemes(type_decl));
+    for type_decl in &imported_type_decls_unqualified {
+        env.extend(typecheck::constructor_schemes_with_aliases(
+            type_decl,
+            &qualified_type_aliases,
+        ));
     }
     env.extend(imported_schemes.clone());
 
@@ -148,8 +192,11 @@ pub fn infer_module_bindings(
     );
     env.extend(typecheck::import_env(&unresolved));
 
-    for type_decl in imported_type_decls {
-        env.extend(typecheck::constructor_schemes(type_decl));
+    for type_decl in &imported_type_decls_unqualified {
+        env.extend(typecheck::constructor_schemes_with_aliases(
+            type_decl,
+            &qualified_type_aliases,
+        ));
     }
 
     if checker.check_program(&mut env, &decls, file_id).is_err() {
@@ -176,6 +223,7 @@ pub fn infer_module_expr_types(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
 ) -> Vec<(std::ops::Range<usize>, String)> {
     let mut sess = session::CompilerSession::new(session::SessionOptions {
@@ -195,10 +243,23 @@ pub fn infer_module_expr_types(
         return Vec::new();
     }
 
+    let qualified_type_aliases =
+        build_qualified_type_aliases(imported_type_decls, imported_extern_types);
+    let imported_type_decls_unqualified: Vec<ast::TypeDecl> = imported_type_decls
+        .iter()
+        .filter(|type_decl| !is_qualified_type_name(type_decl_name(type_decl)))
+        .cloned()
+        .collect();
+
     let mut checker = typecheck::TypeChecker::new();
+    checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
+    checker.seed_imported_type_info(&imported_type_decls_unqualified);
     let mut env = typecheck::primitive_env();
-    for type_decl in imported_type_decls {
-        env.extend(typecheck::constructor_schemes(type_decl));
+    for type_decl in &imported_type_decls_unqualified {
+        env.extend(typecheck::constructor_schemes_with_aliases(
+            type_decl,
+            &qualified_type_aliases,
+        ));
     }
     env.extend(imported_schemes.clone());
 
@@ -227,6 +288,7 @@ pub fn infer_module_exports(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
     let all_bindings = infer_module_bindings(
@@ -235,6 +297,7 @@ pub fn infer_module_exports(
         imports,
         module_exports,
         imported_type_decls,
+        imported_extern_types,
         imported_schemes,
     );
 

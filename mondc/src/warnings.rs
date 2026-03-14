@@ -533,6 +533,26 @@ fn collect_match_redundancy_diagnostics_expr(
                 );
             }
         }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_match_redundancy_diagnostics_expr(
+                record,
+                file_id,
+                constructor_families,
+                variant_families,
+                out,
+            );
+            for (_, value) in updates {
+                collect_match_redundancy_diagnostics_expr(
+                    value,
+                    file_id,
+                    constructor_families,
+                    variant_families,
+                    out,
+                );
+            }
+        }
         Expr::Lambda { body, .. } => collect_match_redundancy_diagnostics_expr(
             body,
             file_id,
@@ -619,6 +639,14 @@ fn collect_top_level_refs(
         }
         Expr::RecordConstruct { fields, .. } => {
             for (_, value) in fields {
+                collect_top_level_refs(value, top_level, locals, out);
+            }
+        }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_top_level_refs(record, top_level, locals, out);
+            for (_, value) in updates {
                 collect_top_level_refs(value, top_level, locals, out);
             }
         }
@@ -717,6 +745,15 @@ fn collect_unused_local_spans(
             }
             free
         }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            let mut free = collect_unused_local_spans(record, out);
+            for (_, value) in updates {
+                free.extend(collect_unused_local_spans(value, out));
+            }
+            free
+        }
         Expr::Lambda { args, body, .. } => {
             let mut free = collect_unused_local_spans(body, out);
             for arg in args {
@@ -807,6 +844,14 @@ fn collect_unqualified_free_vars(
                 collect_unqualified_free_vars(value, locals, out);
             }
         }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_unqualified_free_vars(record, locals, out);
+            for (_, value) in updates {
+                collect_unqualified_free_vars(value, locals, out);
+            }
+        }
         Expr::Lambda { args, body, .. } => {
             let mut inner = locals.clone();
             inner.extend(args.iter().cloned());
@@ -865,6 +910,14 @@ fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
                 collect_qualified_module_refs(value, out);
             }
         }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_qualified_module_refs(record, out);
+            for (_, value) in updates {
+                collect_qualified_module_refs(value, out);
+            }
+        }
         Expr::Lambda { body, .. } => {
             collect_qualified_module_refs(body, out);
         }
@@ -878,6 +931,46 @@ fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
 }
 
 fn used_qualified_modules(decls: &[ast::Declaration]) -> HashSet<String> {
+    fn add_qualified_module(name: &str, out: &mut HashSet<String>) {
+        if let Some((module, _)) = name.split_once('/') {
+            out.insert(module.to_string());
+        }
+    }
+
+    fn collect_type_usage_qualified_modules(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
+        match ty {
+            ast::TypeUsage::Named(name, _) => add_qualified_module(name, out),
+            ast::TypeUsage::Generic(_, _) => {}
+            ast::TypeUsage::App(head, args, _) => {
+                add_qualified_module(head, out);
+                for arg in args {
+                    collect_type_usage_qualified_modules(arg, out);
+                }
+            }
+            ast::TypeUsage::Fun(arg, ret, _) => {
+                collect_type_usage_qualified_modules(arg, out);
+                collect_type_usage_qualified_modules(ret, out);
+            }
+        }
+    }
+
+    fn collect_type_sig_qualified_modules(sig: &ast::TypeSig, out: &mut HashSet<String>) {
+        match sig {
+            ast::TypeSig::Named(name) => add_qualified_module(name, out),
+            ast::TypeSig::Generic(_) => {}
+            ast::TypeSig::App(head, args) => {
+                add_qualified_module(head, out);
+                for arg in args {
+                    collect_type_sig_qualified_modules(arg, out);
+                }
+            }
+            ast::TypeSig::Fun(arg, ret) => {
+                collect_type_sig_qualified_modules(arg, out);
+                collect_type_sig_qualified_modules(ret, out);
+            }
+        }
+    }
+
     let mut used = HashSet::new();
     for decl in decls {
         match decl {
@@ -886,6 +979,21 @@ fn used_qualified_modules(decls: &[ast::Declaration]) -> HashSet<String> {
             }
             ast::Declaration::Test { body, .. } => {
                 collect_qualified_module_refs(body, &mut used);
+            }
+            ast::Declaration::Type(ast::TypeDecl::Record { fields, .. }) => {
+                for (_, ty) in fields {
+                    collect_type_usage_qualified_modules(ty, &mut used);
+                }
+            }
+            ast::Declaration::Type(ast::TypeDecl::Variant { constructors, .. }) => {
+                for (_, payload) in constructors {
+                    if let Some(ty) = payload {
+                        collect_type_usage_qualified_modules(ty, &mut used);
+                    }
+                }
+            }
+            ast::Declaration::ExternLet { ty, .. } => {
+                collect_type_sig_qualified_modules(ty, &mut used);
             }
             _ => {}
         }
@@ -905,6 +1013,10 @@ fn collect_type_usage_names(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
                 collect_type_usage_names(arg, out);
             }
         }
+        ast::TypeUsage::Fun(arg, ret, _) => {
+            collect_type_usage_names(arg, out);
+            collect_type_usage_names(ret, out);
+        }
     }
 }
 
@@ -918,6 +1030,10 @@ fn collect_type_usage_generics(ty: &ast::TypeUsage, out: &mut HashSet<String>) {
             for arg in args {
                 collect_type_usage_generics(arg, out);
             }
+        }
+        ast::TypeUsage::Fun(arg, ret, _) => {
+            collect_type_usage_generics(arg, out);
+            collect_type_usage_generics(ret, out);
         }
     }
 }
@@ -1150,6 +1266,19 @@ fn collect_expr_type_decl_refs(
         Expr::RecordConstruct { name, fields, .. } => {
             used_record_type_names.insert(name.clone());
             for (_, value) in fields {
+                collect_expr_type_decl_refs(
+                    value,
+                    locals,
+                    used_value_names,
+                    used_record_type_names,
+                );
+            }
+        }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_expr_type_decl_refs(record, locals, used_value_names, used_record_type_names);
+            for (_, value) in updates {
                 collect_expr_type_decl_refs(
                     value,
                     locals,

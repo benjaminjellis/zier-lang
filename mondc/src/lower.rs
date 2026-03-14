@@ -608,7 +608,7 @@ impl Lowerer {
             }
 
             // Catch keywords that wandered into the wrong place
-            TokenKind::Let | TokenKind::If | TokenKind::Match | TokenKind::Do => {
+            TokenKind::Let | TokenKind::If | TokenKind::Match | TokenKind::Do | TokenKind::With => {
                 self.error(Diagnostic {
                     severity: Severity::Error,
                     code: Some("E003".to_string()),
@@ -678,13 +678,16 @@ impl Lowerer {
                         TokenKind::If => return self.lower_if(file_id, items, span.clone()),
                         TokenKind::Match => return self.lower_match(file_id, items, span.clone()),
                         TokenKind::Do => return self.lower_do(file_id, items, span.clone()),
+                        TokenKind::With => {
+                            return self.lower_record_update(file_id, items, span.clone());
+                        }
                         TokenKind::NamedField(_) => {
                             return self.lower_field_access(file_id, items, span.clone());
                         }
                         TokenKind::Ident => {
+                            let name = self.source_at(file_id, token.span.clone());
                             // (TypeName :field val ...) — named-field record construction
                             // Detect: capitalised ident followed by a NamedField token
-                            let name = self.source_at(file_id, token.span.clone());
                             if name.starts_with(|c: char| c.is_uppercase())
                                 && let Some(SExpr::Atom(t2)) = items.get(1)
                                 && matches!(t2.kind, TokenKind::NamedField(_))
@@ -975,6 +978,106 @@ impl Lowerer {
         Some(Expr::RecordConstruct { name, fields, span })
     }
 
+    fn lower_record_update(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: Range<usize>,
+    ) -> Option<Expr> {
+        // Syntax: (with record_expr :field1 val1 :field2 val2 ...)
+        if items.len() < 4 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("record update requires a record and at least one field update")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec![
+                        "syntax: (with record :field1 val1 :field2 val2)".into(),
+                    ]),
+            );
+            return None;
+        }
+
+        let record = Box::new(self.lower_expr(file_id, &items[1])?);
+        let mut updates = Vec::new();
+        let mut cursor = 2;
+
+        while cursor < items.len() {
+            let field_name = match items.get(cursor) {
+                Some(SExpr::Atom(t)) => match &t.kind {
+                    TokenKind::NamedField(f) => f.clone(),
+                    _ => {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message("expected a field name in record update")
+                                .with_labels(vec![
+                                    Label::primary(file_id, t.span.clone())
+                                        .with_message("expected `:field_name` here"),
+                                ])
+                                .with_notes(vec![
+                                    "syntax: (with record :field1 val1 :field2 val2)".into(),
+                                ]),
+                        );
+                        return None;
+                    }
+                },
+                Some(other) => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("expected a field name in record update")
+                            .with_labels(vec![
+                                Label::primary(file_id, other.span())
+                                    .with_message("expected `:field_name` here"),
+                            ])
+                            .with_notes(vec![
+                                "syntax: (with record :field1 val1 :field2 val2)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+                None => break,
+            };
+            cursor += 1;
+
+            let value = match items.get(cursor) {
+                Some(sexpr) => self.lower_expr(file_id, sexpr)?,
+                None => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "missing value for field `:{field_name}` in record update"
+                            ))
+                            .with_labels(vec![Label::primary(file_id, span.clone())])
+                            .with_notes(vec![
+                                "syntax: (with record :field1 val1 :field2 val2)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+            };
+            cursor += 1;
+
+            updates.push((field_name, value));
+        }
+
+        if updates.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message("record update has no fields")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec![
+                        "syntax: (with record :field1 val1 :field2 val2)".into(),
+                    ]),
+            );
+            return None;
+        }
+
+        Some(Expr::RecordUpdate {
+            record,
+            updates,
+            span,
+        })
+    }
+
     /// Parse a type usage after `~`.
     /// Supported forms include:
     ///   - `Int`
@@ -1012,9 +1115,7 @@ impl Lowerer {
                     _ => TypeUsage::Named(text, token.span.clone()),
                 })
             }
-            SExpr::Round(items, span) => {
-                self.lower_type_usage_application(file_id, items, span.clone())
-            }
+            SExpr::Round(items, span) => self.lower_type_usage_round(file_id, items, span.clone()),
             other => {
                 self.error(
                     Diagnostic::error()
@@ -1028,12 +1129,102 @@ impl Lowerer {
         }
     }
 
+    fn lower_type_usage_round(
+        &mut self,
+        file_id: usize,
+        items: &[SExpr],
+        span: std::ops::Range<usize>,
+    ) -> Option<TypeUsage> {
+        // Parenthesised type: (A -> B -> C), parsed right-associatively.
+        // Each segment between `->` tokens may itself be a type application.
+        if items.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message("empty type is not allowed")
+                    .with_labels(vec![Label::primary(file_id, span)])
+                    .with_notes(vec!["use `Unit` for the unit type".into()]),
+            );
+            return None;
+        }
+
+        let mut groups: Vec<Vec<&SExpr>> = Vec::new();
+        let mut current: Vec<&SExpr> = Vec::new();
+        let mut saw_arrow = false;
+        for item in items {
+            if let SExpr::Atom(t) = item
+                && matches!(t.kind, TokenKind::ThinArrow)
+            {
+                saw_arrow = true;
+                if !current.is_empty() {
+                    groups.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(item);
+            }
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        if !saw_arrow {
+            return self.lower_type_usage_application(file_id, items, span);
+        }
+        if groups.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message("empty type signature")
+                    .with_labels(vec![Label::primary(file_id, span)]),
+            );
+            return None;
+        }
+
+        let lower_group = |this: &mut Self, group: Vec<&SExpr>| -> Option<TypeUsage> {
+            if group.len() == 1 {
+                this.lower_type_usage_sexpr(file_id, group[0])
+            } else {
+                let group_span = group
+                    .first()
+                    .map(|s| s.span().start)
+                    .zip(group.last().map(|s| s.span().end))
+                    .map(|(start, end)| start..end)
+                    .unwrap_or(0..0);
+                this.lower_type_usage_application(
+                    file_id,
+                    &group.into_iter().cloned().collect::<Vec<_>>(),
+                    group_span,
+                )
+            }
+        };
+
+        let mut lowered: Vec<TypeUsage> = groups
+            .into_iter()
+            .map(|g| lower_group(self, g))
+            .collect::<Option<Vec<_>>>()?;
+
+        let last = lowered.pop().unwrap();
+        Some(lowered.into_iter().rev().fold(last, |acc, seg| {
+            let span = seg.span().start..acc.span().end;
+            TypeUsage::Fun(Box::new(seg), Box::new(acc), span)
+        }))
+    }
+
     fn lower_type_usage_application(
         &mut self,
         file_id: usize,
         items: &[SExpr],
         span: std::ops::Range<usize>,
     ) -> Option<TypeUsage> {
+        if items.is_empty() {
+            self.error(
+                Diagnostic::error()
+                    .with_message("expected a type constructor name")
+                    .with_labels(vec![
+                        Label::primary(file_id, span)
+                            .with_message("empty `()` is not a valid type"),
+                    ]),
+            );
+            return None;
+        }
         let head_sexpr = &items[0];
         let SExpr::Atom(head_tok) = head_sexpr else {
             self.error(
@@ -1067,7 +1258,7 @@ impl Lowerer {
                 let text = self.source_at(file_id, token.span.clone()).to_string();
                 match &token.kind {
                     TokenKind::Generic => Some(TypeSig::Generic(text)),
-                    TokenKind::Ident => Some(TypeSig::Named(text)),
+                    TokenKind::Ident | TokenKind::QualifiedIdent(_) => Some(TypeSig::Named(text)),
                     _ => {
                         self.error(
                             Diagnostic::error()
@@ -1086,7 +1277,13 @@ impl Lowerer {
                 // where each segment between `->` tokens may be a type application
                 // (e.g. `Map 'k 'v` is three consecutive atoms treated as App("Map", ['k,'v])).
                 if items.is_empty() {
-                    return Some(TypeSig::Named("Unit".to_string()));
+                    self.error(
+                        Diagnostic::error()
+                            .with_message("empty type is not allowed")
+                            .with_labels(vec![Label::primary(file_id, span.clone())])
+                            .with_notes(vec!["use `Unit` for the unit type".into()]),
+                    );
+                    return None;
                 }
 
                 // Group consecutive non-arrow items; each group becomes one TypeSig.
@@ -1123,7 +1320,12 @@ impl Lowerer {
                     } else {
                         // First atom is the type constructor, rest are type arguments.
                         let head = match group[0] {
-                            SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
+                            SExpr::Atom(t)
+                                if matches!(
+                                    t.kind,
+                                    TokenKind::Ident | TokenKind::QualifiedIdent(_)
+                                ) =>
+                            {
                                 this.source_at(file_id, t.span.clone()).to_string()
                             }
                             other => {
@@ -2300,10 +2502,13 @@ impl Lowerer {
         let mut acc = self.lower_expr(file_id, &items[1])?;
         for step in &items[2..] {
             let func = Box::new(self.lower_expr(file_id, step)?);
+            // Keep each desugared call span tight so type errors point at the
+            // offending pipeline step instead of the whole pipe expression.
+            let call_span = acc.span().start..step.span().end;
             acc = Expr::Call {
                 func,
                 args: vec![acc],
-                span: span.clone(),
+                span: call_span,
             };
         }
         Some(acc)
@@ -2402,6 +2607,56 @@ mod tests {
         } else {
             panic!("expected nested type application record type");
         }
+    }
+
+    #[test]
+    fn test_record_type_with_function_field() {
+        let (mut lowerer, file_id, sexprs) = setup(
+            "
+                (type ['m] Builder [
+                    (:initialised ~ ((Subject 'm) -> Unit))
+                ])",
+        );
+
+        let exprs = lowerer.lower_file(file_id, &sexprs);
+        if let Declaration::Type(TypeDecl::Record { fields, .. }) = &exprs[0] {
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].0, "initialised");
+            assert!(matches!(
+                &fields[0].1,
+                TypeUsage::Fun(arg, ret, _)
+                    if matches!(
+                        arg.as_ref(),
+                        TypeUsage::App(subject, args, _)
+                            if subject == "Subject"
+                                && args.len() == 1
+                                && matches!(&args[0], TypeUsage::Generic(name, _) if name == "'m")
+                    )
+                    && matches!(ret.as_ref(), TypeUsage::Named(name, _) if name == "Unit")
+            ));
+        } else {
+            panic!("expected record type with function field");
+        }
+    }
+
+    #[test]
+    fn test_record_type_with_empty_parenthesized_type_reports_error() {
+        let (mut lowerer, file_id, sexprs) = setup(
+            "
+                (type Broken [
+                    (:value ~ ())
+                ])",
+        );
+
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(decls.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert!(
+            lowerer
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("empty type is not allowed"))
+        );
     }
 
     #[test]
@@ -2645,6 +2900,35 @@ mod tests {
     #[test]
     fn test_field_access_zero_args() {
         let (mut lowerer, file_id, sexprs) = setup("(:x)");
+        let result = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(result.is_none());
+        assert!(!lowerer.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_record_update_lowering() {
+        let (mut lowerer, file_id, sexprs) = setup("(with point :x 10 :y 20)");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        if let Expr::RecordUpdate {
+            record, updates, ..
+        } = expr
+        {
+            assert!(matches!(record.as_ref(), Expr::Variable(name, _) if name == "point"));
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updates[0].0, "x");
+            assert_eq!(updates[1].0, "y");
+            assert!(matches!(updates[0].1, Expr::Literal(Literal::Int(10), _)));
+            assert!(matches!(updates[1].1, Expr::Literal(Literal::Int(20), _)));
+        } else {
+            panic!("expected RecordUpdate");
+        }
+    }
+
+    #[test]
+    fn test_record_update_missing_value_is_error() {
+        let (mut lowerer, file_id, sexprs) = setup("(with point :x)");
         let result = lowerer.lower_expr(file_id, &sexprs[0]);
         assert!(result.is_none());
         assert!(!lowerer.diagnostics.is_empty());

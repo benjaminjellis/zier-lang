@@ -142,6 +142,12 @@ pub enum Expr {
         fields: Vec<(String, Expr)>,
         span: Range<usize>,
     },
+    /// (with record :field1 val1 :field2 val2) — record update
+    RecordUpdate {
+        record: Box<Expr>,
+        updates: Vec<(String, Expr)>,
+        span: Range<usize>,
+    },
     /// (f {x y} -> body) — anonymous function
     Lambda {
         args: Vec<String>,
@@ -206,6 +212,7 @@ impl Expr {
             Expr::Match { span, .. } => span.clone(),
             Expr::FieldAccess { span, .. } => span.clone(),
             Expr::RecordConstruct { span, .. } => span.clone(),
+            Expr::RecordUpdate { span, .. } => span.clone(),
             Expr::Lambda { span, .. } => span.clone(),
             Expr::QualifiedCall { span, .. } => span.clone(),
         }
@@ -218,6 +225,7 @@ pub enum TypeUsage {
     Named(String, Range<usize>),               // e.g. Int, String, MyType
     Generic(String, Range<usize>),             // e.g. 'a, 't
     App(String, Vec<TypeUsage>, Range<usize>), // e.g. App("Option", [Generic("'a")])
+    Fun(Box<TypeUsage>, Box<TypeUsage>, Range<usize>), // e.g. Int -> String
 }
 
 impl TypeUsage {
@@ -225,7 +233,8 @@ impl TypeUsage {
         match self {
             TypeUsage::Named(_, span)
             | TypeUsage::Generic(_, span)
-            | TypeUsage::App(_, _, span) => span.clone(),
+            | TypeUsage::App(_, _, span)
+            | TypeUsage::Fun(_, _, span) => span.clone(),
         }
     }
 }

@@ -121,6 +121,44 @@ fn duplicate_record_fields_error() {
 }
 
 #[test]
+fn record_constructor_type_mismatch_points_to_field_value() {
+    let src = r#"
+        (type Builder [(:initialised ~ Int)])
+        (let new {}
+          (Builder :initialised "oops"))
+    "#;
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(report.has_errors(), "expected type error");
+    let mismatch = report
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("type mismatch"))
+        .expect("missing type mismatch diagnostic");
+    let primary = mismatch
+        .labels
+        .iter()
+        .find(|label| {
+            matches!(
+                label.style,
+                codespan_reporting::diagnostic::LabelStyle::Primary
+            )
+        })
+        .expect("missing primary label");
+    assert_eq!(&src[primary.range.clone()], "\"oops\"");
+}
+
+#[test]
 fn duplicate_variant_constructors_error() {
     let src = "(type LotsOVariants [One One Two (Three ~ Int)])";
     let result = compile_with_imports(
@@ -322,6 +360,114 @@ fn qualified_only_use_keeps_record_field_accessors_available() {
     assert!(
         !report.has_errors(),
         "record field access should work without unqualified type import: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_type_reference_in_type_declaration_is_supported() {
+    let process_src = "(pub extern type ['m] Name)";
+    let std_mods = vec![(
+        "process".to_string(),
+        "mond_process".to_string(),
+        process_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use process)\n(type ['m] Actor [(:name ~ (process/Name 'm))])\n(let main {} ())";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
+        &resolved.imported_field_indices,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        !report.has_errors(),
+        "expected qualified type reference to resolve: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_only_use_still_requires_qualified_type_spelling() {
+    let process_src = "(pub extern type ['m] Name)";
+    let std_mods = vec![(
+        "process".to_string(),
+        "mond_process".to_string(),
+        process_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use process)\n(type ['m] Actor [(:name ~ (Name 'm))])\n(let main {} ())";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
+        &resolved.imported_field_indices,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        report.has_errors(),
+        "expected unknown type without unqualified import"
+    );
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unknown type") && m.contains("Name")),
+        "expected unknown type Name diagnostic, got: {messages:?}"
+    );
+}
+
+#[test]
+fn extern_signature_accepts_qualified_type_reference() {
+    let process_src = "(pub extern type ['m] Name)";
+    let std_mods = vec![(
+        "process".to_string(),
+        "mond_process".to_string(),
+        process_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use process)\n(pub extern let set_name ~ ((process/Name 'm) -> Unit) process/set_name)\n(let main {} ())";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
+        &resolved.imported_field_indices,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics for qualified extern signature: {:?}",
         report
             .diagnostics
             .iter()
@@ -582,6 +728,7 @@ fn infer_module_exports_preserves_result_bind_error_type() {
         HashMap::new(),
         &module_exports,
         &[],
+        &[],
         &HashMap::new(),
     );
 
@@ -664,6 +811,7 @@ fn imported_result_bind_reports_continuation_mismatch() {
         HashMap::new(),
         &module_exports,
         &[],
+        &[],
         &HashMap::new(),
     );
     let io_schemes = infer_module_exports(
@@ -671,6 +819,7 @@ fn imported_result_bind_reports_continuation_mismatch() {
         io_src,
         HashMap::new(),
         &module_exports,
+        &[],
         &[],
         &HashMap::new(),
     );
@@ -752,6 +901,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
         HashMap::new(),
         &module_exports,
         &[],
+        &[],
         &HashMap::new(),
     );
     let io_schemes = infer_module_exports(
@@ -759,6 +909,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
         io_src,
         HashMap::new(),
         &module_exports,
+        &[],
         &[],
         &HashMap::new(),
     );
@@ -768,6 +919,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
         HashMap::new(),
         &module_exports,
         &exported_type_decls(result_src),
+        &[],
         &result_schemes,
     );
 
@@ -1141,6 +1293,32 @@ fn qualified_only_import_warning_flags_unused_module_import() {
 }
 
 #[test]
+fn qualified_only_import_used_in_type_decl_is_not_flagged_unused() {
+    let src =
+        "(use std/process)\n(type ['m] Actor [(:name ~ (process/Name 'm))])\n(let main {} ())";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut module_exports = HashMap::new();
+    module_exports.insert("process".to_string(), vec![]);
+    let warnings =
+        warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unqualified_import_warnings_flag_unused_specific_and_wildcard() {
     let src =
         "(use std/io)\n(use std/result [Result bind])\n(use std/option [*])\n(let main {} ())";
@@ -1366,6 +1544,7 @@ fn infer_module_expr_types_include_function_arg_and_match_binding_spans() {
         src,
         HashMap::new(),
         &HashMap::new(),
+        &[],
         &[],
         &HashMap::new(),
     );
