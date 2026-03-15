@@ -1,6 +1,7 @@
 mod analysis;
 mod backend;
 pub(crate) mod project;
+mod semantic_tokens;
 pub(crate) mod state;
 #[cfg(test)]
 mod tests;

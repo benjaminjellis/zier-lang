@@ -547,7 +547,7 @@ pub(super) fn byte_range_to_lsp_range(source: &str, start: usize, end: usize) ->
     )
 }
 
-pub(super) fn offset_to_position(source: &str, offset: usize) -> Position {
+pub(crate) fn offset_to_position(source: &str, offset: usize) -> Position {
     let mut line = 0u32;
     let mut col = 0u32;
     let mut seen = 0usize;
@@ -1260,7 +1260,7 @@ pub(super) fn collect_record_fields(
     }
 }
 
-pub(super) fn parse_module(
+pub(crate) fn parse_module(
     source_path: &Path,
     source: &str,
 ) -> std::result::Result<(Vec<mondc::sexpr::SExpr>, Vec<mondc::ast::Declaration>), String> {

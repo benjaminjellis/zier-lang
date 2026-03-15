@@ -14,9 +14,10 @@ use tower_lsp::{
         GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
         InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
         MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel,
-        ReferenceParams, RenameParams, ServerCapabilities, SignatureHelp, SignatureHelpParams,
-        SignatureInformation, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-        TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
+        ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult,
+        ServerCapabilities, SignatureHelp, SignatureHelpParams, SignatureInformation,
+        SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
+        WorkspaceEdit, WorkspaceSymbolParams,
     },
 };
 
@@ -28,7 +29,9 @@ use crate::{
     full_text_change, function_arity, local_symbol_at, lsp_documentation, lsp_error_diagnostic,
     position_to_offset,
     project::Project,
-    scheme_for_symbol, signature_target_at,
+    scheme_for_symbol,
+    semantic_tokens::{compute_semantic_tokens_full, semantic_tokens_capabilities},
+    signature_target_at,
     state::{DocumentState, ServerState},
     symbol_at, symbol_documentation_for_symbol, top_level_symbols,
 };
@@ -151,6 +154,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(semantic_tokens_capabilities()),
                 ..ServerCapabilities::default()
             },
             ..InitializeResult::default()
@@ -165,6 +169,28 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let Some(source) = self.document_text(&uri) else {
+            return Ok(None);
+        };
+        let Ok(path) = uri.to_file_path() else {
+            return Ok(None);
+        };
+        let imported_type_decls = self
+            .analyze_document(&uri)
+            .ok()
+            .flatten()
+            .map(|analysis| analysis.imports.imported_type_decls)
+            .unwrap_or_default();
+        let tokens = compute_semantic_tokens_full(&path, &source, &imported_type_decls)
+            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
