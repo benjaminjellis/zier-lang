@@ -620,6 +620,11 @@ fn fmt_generic(items: &[SExpr], source: &str) -> Doc {
     if items.is_empty() {
         return text("()");
     }
+
+    if let Some(chain) = fmt_thin_arrow_chain(items, source) {
+        return chain;
+    }
+
     let head = fmt(&items[0], source);
     if items.len() == 1 {
         return concat_all([text("("), head, text(")")]);
@@ -645,6 +650,54 @@ fn fmt_generic(items: &[SExpr], source: &str) -> Doc {
         nest(2, concat(line(), args_doc)),
         text(")"),
     ]))
+}
+
+fn fmt_thin_arrow_chain(items: &[SExpr], source: &str) -> Option<Doc> {
+    if !items
+        .iter()
+        .any(|item| matches!(item, SExpr::Atom(token) if token.kind == TokenKind::ThinArrow))
+    {
+        return None;
+    }
+
+    let mut segments: Vec<Vec<&SExpr>> = vec![Vec::new()];
+    for item in items {
+        if matches!(item, SExpr::Atom(token) if token.kind == TokenKind::ThinArrow) {
+            if segments
+                .last()
+                .map(|segment| segment.is_empty())
+                .unwrap_or(true)
+            {
+                return None;
+            }
+            segments.push(Vec::new());
+        } else if let Some(segment) = segments.last_mut() {
+            segment.push(item);
+        }
+    }
+
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+
+    let segment_doc = |segment: &[&SExpr]| -> Doc {
+        join(
+            text(" "),
+            segment.iter().map(|expr| fmt(expr, source)).collect(),
+        )
+    };
+
+    let first = segment_doc(&segments[0]);
+    let rest = segments[1..]
+        .iter()
+        .map(|segment| concat(line(), concat_all([text("-> "), segment_doc(segment)])));
+
+    Some(group(concat_all([
+        text("("),
+        first,
+        nest(2, concat_all(rest)),
+        text(")"),
+    ])))
 }
 
 fn is_lambda_expr(expr: &SExpr) -> bool {

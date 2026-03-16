@@ -405,6 +405,20 @@ fn extern_type_sig_flat() {
     assert_eq!(format(src, 100), format!("{src}\n"));
 }
 
+#[test]
+fn extern_type_sig_thin_arrow_breaks_on_arrows() {
+    let src = "(pub extern let select_specific_monitor ~ (Selector 'p -> Monitor -> (Down -> 'p) -> Selector 'p) mond_process_helpers/select_specific_monitor)";
+    let out = format(src, 80);
+    assert!(
+        !out.contains("Selector\n  'p"),
+        "type application should stay together:\n{out}"
+    );
+    assert!(
+        out.contains("\n  -> Monitor"),
+        "expected line break at thin arrow boundaries:\n{out}"
+    );
+}
+
 // ── do ────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -461,4 +475,12 @@ fn extern_type_sig_idempotent() {
     assert!(!out.contains("'k\n"), "type sig is breaking badly:\n{out}");
     let out2 = format(&out, 100);
     assert_eq!(out, out2, "formatter is not idempotent");
+}
+
+#[test]
+fn extern_type_sig_thin_arrow_idempotent() {
+    let src = "(pub extern let select_specific_monitor ~ (Selector 'p -> Monitor -> (Down -> 'p) -> Selector 'p) mond_process_helpers/select_specific_monitor)";
+    let out = format(src, 80);
+    let out2 = format(&out, 80);
+    assert_eq!(out, out2, "thin-arrow formatting is not idempotent");
 }
