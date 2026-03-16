@@ -3,7 +3,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::ast::{Expr, Literal, Pattern, TypeDecl, TypeUsage};
+use crate::ast::{Expr, Literal, MatchArm, Pattern, TypeDecl, TypeUsage};
 
 // ---------------------------------------------------------------------------
 // Internal Type Representation
@@ -1197,16 +1197,15 @@ impl TypeChecker {
         &self,
         subst: &Substitution,
         target_types: &[Rc<Type>],
-        arms: &[(Vec<Pattern>, Expr)],
+        arms: &[MatchArm],
     ) -> Result<(), TypeError> {
         if target_types.len() != 1 {
             return Ok(());
         }
 
-        if arms
-            .iter()
-            .any(|(pats, _)| pats.first().is_some_and(Self::pattern_is_catch_all))
-        {
+        if arms.iter().any(|arm| {
+            arm.guard.is_none() && arm.patterns.first().is_some_and(Self::pattern_is_catch_all)
+        }) {
             return Ok(());
         }
 
@@ -1215,8 +1214,11 @@ impl TypeChecker {
             Type::Con(type_name, args) if type_name == "List" && args.len() == 1 => {
                 let mut has_empty = false;
                 let mut has_cons = false;
-                for (pats, _) in arms {
-                    if let Some(pat) = pats.first() {
+                for arm in arms {
+                    if arm.guard.is_some() {
+                        continue;
+                    }
+                    if let Some(pat) = arm.patterns.first() {
                         has_empty |= Self::pattern_matches_empty_list(pat);
                         has_cons |= Self::pattern_matches_non_empty_list(pat);
                     }
@@ -1237,8 +1239,11 @@ impl TypeChecker {
             Type::Con(type_name, _) if type_name == "Bool" => {
                 let mut seen_true = false;
                 let mut seen_false = false;
-                for (pats, _) in arms {
-                    if let Some(pat) = pats.first() {
+                for arm in arms {
+                    if arm.guard.is_some() {
+                        continue;
+                    }
+                    if let Some(pat) = arm.patterns.first() {
                         seen_true |= Self::pattern_matches_bool(pat, true);
                         seen_false |= Self::pattern_matches_bool(pat, false);
                     }
@@ -1262,8 +1267,11 @@ impl TypeChecker {
                 };
 
                 let mut covered = HashSet::new();
-                for (pats, _) in arms {
-                    if let Some(pat) = pats.first() {
+                for arm in arms {
+                    if arm.guard.is_some() {
+                        continue;
+                    }
+                    if let Some(pat) = arm.patterns.first() {
                         Self::collect_top_level_constructors(pat, &mut covered);
                     }
                 }
@@ -1610,7 +1618,8 @@ impl TypeChecker {
 
                 let result_ty = self.fresh();
 
-                for (arm_index, (pats, body)) in arms.iter().enumerate() {
+                for (arm_index, arm) in arms.iter().enumerate() {
+                    let pats = &arm.patterns;
                     let mut pat_env = apply_subst_env(&subst, env);
                     for (pat, t_target) in pats.iter().zip(target_types.iter()) {
                         let t_target_s = apply_subst(&subst, t_target);
@@ -1623,10 +1632,25 @@ impl TypeChecker {
                     // so pattern-bound variables have their concrete types visible.
                     // Without this, `val` in `(Some val) ~> body` would be Var(?n)
                     // rather than the type inferred from the match target.
+                    let body_env = apply_subst_env(&subst, &pat_env);
+                    let guard_preds = if let Some(guard) = &arm.guard {
+                        let (s_guard, t_guard, guard_preds) = self.infer(&body_env, guard)?;
+                        subst = compose_subst(&s_guard, &subst);
+                        preds = apply_subst_preds(&s_guard, &preds);
+                        let guard_expected = Rc::new(Type::Con("Bool".into(), vec![]));
+                        let guard_found = apply_subst(&subst, &t_guard);
+                        let s_guard_bool = unify(&guard_found, &guard_expected)?;
+                        subst = compose_subst(&s_guard_bool, &subst);
+                        preds = apply_subst_preds(&s_guard_bool, &preds);
+                        apply_subst_preds(&s_guard_bool, &guard_preds)
+                    } else {
+                        vec![]
+                    };
                     let (s_body, t_body, body_preds) =
-                        self.infer(&apply_subst_env(&subst, &pat_env), body)?;
+                        self.infer(&apply_subst_env(&subst, &pat_env), &arm.body)?;
                     subst = compose_subst(&s_body, &subst);
                     preds = apply_subst_preds(&s_body, &preds);
+                    preds.extend(guard_preds);
                     preds.extend(body_preds);
 
                     let expected = apply_subst(&subst, &result_ty);
@@ -3987,6 +4011,20 @@ mod tests {
         let src = "(match 42 n ~> (+ n 1))";
         let ty = check_expr(src).unwrap();
         assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn infer_match_guard_typechecks() {
+        let src = "(match 42 n if (> n 0) ~> n _ ~> 0)";
+        let ty = check_expr(src).unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn reject_match_guard_non_bool() {
+        let src = "(match 42 n if n ~> n _ ~> 0)";
+        let result = check_expr(src);
+        assert!(result.is_err(), "expected non-bool guard to fail");
     }
 
     #[test]

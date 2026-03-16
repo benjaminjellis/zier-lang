@@ -55,6 +55,16 @@ For patterns with multiple cases on one branch you can use `|`
     _                     ~> False))
 ```
 
+Match arms can also use a guard with `if`:
+
+```mond
+(let classify_positive {value}
+  (match value
+    (Some x) if (> x 0) ~> "positive"
+    (Some _)            ~> "non-positive"
+    None                ~> "missing"))
+```
+
 You can also destructure records in `match` arms using named fields:
 
 ```mond

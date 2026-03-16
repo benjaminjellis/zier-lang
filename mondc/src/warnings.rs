@@ -450,10 +450,19 @@ fn collect_match_redundancy_diagnostics_expr(
 
             if targets.len() == 1 {
                 let mut coverage = MatchCoverage::default();
-                for (patterns, body) in arms {
-                    let Some(pattern) = patterns.first() else {
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
                         collect_match_redundancy_diagnostics_expr(
-                            body,
+                            guard,
+                            file_id,
+                            constructor_families,
+                            variant_families,
+                            out,
+                        );
+                    }
+                    let Some(pattern) = arm.patterns.first() else {
+                        collect_match_redundancy_diagnostics_expr(
+                            &arm.body,
                             file_id,
                             constructor_families,
                             variant_families,
@@ -461,6 +470,17 @@ fn collect_match_redundancy_diagnostics_expr(
                         );
                         continue;
                     };
+
+                    if arm.guard.is_some() {
+                        collect_match_redundancy_diagnostics_expr(
+                            &arm.body,
+                            file_id,
+                            constructor_families,
+                            variant_families,
+                            out,
+                        );
+                        continue;
+                    }
 
                     let mut arm_coverage = coverage.clone();
                     let mut has_reachable_alternative = false;
@@ -496,7 +516,7 @@ fn collect_match_redundancy_diagnostics_expr(
                     }
 
                     collect_match_redundancy_diagnostics_expr(
-                        body,
+                        &arm.body,
                         file_id,
                         constructor_families,
                         variant_families,
@@ -504,9 +524,18 @@ fn collect_match_redundancy_diagnostics_expr(
                     );
                 }
             } else {
-                for (_, body) in arms {
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        collect_match_redundancy_diagnostics_expr(
+                            guard,
+                            file_id,
+                            constructor_families,
+                            variant_families,
+                            out,
+                        );
+                    }
                     collect_match_redundancy_diagnostics_expr(
-                        body,
+                        &arm.body,
                         file_id,
                         constructor_families,
                         variant_families,
@@ -626,12 +655,15 @@ fn collect_top_level_refs(
             for target in targets {
                 collect_top_level_refs(target, top_level, locals, out);
             }
-            for (patterns, body) in arms {
+            for arm in arms {
                 let mut arm_locals = locals.clone();
-                for pat in patterns {
+                for pat in &arm.patterns {
                     bind_pattern_names(pat, &mut arm_locals);
                 }
-                collect_top_level_refs(body, top_level, &arm_locals, out);
+                if let Some(guard) = &arm.guard {
+                    collect_top_level_refs(guard, top_level, &arm_locals, out);
+                }
+                collect_top_level_refs(&arm.body, top_level, &arm_locals, out);
             }
         }
         Expr::FieldAccess { record, .. } => {
@@ -724,10 +756,13 @@ fn collect_unused_local_spans(
             for target in targets {
                 free.extend(collect_unused_local_spans(target, out));
             }
-            for (patterns, body) in arms {
-                let mut body_free = collect_unused_local_spans(body, out);
+            for arm in arms {
+                let mut body_free = collect_unused_local_spans(&arm.body, out);
+                if let Some(guard) = &arm.guard {
+                    body_free.extend(collect_unused_local_spans(guard, out));
+                }
                 let mut bound = HashSet::new();
-                for pat in patterns {
+                for pat in &arm.patterns {
                     bind_pattern_names(pat, &mut bound);
                 }
                 for name in bound {
@@ -822,15 +857,18 @@ fn collect_unqualified_free_vars(
             for target in targets {
                 collect_unqualified_free_vars(target, locals, out);
             }
-            for (patterns, body) in arms {
-                for pat in patterns {
+            for arm in arms {
+                for pat in &arm.patterns {
                     collect_pattern_constructor_names(pat, out);
                 }
                 let mut arm_locals = locals.clone();
-                for pat in patterns {
+                for pat in &arm.patterns {
                     bind_pattern_names(pat, &mut arm_locals);
                 }
-                collect_unqualified_free_vars(body, &arm_locals, out);
+                if let Some(guard) = &arm.guard {
+                    collect_unqualified_free_vars(guard, &arm_locals, out);
+                }
+                collect_unqualified_free_vars(&arm.body, &arm_locals, out);
             }
         }
         Expr::FieldAccess { record, .. } => {
@@ -898,8 +936,11 @@ fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
             for target in targets {
                 collect_qualified_module_refs(target, out);
             }
-            for (_, body) in arms {
-                collect_qualified_module_refs(body, out);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_qualified_module_refs(guard, out);
+                }
+                collect_qualified_module_refs(&arm.body, out);
             }
         }
         Expr::FieldAccess { record, .. } => {
@@ -1244,16 +1285,24 @@ fn collect_expr_type_decl_refs(
                     used_record_type_names,
                 );
             }
-            for (patterns, body) in arms {
-                for pat in patterns {
+            for arm in arms {
+                for pat in &arm.patterns {
                     collect_pattern_constructor_names(pat, used_value_names);
                 }
                 let mut arm_locals = locals.clone();
-                for pat in patterns {
+                for pat in &arm.patterns {
                     bind_pattern_names(pat, &mut arm_locals);
                 }
+                if let Some(guard) = &arm.guard {
+                    collect_expr_type_decl_refs(
+                        guard,
+                        &arm_locals,
+                        used_value_names,
+                        used_record_type_names,
+                    );
+                }
                 collect_expr_type_decl_refs(
-                    body,
+                    &arm.body,
                     &arm_locals,
                     used_value_names,
                     used_record_type_names,

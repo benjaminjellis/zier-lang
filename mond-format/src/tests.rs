@@ -105,6 +105,44 @@ fn if_breaks_long() {
     assert!(out.contains('\n'));
 }
 
+#[test]
+fn if_let_inline() {
+    assert_eq!(
+        fmt("(if let [(Some x) maybe] x 0)"),
+        "(if let [(Some x) maybe] x 0)\n"
+    );
+}
+
+#[test]
+fn if_let_legacy_inline_normalises_to_binding_vector() {
+    assert_eq!(
+        fmt("(if let (Some x) maybe x 0)"),
+        "(if let [(Some x) maybe] x 0)\n"
+    );
+}
+
+#[test]
+fn if_let_keeps_head_together_when_wrapped() {
+    let src = "(if let [(Some x) (:selector initialised)] x (process/select (process/new_selector) subject))";
+    let out = fmt(src);
+    assert!(
+        out.starts_with("(if let "),
+        "expected `if let` head to stay together:\n{out}"
+    );
+    assert!(
+        !out.starts_with("(if\n"),
+        "expected formatter to avoid splitting after `if`:\n{out}"
+    );
+}
+
+#[test]
+fn if_let_in_let_binding_indents_branches_deeper() {
+    let src = "(let [selector (if let [(Some x) (:selector initialised)] x (process/select (process/new_selector) subject)) selector (process/map_selector selector Message)] selector)";
+    let out = fmt(src);
+    let expected = "(let [selector (if let [(Some x) (:selector initialised)]\n                 x\n                 (process/select (process/new_selector) subject))\n      selector (process/map_selector selector Message)]\n  selector)\n";
+    assert_eq!(out, expected);
+}
+
 // ── match ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -129,6 +167,14 @@ fn match_constructor_arm() {
     assert!(out.contains("~>"));
     assert!(out.contains("None ~> 0"));
     assert!(out.contains("(Some v) ~> v"));
+}
+
+#[test]
+fn match_guard_arm_formats_inline() {
+    let src = "(match x (Some v) if (> v 0) ~> v _ ~> 0)";
+    let out = fmt(src);
+    let expected = "(match x\n  (Some v) if (> v 0) ~> v\n  _ ~> 0)\n";
+    assert_eq!(out, expected);
 }
 
 #[test]

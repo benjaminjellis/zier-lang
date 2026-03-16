@@ -128,7 +128,7 @@ pub enum Expr {
     },
     Match {
         targets: Vec<Expr>,
-        arms: Vec<(Vec<Pattern>, Expr)>,
+        arms: Vec<MatchArm>,
         span: Range<usize>,
     },
     FieldAccess {
@@ -164,6 +164,13 @@ pub enum Expr {
         /// Span of just the `module/function` ident token (for diagnostics).
         fn_span: Range<usize>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub patterns: Vec<Pattern>,
+    pub guard: Option<Expr>,
+    pub body: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]

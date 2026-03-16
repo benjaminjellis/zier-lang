@@ -280,12 +280,15 @@ impl TokenCollector {
                 for target in targets {
                     self.collect_expr(source, target, locals);
                 }
-                for (pats, body) in arms {
+                for arm in arms {
                     let mut inner = locals.clone();
-                    for pat in pats {
+                    for pat in &arm.patterns {
                         self.bind_pattern_locals(source, pat, &mut inner);
                     }
-                    self.collect_expr(source, body, &inner);
+                    if let Some(guard) = &arm.guard {
+                        self.collect_expr(source, guard, &inner);
+                    }
+                    self.collect_expr(source, &arm.body, &inner);
                 }
             }
             Expr::FieldAccess { record, .. } => {

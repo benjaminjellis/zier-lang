@@ -8,10 +8,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
 
-use crate::MANIFEST_NAME;
-
-const STD_GIT_URL: &str = "git@github.com:benjaminjellis/mond-std.git";
-const STD_GIT_TAG: &str = "0.0.4";
+use crate::{MANIFEST_NAME, STD_GIT_TAG, STD_GIT_URL};
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct BahnManifest {

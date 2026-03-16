@@ -443,6 +443,31 @@ fn fmt_type_body(items: &[SExpr], source: &str) -> Doc {
 
 fn fmt_if(rest: &[SExpr], source: &str) -> Doc {
     match rest {
+        [SExpr::Atom(let_tok), binding @ SExpr::Square(..), then, els]
+            if let_tok.kind == TokenKind::Let =>
+        {
+            align(group(concat_all([
+                text("(if let "),
+                fmt(binding, source),
+                nest(
+                    2,
+                    concat_all([line(), fmt(then, source), line(), fmt(els, source)]),
+                ),
+                text(")"),
+            ])))
+        }
+        // Legacy form kept for now; formatter normalises it to `[pattern value]`.
+        [SExpr::Atom(let_tok), pat, val, then, els] if let_tok.kind == TokenKind::Let => {
+            align(group(concat_all([
+                text("(if let "),
+                fmt_if_let_binding(pat, val, source),
+                nest(
+                    2,
+                    concat_all([line(), fmt(then, source), line(), fmt(els, source)]),
+                ),
+                text(")"),
+            ])))
+        }
         [cond, then, els] => group(concat_all([
             text("(if "),
             fmt(cond, source),
@@ -454,6 +479,18 @@ fn fmt_if(rest: &[SExpr], source: &str) -> Doc {
         ])),
         _ => fmt_generic_with_head("if", rest, source),
     }
+}
+
+fn fmt_if_let_binding(pattern: &SExpr, value: &SExpr, source: &str) -> Doc {
+    group(concat_all([
+        text("["),
+        align(concat_all([
+            fmt(pattern, source),
+            line(),
+            fmt(value, source),
+        ])),
+        text("]"),
+    ]))
 }
 
 // ── f (lambda) ───────────────────────────────────────────────────────────────
@@ -537,16 +574,21 @@ fn fmt_match(rest: &[SExpr], source: &str) -> Doc {
 
     let arm_docs: Vec<Doc> = arms
         .into_iter()
-        .map(|(pats, body)| {
+        .map(|(pats, guard, body)| {
             let pat_doc = join(text(" "), pats.iter().map(|s| fmt(s, source)).collect());
+            let head_doc = if let Some(guard) = guard {
+                concat_all([pat_doc, text(" if "), fmt(guard, source)])
+            } else {
+                pat_doc
+            };
             if arm_body_forces_line_break(body) {
                 concat_all([
-                    pat_doc,
+                    head_doc,
                     text(" ~>"),
                     nest(2, concat(line(), fmt(body, source))),
                 ])
             } else {
-                concat_all([pat_doc, text(" ~> "), fmt(body, source)])
+                concat_all([head_doc, text(" ~> "), fmt(body, source)])
             }
         })
         .collect();
@@ -577,8 +619,8 @@ fn arm_body_forces_line_break(body: &SExpr) -> bool {
     matches!(head.kind, TokenKind::Match | TokenKind::Do)
 }
 
-/// Split a flat SExpr sequence into match arms: `(patterns, body)`.
-fn collect_match_arms(items: &[SExpr]) -> Vec<(Vec<&SExpr>, &SExpr)> {
+/// Split a flat SExpr sequence into match arms: `(patterns, guard, body)`.
+fn collect_match_arms(items: &[SExpr]) -> Vec<(Vec<&SExpr>, Option<&SExpr>, &SExpr)> {
     let mut arms = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -593,14 +635,21 @@ fn collect_match_arms(items: &[SExpr]) -> Vec<(Vec<&SExpr>, &SExpr)> {
         if i >= items.len() {
             break;
         }
+        let (patterns, guard) = if pat.len() >= 2
+            && matches!(&pat[pat.len() - 2], SExpr::Atom(t) if t.kind == TokenKind::If)
+        {
+            (pat[..pat.len() - 2].to_vec(), Some(pat[pat.len() - 1]))
+        } else {
+            (pat, None)
+        };
         i += 1; // skip `~>`
         if i >= items.len() {
             break;
         }
         let body = &items[i];
         i += 1;
-        if !pat.is_empty() {
-            arms.push((pat, body));
+        if !patterns.is_empty() {
+            arms.push((patterns, guard, body));
         }
     }
     arms

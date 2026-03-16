@@ -472,11 +472,27 @@ fn lower_expr_with_renames(
                 )
             };
 
+            if arms.iter().any(|arm| arm.guard.is_some()) {
+                let scrutinee_var = format!("MatchScrut{}__", *fresh_idx);
+                *fresh_idx += 1;
+                let scrutinee_ref = ir::Expr::Var(scrutinee_var.clone());
+                let clauses = lower_match_case_clauses(
+                    targets.len(),
+                    arms,
+                    &scrutinee_ref,
+                    ctx,
+                    renames,
+                    fresh_idx,
+                );
+                let case_expr = ir::Expr::Case(Box::new(scrutinee_ref.clone()), clauses);
+                return ir::Expr::Let(scrutinee_var, Box::new(scrutinee), Box::new(case_expr));
+            }
+
             let mut ir_arms = Vec::new();
-            for (patterns, body) in arms {
+            for arm in arms {
                 let mut arm_renames = renames.clone();
                 let mut pattern_renames: HashMap<String, String> = HashMap::new();
-                for pat in patterns {
+                for pat in &arm.patterns {
                     let mut names = Vec::new();
                     collect_pattern_vars(pat, &mut names);
                     for name in names {
@@ -490,12 +506,12 @@ fn lower_expr_with_renames(
                     }
                 }
                 arm_renames.extend(pattern_renames.clone());
-                let body_ir = lower_expr_with_renames(body, ctx, &arm_renames, fresh_idx);
+                let body_ir = lower_expr_with_renames(&arm.body, ctx, &arm_renames, fresh_idx);
                 let pat = if targets.len() == 1 {
-                    lower_pattern(&patterns[0], ctx, &pattern_renames)
+                    lower_pattern(&arm.patterns[0], ctx, &pattern_renames)
                 } else {
                     ir::Pattern::Tuple(
-                        patterns
+                        arm.patterns
                             .iter()
                             .map(|p| lower_pattern(p, ctx, &pattern_renames))
                             .collect(),
@@ -915,6 +931,88 @@ fn lower_pattern(pat: &ast::Pattern, ctx: &Ctx, renames: &HashMap<String, String
     }
 }
 
+fn lower_match_case_clauses(
+    targets_len: usize,
+    arms: &[ast::MatchArm],
+    scrutinee_ref: &ir::Expr,
+    ctx: &Ctx,
+    renames: &HashMap<String, String>,
+    fresh_idx: &mut usize,
+) -> Vec<(ir::Pattern, ir::Expr)> {
+    let Some(first) = arms.first() else {
+        return vec![(ir::Pattern::Any, match_case_clause_error(scrutinee_ref))];
+    };
+
+    let rest = lower_match_case_clauses(
+        targets_len,
+        &arms[1..],
+        scrutinee_ref,
+        ctx,
+        renames,
+        fresh_idx,
+    );
+
+    let mut arm_renames = renames.clone();
+    let mut pattern_renames: HashMap<String, String> = HashMap::new();
+    for pat in &first.patterns {
+        let mut names = Vec::new();
+        collect_pattern_vars(pat, &mut names);
+        for name in names {
+            if let std::collections::hash_map::Entry::Vacant(v) =
+                pattern_renames.entry(name.clone())
+            {
+                let fresh = format!("{}__p{}", var_name(&name), *fresh_idx);
+                *fresh_idx += 1;
+                v.insert(fresh);
+            }
+        }
+    }
+    arm_renames.extend(pattern_renames.clone());
+
+    let body_ir = lower_expr_with_renames(&first.body, ctx, &arm_renames, fresh_idx);
+    let guarded_body = if let Some(guard) = &first.guard {
+        let guard_ir = lower_expr_with_renames(guard, ctx, &arm_renames, fresh_idx);
+        let fallback = ir::Expr::Case(Box::new(scrutinee_ref.clone()), rest.clone());
+        ir::Expr::Case(
+            Box::new(guard_ir),
+            vec![
+                (ir::Pattern::Atom("true".into()), body_ir),
+                (ir::Pattern::Any, fallback),
+            ],
+        )
+    } else {
+        body_ir
+    };
+
+    let pat = if targets_len == 1 {
+        lower_pattern(&first.patterns[0], ctx, &pattern_renames)
+    } else {
+        ir::Pattern::Tuple(
+            first
+                .patterns
+                .iter()
+                .map(|p| lower_pattern(p, ctx, &pattern_renames))
+                .collect(),
+        )
+    };
+
+    let mut clauses = Vec::new();
+    expand_or_pattern(pat, guarded_body, &mut clauses);
+    clauses.extend(rest);
+    clauses
+}
+
+fn match_case_clause_error(scrutinee_ref: &ir::Expr) -> ir::Expr {
+    ir::Expr::RemoteCall(
+        "erlang".into(),
+        "error".into(),
+        vec![ir::Expr::Tuple(vec![
+            ir::Expr::Atom("case_clause".into()),
+            scrutinee_ref.clone(),
+        ])],
+    )
+}
+
 fn collect_pattern_vars(pat: &ast::Pattern, out: &mut Vec<String>) {
     match pat {
         ast::Pattern::Variable(name, _) => {
@@ -1088,7 +1186,7 @@ fn collect_lets(expr: &ir::Expr) -> (Vec<(&str, &ir::Expr)>, &ir::Expr) {
 
 fn emit_expr(expr: &ir::Expr) -> String {
     match expr {
-        ir::Expr::Atom(s) => s.clone(),
+        ir::Expr::Atom(s) => quote_atom(s),
         ir::Expr::Int(n) => n.to_string(),
         ir::Expr::Float(f) => format!("{f}"),
         ir::Expr::Str(s) => format!("<<\"{}\"/utf8>>", escape_str(s)),
@@ -1189,7 +1287,7 @@ fn emit_pattern(pat: &ir::Pattern) -> String {
     match pat {
         ir::Pattern::Any => "_".to_string(),
         ir::Pattern::Var(s) => s.clone(),
-        ir::Pattern::Atom(s) => s.clone(),
+        ir::Pattern::Atom(s) => quote_atom(s),
         ir::Pattern::Int(n) => n.to_string(),
         ir::Pattern::Float(f) => format!("{f}"),
         ir::Pattern::Str(s) => format!("<<\"{}\"/utf8>>", escape_str(s)),
@@ -1225,6 +1323,8 @@ fn emit_pattern(pat: &ir::Pattern) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{emit_expr, emit_pattern};
+    use crate::ir;
 
     #[test]
     fn multi_arg_tco_emits_two_functions() {
@@ -1384,6 +1484,24 @@ mod tests {
         assert!(
             erl.contains("initialised -> erlang:setelement(2"),
             "expected Initialised selector update index in dispatch:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn emit_atom_quotes_non_identifier_atoms() {
+        assert_eq!(emit_expr(&ir::Expr::Atom("ok".into())), "ok");
+        assert_eq!(
+            emit_expr(&ir::Expr::Atom("map/takeresult".into())),
+            "'map/takeresult'"
+        );
+    }
+
+    #[test]
+    fn emit_pattern_quotes_non_identifier_atoms() {
+        assert_eq!(emit_pattern(&ir::Pattern::Atom("none".into())), "none");
+        assert_eq!(
+            emit_pattern(&ir::Pattern::Atom("map/takeresult".into())),
+            "'map/takeresult'"
         );
     }
 }

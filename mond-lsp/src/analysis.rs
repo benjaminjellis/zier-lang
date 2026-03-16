@@ -872,12 +872,16 @@ pub(super) fn local_names_in_expr(
             .iter()
             .find_map(|target| local_names_in_expr(target, offset, locals))
             .or_else(|| {
-                arms.iter().find_map(|(pats, body)| {
+                arms.iter().find_map(|arm| {
                     let mut inner = locals.clone();
-                    for pat in pats {
+                    for pat in &arm.patterns {
                         bind_pattern_names(pat, &mut inner);
                     }
-                    local_names_in_expr(body, offset, &inner)
+                    local_names_in_expr(&arm.body, offset, &inner).or_else(|| {
+                        arm.guard
+                            .as_ref()
+                            .and_then(|guard| local_names_in_expr(guard, offset, &inner))
+                    })
                 })
             })
             .or_else(|| Some(locals.clone())),
@@ -1115,19 +1119,31 @@ pub(super) fn signature_target_in_expr(
                 signature_target_in_expr(target, current_module, top_level, imports, offset, locals)
             })
             .or_else(|| {
-                arms.iter().find_map(|(pats, body)| {
+                arms.iter().find_map(|arm| {
                     let mut inner = locals.clone();
-                    for pat in pats {
+                    for pat in &arm.patterns {
                         bind_pattern_names(pat, &mut inner);
                     }
                     signature_target_in_expr(
-                        body,
+                        &arm.body,
                         current_module,
                         top_level,
                         imports,
                         offset,
                         &inner,
                     )
+                    .or_else(|| {
+                        arm.guard.as_ref().and_then(|guard| {
+                            signature_target_in_expr(
+                                guard,
+                                current_module,
+                                top_level,
+                                imports,
+                                offset,
+                                &inner,
+                            )
+                        })
+                    })
                 })
             }),
         Expr::FieldAccess { record, .. } => {
@@ -1642,12 +1658,29 @@ pub(super) fn collect_expr_occurrences(
             for target in targets {
                 collect_expr_occurrences(target, current_module, top_level, imports, locals, out);
             }
-            for (pats, body) in arms {
+            for arm in arms {
                 let mut inner = locals.clone();
-                for pat in pats {
+                for pat in &arm.patterns {
                     bind_pattern_names(pat, &mut inner);
                 }
-                collect_expr_occurrences(body, current_module, top_level, imports, &inner, out);
+                if let Some(guard) = &arm.guard {
+                    collect_expr_occurrences(
+                        guard,
+                        current_module,
+                        top_level,
+                        imports,
+                        &inner,
+                        out,
+                    );
+                }
+                collect_expr_occurrences(
+                    &arm.body,
+                    current_module,
+                    top_level,
+                    imports,
+                    &inner,
+                    out,
+                );
             }
         }
         Expr::FieldAccess { record, .. } => {
@@ -1787,12 +1820,16 @@ pub(super) fn hover_target_in_expr(
             .iter()
             .find_map(|target| hover_target_in_expr(target, offset, locals))
             .or_else(|| {
-                arms.iter().find_map(|(pats, body)| {
+                arms.iter().find_map(|arm| {
                     let mut inner = locals.clone();
-                    for pat in pats {
+                    for pat in &arm.patterns {
                         bind_pattern_names(pat, &mut inner);
                     }
-                    hover_target_in_expr(body, offset, &inner)
+                    hover_target_in_expr(&arm.body, offset, &inner).or_else(|| {
+                        arm.guard
+                            .as_ref()
+                            .and_then(|guard| hover_target_in_expr(guard, offset, &inner))
+                    })
                 })
             }),
         Expr::FieldAccess { record, .. } => hover_target_in_expr(record, offset, locals),
@@ -1954,12 +1991,15 @@ pub(super) fn collect_local_occurrences_in_expr(
             for target in targets {
                 collect_local_occurrences_in_expr(target, locals, out);
             }
-            for (pats, body) in arms {
+            for arm in arms {
                 let mut inner = locals.clone();
-                for pat in pats {
+                for pat in &arm.patterns {
                     bind_pattern_locals(pat, &mut inner, out);
                 }
-                collect_local_occurrences_in_expr(body, &inner, out);
+                if let Some(guard) = &arm.guard {
+                    collect_local_occurrences_in_expr(guard, &inner, out);
+                }
+                collect_local_occurrences_in_expr(&arm.body, &inner, out);
             }
         }
         Expr::FieldAccess { record, .. } => {

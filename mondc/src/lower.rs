@@ -4,7 +4,10 @@ use codespan_reporting::{
 };
 
 use crate::{
-    ast::{Declaration, Expr, Literal, Pattern, TypeDecl, TypeSig, TypeUsage, UnqualifiedImports},
+    ast::{
+        Declaration, Expr, Literal, MatchArm, Pattern, TypeDecl, TypeSig, TypeUsage,
+        UnqualifiedImports,
+    },
     lexer::{Token, TokenKind},
     sexpr::SExpr,
 };
@@ -898,7 +901,18 @@ impl Lowerer {
 
             Expr::Match {
                 targets: vec![val],
-                arms: vec![(vec![ok_pat], inner), (vec![error_pat], error_expr)],
+                arms: vec![
+                    MatchArm {
+                        patterns: vec![ok_pat],
+                        guard: None,
+                        body: inner,
+                    },
+                    MatchArm {
+                        patterns: vec![error_pat],
+                        guard: None,
+                        body: error_expr,
+                    },
+                ],
                 span: span.clone(),
             }
         });
@@ -1841,17 +1855,44 @@ impl Lowerer {
         // first_arrow is index within items[1..], so absolute index = first_arrow + 1.
         let first_arrow_abs = first_arrow + 1;
 
-        // items[1..first_arrow_abs] are targets + first-arm patterns.
+        // items[1..first_arm_head_end] are targets + first-arm patterns.
+        // If the first arm has a guard (`... if <expr> ~>`), strip the guard
+        // marker and expression from this prefix before inferring target count.
+        let mut first_arm_head_end = first_arrow_abs;
+        if first_arm_head_end >= 2
+            && matches!(
+                items.get(first_arm_head_end - 1),
+                Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::If)
+            )
+        {
+            let if_span = items[first_arm_head_end - 1].span();
+            self.error(
+                Diagnostic::error()
+                    .with_message("missing guard expression after `if` in match arm")
+                    .with_labels(vec![Label::primary(file_id, if_span)]),
+            );
+            return None;
+        }
+        if first_arm_head_end >= 3
+            && matches!(
+                items.get(first_arm_head_end - 2),
+                Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::If)
+            )
+        {
+            first_arm_head_end -= 2;
+        }
+
         // Detect or-patterns: if any match-alternative separator appears
         // before the first arrow, single-target mode.
-        let has_or = items[1..first_arrow_abs]
+        let has_or = items[1..first_arm_head_end]
             .iter()
             .any(|s| self.is_match_alt_separator(file_id, s));
 
         let n_targets = if has_or {
             1
         } else {
-            let n_items = first_arrow_abs - 1; // items between 'match' and first arrow
+            // items between 'match' and first arm arrow, excluding optional guard prefix
+            let n_items = first_arm_head_end - 1;
             if n_items == 0 || n_items % 2 != 0 {
                 self.error(
                     Diagnostic::error()
@@ -1926,6 +1967,26 @@ impl Lowerer {
                 arm_patterns.push(final_pat);
             }
 
+            // Optional guard: `... if <guard-expr> ~> ...`
+            let guard = match items.get(cursor) {
+                Some(SExpr::Atom(token)) if matches!(token.kind, TokenKind::If) => {
+                    let if_span = token.span.clone();
+                    cursor += 1;
+                    let Some(guard_sexpr) = items.get(cursor) else {
+                        self.error(
+                            Diagnostic::error()
+                                .with_message("missing guard expression after `if` in match arm")
+                                .with_labels(vec![Label::primary(file_id, if_span)]),
+                        );
+                        return None;
+                    };
+                    let guard = self.lower_expr(file_id, guard_sexpr)?;
+                    cursor += 1;
+                    Some(guard)
+                }
+                _ => None,
+            };
+
             // Expect and consume '~>'.
             match items.get(cursor) {
                 Some(SExpr::Atom(token)) if matches!(token.kind, TokenKind::Arrow) => {
@@ -1965,10 +2026,7 @@ impl Lowerer {
             if let Some(next) = items.get(cursor)
                 && matches!(next, SExpr::Round(..))
             {
-                let next_has_arrow = items
-                    .get(cursor + n_targets)
-                    .map(|s| matches!(s, SExpr::Atom(t) if matches!(t.kind, TokenKind::Arrow)))
-                    .unwrap_or(false);
+                let next_has_arrow = self.looks_like_match_arm_start(items, cursor, n_targets);
                 if !next_has_arrow {
                     self.error(
                         Diagnostic::error()
@@ -1985,7 +2043,11 @@ impl Lowerer {
                 }
             }
 
-            arms.push((arm_patterns, body));
+            arms.push(MatchArm {
+                patterns: arm_patterns,
+                guard,
+                body,
+            });
         }
 
         Some(Expr::Match {
@@ -2001,6 +2063,33 @@ impl Lowerer {
         };
         matches!(token.kind, TokenKind::Operator)
             && self.source_at(file_id, token.span.clone()) == "|"
+    }
+
+    fn looks_like_match_arm_start(&self, items: &[SExpr], cursor: usize, n_targets: usize) -> bool {
+        let mut idx = cursor;
+
+        for _ in 0..n_targets {
+            if idx >= items.len() {
+                return false;
+            }
+            idx += 1;
+        }
+
+        if matches!(
+            items.get(idx),
+            Some(SExpr::Atom(token)) if matches!(token.kind, TokenKind::If)
+        ) {
+            idx += 1;
+            if idx >= items.len() {
+                return false;
+            }
+            idx += 1;
+        }
+
+        matches!(
+            items.get(idx),
+            Some(SExpr::Atom(token)) if matches!(token.kind, TokenKind::Arrow)
+        )
     }
 
     fn lower_pattern(&mut self, file_id: usize, sexpr: &SExpr) -> Option<Pattern> {
@@ -2202,6 +2291,130 @@ impl Lowerer {
     }
 
     fn lower_if(&mut self, file_id: usize, items: &[SExpr], span: Range<usize>) -> Option<Expr> {
+        // if-let form:
+        //   (if let [<pattern> <value>] <then> <else>)
+        // Desugars to:
+        //   (match <value> <pattern> ~> <then> _ ~> <else>)
+        let is_if_let = matches!(
+            items.get(1),
+            Some(SExpr::Atom(t)) if matches!(t.kind, TokenKind::Let)
+        );
+        if is_if_let {
+            match items {
+                // Canonical form: (if let [pattern value] then else)
+                [
+                    _,
+                    SExpr::Atom(let_tok),
+                    SExpr::Square(binding, binding_span),
+                    then_expr,
+                    else_expr,
+                ] if let_tok.kind == TokenKind::Let => {
+                    if binding.len() != 2 {
+                        self.error(
+                            Diagnostic::error()
+                                .with_code("E005")
+                                .with_message("invalid if let binding")
+                                .with_labels(vec![Label::primary(file_id, binding_span.clone())
+                                    .with_message("expected [<pattern> <value>]")])
+                                .with_notes(vec![
+                                    "help: the syntax is (if let [<pattern> <value>] <then-branch> <else-branch>)"
+                                        .into(),
+                                ]),
+                        );
+                        return None;
+                    }
+
+                    let pattern = self.lower_pattern(file_id, &binding[0])?;
+                    let target = self.lower_expr(file_id, &binding[1])?;
+                    let then = self.lower_expr(file_id, then_expr)?;
+                    let els = self.lower_expr(file_id, else_expr)?;
+
+                    return Some(Expr::Match {
+                        targets: vec![target],
+                        arms: vec![
+                            MatchArm {
+                                patterns: vec![pattern],
+                                guard: None,
+                                body: then,
+                            },
+                            MatchArm {
+                                patterns: vec![Pattern::Any(span.clone())],
+                                guard: None,
+                                body: els,
+                            },
+                        ],
+                        span,
+                    });
+                }
+
+                // Legacy form (supported for compatibility):
+                //   (if let <pattern> <value> <then> <else>)
+                [
+                    _,
+                    SExpr::Atom(let_tok),
+                    pattern_expr,
+                    target_expr,
+                    then_expr,
+                    else_expr,
+                ] if let_tok.kind == TokenKind::Let
+                    && !matches!(pattern_expr, SExpr::Square(_, _)) =>
+                {
+                    let pattern = self.lower_pattern(file_id, pattern_expr)?;
+                    let target = self.lower_expr(file_id, target_expr)?;
+                    let then = self.lower_expr(file_id, then_expr)?;
+                    let els = self.lower_expr(file_id, else_expr)?;
+
+                    return Some(Expr::Match {
+                        targets: vec![target],
+                        arms: vec![
+                            MatchArm {
+                                patterns: vec![pattern],
+                                guard: None,
+                                body: then,
+                            },
+                            MatchArm {
+                                patterns: vec![Pattern::Any(span.clone())],
+                                guard: None,
+                                body: els,
+                            },
+                        ],
+                        span,
+                    });
+                }
+
+                [_, SExpr::Atom(let_tok), binding, _, _] if let_tok.kind == TokenKind::Let => {
+                    self.error(
+                        Diagnostic::error()
+                            .with_code("E005")
+                            .with_message("invalid if let binding")
+                            .with_labels(vec![Label::primary(file_id, binding.span())
+                                .with_message("expected [<pattern> <value>]")])
+                            .with_notes(vec![
+                                "help: the syntax is (if let [<pattern> <value>] <then-branch> <else-branch>)"
+                                    .into(),
+                            ]),
+                    );
+                    return None;
+                }
+
+                _ => {
+                    let actual_args = if items.is_empty() { 0 } else { items.len() - 1 };
+                    self.error(
+                        Diagnostic::error()
+                            .with_code("E005")
+                            .with_message("wrong number of arguments for 'if let'")
+                            .with_labels(vec![Label::primary(file_id, span.clone()).with_message(
+                                format!("expected 4 arguments, found {}", actual_args),
+                            )])
+                            .with_notes(vec![
+                                "help: the syntax is (if let [<pattern> <value>] <then-branch> <else-branch>)".into(),
+                            ]),
+                    );
+                    return None;
+                }
+            }
+        }
+
         // 1. Validation: (if cond then else) has 4 elements total
         if items.len() != 4 {
             let actual_args = if items.is_empty() { 0 } else { items.len() - 1 };
@@ -2863,6 +3076,50 @@ mod tests {
     }
 
     #[test]
+    fn test_valid_if_let_desugars_to_match() {
+        let (mut lowerer, file_id, sexprs) = setup("(if let [(Some x) maybe] x 0)");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+
+        if let Expr::Match { targets, arms, .. } = expr {
+            assert_eq!(targets.len(), 1);
+            assert!(matches!(targets[0], Expr::Variable(ref n, _) if n == "maybe"));
+            assert_eq!(arms.len(), 2);
+
+            match &arms[0].patterns[0] {
+                Pattern::Constructor(name, args, _) => {
+                    assert_eq!(name, "Some");
+                    assert!(matches!(
+                        args.first(),
+                        Some(Pattern::Variable(name, _)) if name == "x"
+                    ));
+                }
+                other => panic!("expected constructor pattern in if-let arm, got {other:?}"),
+            }
+
+            assert!(matches!(arms[0].body, Expr::Variable(ref n, _) if n == "x"));
+            assert!(matches!(arms[1].patterns[0], Pattern::Any(_)));
+            assert!(matches!(arms[1].body, Expr::Literal(Literal::Int(0), _)));
+        } else {
+            panic!("Expected Expr::Match desugaring for if-let");
+        }
+    }
+
+    #[test]
+    fn test_valid_if_let_legacy_syntax_desugars_to_match() {
+        let (mut lowerer, file_id, sexprs) = setup("(if let (Some x) maybe x 0)");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+
+        assert!(
+            matches!(expr, Expr::Match { .. }),
+            "Expected Expr::Match desugaring for legacy if-let syntax"
+        );
+    }
+
+    #[test]
     fn test_error_reporting_on_invalid_if() {
         // 'if' with missing else branch
         let (mut lowerer, file_id, sexprs) = setup("(if True 1)");
@@ -2873,6 +3130,25 @@ mod tests {
             lowerer.diagnostics[0].message,
             "wrong number of arguments for 'if'"
         );
+    }
+
+    #[test]
+    fn test_error_reporting_on_invalid_if_let_arity() {
+        let (mut lowerer, file_id, sexprs) = setup("(if let [(Some x) maybe] x)");
+        let _ = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "wrong number of arguments for 'if let'"
+        );
+    }
+
+    #[test]
+    fn test_error_reporting_on_invalid_if_let_binding_shape() {
+        let (mut lowerer, file_id, sexprs) = setup("(if let [(Some x)] x 0)");
+        let _ = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(lowerer.diagnostics[0].message, "invalid if let binding");
     }
 
     #[test]
@@ -3026,7 +3302,7 @@ mod tests {
         if let Expr::Match { arms, .. } = expr {
             assert_eq!(arms.len(), 1);
             assert!(
-                matches!(arms[0].0[0], Pattern::Any(_)),
+                matches!(arms[0].patterns[0], Pattern::Any(_)),
                 "expected Any pattern"
             );
         } else {
@@ -3042,9 +3318,15 @@ mod tests {
             .expect("lowering failed");
         if let Expr::Match { arms, .. } = expr {
             assert_eq!(arms.len(), 3);
-            assert!(matches!(arms[0].0[0], Pattern::Literal(Literal::Int(0), _)));
-            assert!(matches!(arms[1].0[0], Pattern::Literal(Literal::Int(1), _)));
-            assert!(matches!(arms[2].0[0], Pattern::Any(_)));
+            assert!(matches!(
+                arms[0].patterns[0],
+                Pattern::Literal(Literal::Int(0), _)
+            ));
+            assert!(matches!(
+                arms[1].patterns[0],
+                Pattern::Literal(Literal::Int(1), _)
+            ));
+            assert!(matches!(arms[2].patterns[0], Pattern::Any(_)));
         } else {
             panic!("expected Match");
         }
@@ -3127,7 +3409,7 @@ mod tests {
             .expect("lowering failed");
 
         if let Expr::Match { arms, .. } = expr {
-            if let Pattern::Constructor(name, args, _) = &arms[0].0[0] {
+            if let Pattern::Constructor(name, args, _) = &arms[0].patterns[0] {
                 assert_eq!(name, "Some");
                 assert_eq!(args.len(), 1);
             } else {
@@ -3329,6 +3611,38 @@ mod tests {
     }
 
     #[test]
+    fn test_match_guard_lowers_on_arm() {
+        let src = "(match x (Some y) if (> y 0) ~> y _ ~> 0)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        if let Expr::Match { arms, .. } = expr {
+            assert_eq!(arms.len(), 2);
+            assert!(arms[0].guard.is_some(), "expected first arm guard");
+            assert!(arms[1].guard.is_none(), "expected second arm without guard");
+        } else {
+            panic!("expected Match");
+        }
+    }
+
+    #[test]
+    fn test_match_guard_requires_expression_after_if() {
+        let src = "(match x (Some y) if ~> y _ ~> 0)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let _ = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(!lowerer.diagnostics.is_empty());
+        assert!(
+            lowerer.diagnostics[0]
+                .message
+                .contains("missing guard expression after `if`"),
+            "unexpected diagnostic: {}",
+            lowerer.diagnostics[0].message
+        );
+    }
+
+    #[test]
     fn test_do_sequences_expressions() {
         let src = "(let f {} (do (g 1) (h 2) (i 3)))";
         let (mut lowerer, file_id, sexprs) = setup(src);
@@ -3391,7 +3705,7 @@ mod tests {
             .expect("lowering failed");
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
-            assert!(matches!(arms[0].0[0], Pattern::Variable(ref s, _) if s == "n"));
+            assert!(matches!(arms[0].patterns[0], Pattern::Variable(ref s, _) if s == "n"));
         } else {
             panic!("expected Match");
         }
@@ -3407,11 +3721,11 @@ mod tests {
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
             assert!(matches!(
-                arms[0].0[0],
+                arms[0].patterns[0],
                 Pattern::Literal(Literal::Bool(true), _)
             ));
             assert!(matches!(
-                arms[1].0[0],
+                arms[1].patterns[0],
                 Pattern::Literal(Literal::Bool(false), _)
             ));
         } else {
@@ -3430,10 +3744,10 @@ mod tests {
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
             assert!(
-                matches!(&arms[0].0[0], Pattern::Constructor(name, args, _) if name == "None" && args.is_empty())
+                matches!(&arms[0].patterns[0], Pattern::Constructor(name, args, _) if name == "None" && args.is_empty())
             );
             assert!(
-                matches!(&arms[1].0[0], Pattern::Constructor(name, args, _) if name == "Some" && args.len() == 1)
+                matches!(&arms[1].patterns[0], Pattern::Constructor(name, args, _) if name == "Some" && args.len() == 1)
             );
         } else {
             panic!("expected Match");
@@ -3449,7 +3763,7 @@ mod tests {
             .expect("lowering failed");
         assert!(lowerer.diagnostics.is_empty());
         if let Expr::Match { arms, .. } = expr {
-            match &arms[0].0[0] {
+            match &arms[0].patterns[0] {
                 Pattern::Record { name, fields, .. } => {
                     assert_eq!(name, "Person");
                     assert_eq!(fields.len(), 2);
@@ -3474,7 +3788,7 @@ mod tests {
             .expect("lowering failed");
         assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
         if let Expr::Match { arms, .. } = expr {
-            match &arms[0].0[0] {
+            match &arms[0].patterns[0] {
                 Pattern::Cons(head, tail, _) => {
                     assert!(matches!(head.as_ref(), Pattern::Variable(name, _) if name == "t"));
                     assert!(matches!(tail.as_ref(), Pattern::EmptyList(_)));
@@ -3495,7 +3809,7 @@ mod tests {
             .expect("lowering failed");
         assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
         if let Expr::Match { arms, .. } = expr {
-            match &arms[0].0[0] {
+            match &arms[0].patterns[0] {
                 Pattern::Cons(first_head, first_tail, _) => {
                     assert!(
                         matches!(first_head.as_ref(), Pattern::Variable(name, _) if name == "h")
@@ -3534,8 +3848,8 @@ mod tests {
         if let Expr::Match { targets, arms, .. } = expr {
             assert_eq!(targets.len(), 1);
             assert_eq!(arms.len(), 2);
-            assert!(matches!(&arms[0].0[0], Pattern::Or(pats, _) if pats.len() == 3));
-            assert!(matches!(&arms[1].0[0], Pattern::Any(_)));
+            assert!(matches!(&arms[0].patterns[0], Pattern::Or(pats, _) if pats.len() == 3));
+            assert!(matches!(&arms[1].patterns[0], Pattern::Any(_)));
         } else {
             panic!("expected Match");
         }
@@ -3572,17 +3886,17 @@ mod tests {
         if let Expr::Match { targets, arms, .. } = expr {
             assert_eq!(targets.len(), 2);
             assert_eq!(arms.len(), 2);
-            assert_eq!(arms[0].0.len(), 2);
+            assert_eq!(arms[0].patterns.len(), 2);
             assert!(matches!(
-                &arms[0].0[0],
+                &arms[0].patterns[0],
                 Pattern::Literal(Literal::Int(1), _)
             ));
             assert!(matches!(
-                &arms[0].0[1],
+                &arms[0].patterns[1],
                 Pattern::Literal(Literal::Int(1), _)
             ));
-            assert!(matches!(&arms[1].0[0], Pattern::Any(_)));
-            assert!(matches!(&arms[1].0[1], Pattern::Any(_)));
+            assert!(matches!(&arms[1].patterns[0], Pattern::Any(_)));
+            assert!(matches!(&arms[1].patterns[1], Pattern::Any(_)));
         } else {
             panic!("expected Match");
         }
@@ -3790,7 +4104,7 @@ mod tests {
         match expr {
             Expr::Match { arms, .. } => {
                 assert_eq!(arms.len(), 2);
-                match &arms[0].0[0] {
+                match &arms[0].patterns[0] {
                     Pattern::Constructor(name, args, _) => {
                         assert_eq!(name, "Ok");
                         assert!(matches!(
@@ -3801,7 +4115,7 @@ mod tests {
                     other => panic!("expected Ok constructor pattern, got {other:?}"),
                 }
 
-                match &arms[1].0[0] {
+                match &arms[1].patterns[0] {
                     Pattern::Constructor(name, args, _) => {
                         assert_eq!(name, "Error");
                         assert!(matches!(
@@ -3812,7 +4126,7 @@ mod tests {
                     other => panic!("expected Error constructor pattern, got {other:?}"),
                 }
 
-                match &arms[1].1 {
+                match &arms[1].body {
                     Expr::Call { func, args, .. } => {
                         assert!(matches!(
                             func.as_ref(),

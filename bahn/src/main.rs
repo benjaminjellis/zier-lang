@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+pub(crate) const STD_GIT_URL: &str = "git@github.com:benjaminjellis/mond-std.git";
+pub(crate) const STD_GIT_TAG: &str = "0.0.6";
 pub(crate) const MANIFEST_NAME: &str = "bahn.toml";
 pub(crate) const LOCKFILE_NAME: &str = "bahn.lock";
 pub(crate) const TARGET_DIR: &str = "target";
