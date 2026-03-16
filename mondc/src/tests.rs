@@ -369,6 +369,64 @@ fn qualified_only_use_keeps_record_field_accessors_available() {
 }
 
 #[test]
+fn field_access_uses_the_record_type_not_just_field_name() {
+    let src = "(type ['s] ContinuePayload [(:state ~ 's)])\n\
+               (type ['s] Initialised [(:state ~ 's)])\n\
+               (let continue_payload_state {continue}\n\
+                 (:state continue))\n\
+               (let main {}\n\
+                 (continue_payload_state (ContinuePayload :state 1)))";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(
+        !report.has_errors(),
+        "field access should be disambiguated by record type: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn nested_constructor_pattern_keeps_payload_bindings() {
+    let src = "(type ContinuePayload [(:state ~ Int) (:selector ~ Int)])\n\
+               (type Next [(Continue ~ ContinuePayload) Stop])\n\
+               (let unwrap {value}\n\
+                 (match value\n\
+                   (Continue (ContinuePayload current_state _)) ~> current_state\n\
+                   Stop ~> 0))";
+    let output = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("compile");
+    assert!(
+        output.contains("{continue, {continuepayload"),
+        "expected nested constructor payload tuple pattern, got:\n{output}"
+    );
+}
+
+#[test]
 fn qualified_type_reference_in_type_declaration_is_supported() {
     let process_src = "(pub extern type ['m] Name)";
     let std_mods = vec![(
@@ -657,6 +715,32 @@ fn type_declaration_accepts_nested_type_application() {
             .iter()
             .map(|d| d.message.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn nullary_extern_call_lowers_to_zero_arity() {
+    let src = "(extern let now ~ (Unit -> Int) erlang/system_time)\n(let main {} (now))";
+    let output = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("compile");
+    assert!(
+        output.contains("now()"),
+        "expected nullary extern call to lower to now()/0:\n{output}"
+    );
+    assert!(
+        !output.contains("now(unit)"),
+        "unexpected unit-arg call for nullary extern:\n{output}"
     );
 }
 

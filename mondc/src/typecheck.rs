@@ -635,6 +635,19 @@ fn mismatch_with_span(error: TypeError, span: std::ops::Range<usize>) -> TypeErr
     }
 }
 
+fn record_accessor_key(record_name: &str, field_name: &str) -> String {
+    format!(":{record_name}:{field_name}")
+}
+
+fn lookup_record_accessor<'a>(
+    env: &'a TypeEnv,
+    record_name: &str,
+    field_name: &str,
+) -> Option<&'a Scheme> {
+    env.get(&record_accessor_key(record_name, field_name))
+        .or_else(|| env.get(&format!(":{field_name}")))
+}
+
 // ---------------------------------------------------------------------------
 // TypeChecker Implementation
 // ---------------------------------------------------------------------------
@@ -1197,21 +1210,45 @@ impl TypeChecker {
                 // doesn't exist.
                 let (s1, t_record) = self.infer(env, record)?;
 
-                let accessor_name = format!(":{field}");
-                let scheme = env.get(&accessor_name).ok_or_else(|| {
-                    let resolved = apply_subst(&s1, &t_record);
-                    let def = if let Type::Con(type_name, _) = resolved.as_ref() {
-                        self.type_def_spans.get(type_name).cloned()
+                let resolved_record = apply_subst(&s1, &t_record);
+                let scheme = if let Type::Con(record_name, _) = resolved_record.as_ref() {
+                    if let Some(layout) = self.record_fields.get(record_name) {
+                        if !layout.iter().any(|declared| declared == field) {
+                            return Err(TypeError::UnknownField {
+                                field: field.clone(),
+                                record_ty: resolved_record.clone(),
+                                field_span: span.clone(),
+                                def: self.type_def_spans.get(record_name).cloned(),
+                            });
+                        }
+                        lookup_record_accessor(env, record_name, field).ok_or_else(|| {
+                            TypeError::UnknownField {
+                                field: field.clone(),
+                                record_ty: resolved_record.clone(),
+                                field_span: span.clone(),
+                                def: self.type_def_spans.get(record_name).cloned(),
+                            }
+                        })?
                     } else {
-                        None
-                    };
-                    TypeError::UnknownField {
-                        field: field.clone(),
-                        record_ty: resolved,
-                        field_span: span.clone(),
-                        def,
+                        let accessor_name = format!(":{field}");
+                        env.get(&accessor_name)
+                            .ok_or_else(|| TypeError::UnknownField {
+                                field: field.clone(),
+                                record_ty: resolved_record.clone(),
+                                field_span: span.clone(),
+                                def: self.type_def_spans.get(record_name).cloned(),
+                            })?
                     }
-                })?;
+                } else {
+                    let accessor_name = format!(":{field}");
+                    env.get(&accessor_name)
+                        .ok_or_else(|| TypeError::UnknownField {
+                            field: field.clone(),
+                            record_ty: resolved_record.clone(),
+                            field_span: span.clone(),
+                            def: None,
+                        })?
+                };
                 let accessor_ty = self.instantiate(scheme);
 
                 let ret_ty = self.fresh();
@@ -1467,10 +1504,13 @@ impl TypeChecker {
                     let record_span = record.span();
 
                     for field_name in &layout {
-                        let accessor_name = format!(":{field_name}");
-                        let accessor_scheme = env.get(&accessor_name).ok_or_else(|| {
-                            TypeError::UnboundVariable(accessor_name.clone(), record_span.clone())
-                        })?;
+                        let accessor_scheme = lookup_record_accessor(env, &record_name, field_name)
+                            .ok_or_else(|| {
+                                TypeError::UnboundVariable(
+                                    format!(":{field_name}"),
+                                    record_span.clone(),
+                                )
+                            })?;
                         let accessor_in_ty = self.instantiate(accessor_scheme);
                         let accessor_out_ty = self.instantiate(accessor_scheme);
 
@@ -1750,10 +1790,10 @@ impl TypeChecker {
                         });
                     }
 
-                    let accessor_name = format!(":{field_name}");
-                    let accessor_scheme = env.get(&accessor_name).ok_or_else(|| {
-                        TypeError::UnboundVariable(accessor_name, field_span.clone())
-                    })?;
+                    let accessor_scheme = lookup_record_accessor(env, name, field_name)
+                        .ok_or_else(|| {
+                            TypeError::UnboundVariable(format!(":{field_name}"), field_span.clone())
+                        })?;
                     let accessor_ty = self.instantiate(accessor_scheme);
                     let field_ty = self.fresh();
                     let s_acc = unify(
@@ -1863,10 +1903,19 @@ impl TypeChecker {
                         );
                         self.record_param_arity.insert(name.clone(), params.len());
                     }
-                    env.extend(constructor_schemes_with_aliases(
-                        type_decl,
-                        &self.qualified_type_aliases,
-                    ));
+                    for (name, scheme) in
+                        constructor_schemes_with_aliases(type_decl, &self.qualified_type_aliases)
+                    {
+                        // Plain field accessor keys (e.g. `:state`) are overloaded
+                        // across records. Preserve first declaration order rather than
+                        // letting later record declarations overwrite earlier ones.
+                        let is_plain_field_accessor =
+                            name.starts_with(':') && !name[1..].contains(':');
+                        if is_plain_field_accessor && env.contains_key(&name) {
+                            continue;
+                        }
+                        env.insert(name, scheme);
+                    }
                 }
                 Declaration::Expression(expr) => {
                     match self.infer(env, expr) {
@@ -2238,13 +2287,15 @@ pub fn constructor_schemes_with_aliases(
             for (field_name, field_ty) in fields {
                 let ft = type_usage_to_type(field_ty, &param_map, aliases);
                 let accessor_ty = Type::fun(result_ty.clone(), ft);
-                env.insert(
-                    format!(":{field_name}"),
-                    Scheme {
-                        vars: scheme_vars.clone(),
-                        ty: accessor_ty,
-                    },
-                );
+                let scheme = Scheme {
+                    vars: scheme_vars.clone(),
+                    ty: accessor_ty,
+                };
+                // Record-qualified accessor key avoids collisions when multiple
+                // records share a field name.
+                env.insert(record_accessor_key(name, field_name), scheme.clone());
+                // Keep the plain accessor key as a fallback for older call paths.
+                env.entry(format!(":{field_name}")).or_insert(scheme);
             }
         }
     }

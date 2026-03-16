@@ -544,6 +544,7 @@ pub fn compile_with_imports_in_session(
                 }
             }
             ast::TypeDecl::Record { name, fields, .. } => {
+                imported_constructors.insert(name.clone(), fields.len());
                 for (i, (field_name, _)) in fields.iter().enumerate() {
                     merged_imported_field_indices.insert(field_name.clone(), i + 2);
                 }

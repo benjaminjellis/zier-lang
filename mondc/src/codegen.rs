@@ -9,6 +9,8 @@ struct Ctx {
     fn_names: HashSet<String>,
     /// Top-level function name → number of Mond args (for multi-arg TCO)
     fn_arities: HashMap<String, usize>,
+    /// Local extern declarations marked nullary `(Unit -> T)` lowered to `/0`.
+    nullary_externs: HashSet<String>,
     /// Constructor name → arity (0 = nullary atom, 1+ = tuple)
     constructors: HashMap<String, usize>,
     /// Imported function name → Erlang module (from `use` declarations)
@@ -35,6 +37,7 @@ pub fn lower_module(
     // Pass 1: collect function names, arities, constructor arities, and record field indices
     let mut fn_names = HashSet::new();
     let mut fn_arities = HashMap::new();
+    let mut nullary_externs = HashSet::new();
     let mut constructors = imported_constructors;
     let mut field_indices = imported_field_indices;
     let mut record_layouts = imported_record_layouts;
@@ -45,8 +48,13 @@ pub fn lower_module(
                 fn_names.insert(name.clone());
                 fn_arities.insert(name.clone(), args.len());
             }
-            ast::Declaration::ExternLet { name, .. } => {
+            ast::Declaration::ExternLet {
+                name, is_nullary, ..
+            } => {
                 fn_names.insert(name.clone());
+                if *is_nullary {
+                    nullary_externs.insert(name.clone());
+                }
             }
             ast::Declaration::Type(ast::TypeDecl::Variant {
                 constructors: ctors,
@@ -61,6 +69,8 @@ pub fn lower_module(
                 for (i, (field_name, _)) in fields.iter().enumerate() {
                     field_indices.insert(field_name.clone(), i + 2);
                 }
+                // Records are constructors too: {record_tag, field1, field2, ...}
+                constructors.insert(name.clone(), fields.len());
                 record_layouts.insert(
                     name.clone(),
                     fields
@@ -76,6 +86,7 @@ pub fn lower_module(
     let ctx = Ctx {
         fn_names,
         fn_arities,
+        nullary_externs,
         constructors,
         imports,
         module_aliases,
@@ -502,6 +513,9 @@ fn lower_call(
         // Known local function — emit direct call
         if ctx.fn_names.contains(name.as_str()) {
             if args.is_empty() {
+                if ctx.nullary_externs.contains(name.as_str()) {
+                    return ir::Expr::LocalCallMulti(name.clone(), vec![]);
+                }
                 // 0-arg call → call with unit
                 return ir::Expr::LocalCall(name.clone(), Box::new(ir::Expr::Atom("unit".into())));
             }
