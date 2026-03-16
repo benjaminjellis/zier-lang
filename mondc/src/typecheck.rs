@@ -2820,15 +2820,11 @@ mod tests {
 
     #[test]
     fn infer_let_bind() {
-        // let? desugars to bind; define a Result bind and use it
+        // let? is built-in Result short-circuiting sugar.
         let src = r#"
             (type ['a 'e] Result [
                 (Ok ~ 'a)
                 (Error ~ 'e)])
-            (let bind {m func}
-                (match m
-                    (Ok x) ~> (func x)
-                    (Error e) ~> (Error e)))
             (let safe_inc {r}
                 (let? [x r]
                     (Ok (+ x 1))))

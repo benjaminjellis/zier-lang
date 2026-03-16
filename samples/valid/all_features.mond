@@ -3,7 +3,7 @@
 
 ;; imports (`use`) — qualified, specific unqualified, and wildcard unqualified
 (use std/io)
-(use std/result [Result bind])
+(use std/result [Result])
 (use std/option [*])
 
 ;; extern declarations (`extern let`, nullary extern let, and extern type)
@@ -23,12 +23,6 @@
 ;; top-level function (`let`) with recursion + `if`
 (let factorial {n}
   (if (= n 0) 1 (* n (factorial (- n 1)))))
-
-;; needed for `let?`
-(pub let bind {m func}
-  (match m
-    (Ok x) ~> (func x)
-    (Error e) ~> (Error e)))
 
 (let safe_div {a b}
   (if (= b 0) (Error "division by zero") (Ok (/ a b))))

@@ -5,7 +5,7 @@ Testing helpers are regular std functions and must be imported explicitly.
 
 ```mond
 (use std/string)
-(use std/result [bind])
+(use std/result [Result])
 (use std/testing [assert_eq])
 
 (test "string/length"
@@ -16,5 +16,5 @@ Testing helpers are regular std functions and must be imported explicitly.
 Notes:
 
 - `test` declarations are only allowed in files under `tests/`
-- `let?` requires `bind` to be in unqualified scope
+- `let?` short-circuits on `Result`, no `bind` import required
 - `(use std)` does not import `assert_eq` into unqualified scope

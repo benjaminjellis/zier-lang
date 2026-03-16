@@ -2,11 +2,6 @@
   (Ok ~ 'a)
   (Error ~ 'e)])
 
-(let bind {m func}
-  (match m
-    (Ok x) ~> (func x)
-    (Error e) ~> (Error e)))
-
 (let safe_div {a b}
   (if (= b 0) (Error "division by zero") (Ok (/ a b))))
 

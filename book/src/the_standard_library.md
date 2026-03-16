@@ -45,10 +45,10 @@ The standard library also provides some useful types like `Option` and `Result`.
 (use std/option [Option])
 ```
 
-The language also provides some syntactic sugar like `let?`. `let?` is a monadic bind. It requires a `bind` function in scope and chains operations that return a `Result`, short-circuiting on the first error. This syntax can be used simply with `(use std/result [Result bind])`.
+The language also provides syntactic sugar with `let?`. It chains operations that return a `Result`, short-circuiting on the first error. `let?` is built in, so no `bind` import is required.
 
 ```mond
-(use std/result [Result bind])
+(use std/result [Result])
 (use std/io)
 
 (let might_fail {} (Ok 10))
@@ -62,7 +62,11 @@ The language also provides some syntactic sugar like `let?`. `let?` is a monadic
         (Ok (+ a b)))))
 ```
 
-This desugars to `(bind (might_fail) (f {a} -> (bind (might_also_fail a) (f {b} -> (Ok (+ a b))))))` and if you run it, you'll see:
+This desugars to:
+
+`(match (might_fail) (Ok a) ~> (match (might_also_fail a) (Ok b) ~> (Ok (+ a b)) (Error e) ~> (Error e)) (Error e) ~> (Error e))`
+
+If you run it, you'll see:
 
 ```shell
 10
@@ -104,7 +108,7 @@ Named subjects:
 
 ```mond
 (use std/process)
-(use std/result [Result bind])
+(use std/result [Result])
 (use std/testing [assert_eq])
 
 (test

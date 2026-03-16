@@ -875,7 +875,7 @@ fn infer_module_exports_preserves_result_bind_error_type() {
 }
 
 #[test]
-fn imported_result_bind_reports_continuation_mismatch() {
+fn letq_reports_continuation_mismatch_without_bind_in_scope() {
     let result_src = RESULT_STD_SRC;
     let io_src = IO_STD_SRC;
 
@@ -889,15 +889,6 @@ fn imported_result_bind_reports_continuation_mismatch() {
         vec!["println".to_string(), "debug".to_string()],
     );
 
-    let result_schemes = infer_module_exports(
-        "result",
-        result_src,
-        HashMap::new(),
-        &module_exports,
-        &[],
-        &[],
-        &HashMap::new(),
-    );
     let io_schemes = infer_module_exports(
         "io",
         io_src,
@@ -909,18 +900,16 @@ fn imported_result_bind_reports_continuation_mismatch() {
     );
 
     let mut imported_schemes = HashMap::new();
-    imported_schemes.insert("bind".to_string(), result_schemes["bind"].clone());
-    imported_schemes.insert("result/bind".to_string(), result_schemes["bind"].clone());
     imported_schemes.insert("debug".to_string(), io_schemes["debug"].clone());
     imported_schemes.insert("io/debug".to_string(), io_schemes["debug"].clone());
 
     let imported_type_decls = exported_type_decls(result_src);
     let mut imports = HashMap::new();
-    imports.insert("bind".to_string(), "result".to_string());
+    imports.insert("Result".to_string(), "result".to_string());
     imports.insert("debug".to_string(), "io".to_string());
 
     let src = r#"
-            (use result [Result bind])
+            (use result [Result])
             (use io [debug])
             (let ok {} (Ok ()))
             (let main {}
@@ -950,13 +939,13 @@ fn imported_result_bind_reports_continuation_mismatch() {
     assert!(
         rendered
             .iter()
-            .any(|msg| msg.contains("type mismatch: expected `Result")),
+            .any(|msg| msg.contains("match arms have incompatible types")),
         "unexpected diagnostics: {rendered:?}"
     );
 }
 
 #[test]
-fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
+fn test_declaration_with_letq_reports_continuation_mismatch_without_bind_in_scope() {
     let result_src = RESULT_STD_SRC;
     let io_src = IO_STD_SRC;
     let testing_src = TESTING_STD_SRC;
@@ -1022,7 +1011,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
     }
 
     let mut imports = HashMap::new();
-    imports.insert("bind".to_string(), "result".to_string());
+    imports.insert("Result".to_string(), "result".to_string());
     imports.insert("debug".to_string(), "io".to_string());
     imports.insert("assert_eq".to_string(), "testing".to_string());
 
@@ -1030,7 +1019,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
     imported_type_decls.extend(exported_type_decls(testing_src));
 
     let src = r#"
-            (use result [bind])
+            (use result [Result])
             (use io)
             (use testing [assert_eq])
             (test "x"
@@ -1060,7 +1049,7 @@ fn test_declaration_with_imported_bind_reports_continuation_mismatch() {
     assert!(
         labels
             .iter()
-            .any(|msg| msg.contains("`bind` expects `Unit -> Result")),
+            .any(|msg| msg.contains("arms must all return the same type")),
         "unexpected labels: {labels:?}"
     );
 }

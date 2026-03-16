@@ -856,7 +856,10 @@ impl Lowerer {
 
         let body = self.lower_expr(file_id, &items[2])?;
 
-        // Desugar right-to-left into nested (bind expr (f {name} -> ...))
+        // Desugar right-to-left into nested Result matches:
+        // (match expr
+        //   (Ok name) ~> inner
+        //   (Error e) ~> (Error e))
         let mut pairs: Vec<(String, Expr)> = Vec::new();
         for chunk in bindings.chunks(2) {
             let name = match &chunk[0] {
@@ -876,15 +879,26 @@ impl Lowerer {
 
         // Fold right: innermost binding wraps the body
         let result = pairs.into_iter().rev().fold(body, |inner, (name, val)| {
-            let lambda = Expr::Lambda {
-                args: vec![name],
-                arg_spans: vec![span.clone()],
-                body: Box::new(inner),
+            let error_name = "__letq_error".to_string();
+            let ok_pat = Pattern::Constructor(
+                "Ok".to_string(),
+                vec![Pattern::Variable(name, span.clone())],
+                span.clone(),
+            );
+            let error_pat = Pattern::Constructor(
+                "Error".to_string(),
+                vec![Pattern::Variable(error_name.clone(), span.clone())],
+                span.clone(),
+            );
+            let error_expr = Expr::Call {
+                func: Box::new(Expr::Variable("Error".to_string(), span.clone())),
+                args: vec![Expr::Variable(error_name, span.clone())],
                 span: span.clone(),
             };
-            Expr::Call {
-                func: Box::new(Expr::Variable("bind".to_string(), span.clone())),
-                args: vec![val, lambda],
+
+            Expr::Match {
+                targets: vec![val],
+                arms: vec![(vec![ok_pat], inner), (vec![error_pat], error_expr)],
                 span: span.clone(),
             }
         });
@@ -3763,6 +3777,57 @@ mod tests {
             lowerer.diagnostics[0].message,
             "let? requires a body expression"
         );
+    }
+
+    #[test]
+    fn test_let_bind_desugars_to_result_match() {
+        let (mut lowerer, file_id, sexprs) = setup("(let? [x (safe)] (Ok x))");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("expected let? to lower");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+
+        match expr {
+            Expr::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                match &arms[0].0[0] {
+                    Pattern::Constructor(name, args, _) => {
+                        assert_eq!(name, "Ok");
+                        assert!(matches!(
+                            args.first(),
+                            Some(Pattern::Variable(n, _)) if n == "x"
+                        ));
+                    }
+                    other => panic!("expected Ok constructor pattern, got {other:?}"),
+                }
+
+                match &arms[1].0[0] {
+                    Pattern::Constructor(name, args, _) => {
+                        assert_eq!(name, "Error");
+                        assert!(matches!(
+                            args.first(),
+                            Some(Pattern::Variable(n, _)) if n == "__letq_error"
+                        ));
+                    }
+                    other => panic!("expected Error constructor pattern, got {other:?}"),
+                }
+
+                match &arms[1].1 {
+                    Expr::Call { func, args, .. } => {
+                        assert!(matches!(
+                            func.as_ref(),
+                            Expr::Variable(name, _) if name == "Error"
+                        ));
+                        assert!(matches!(
+                            args.first(),
+                            Some(Expr::Variable(name, _)) if name == "__letq_error"
+                        ));
+                    }
+                    other => panic!("expected Error constructor call, got {other:?}"),
+                }
+            }
+            other => panic!("expected let? to desugar to match, got {other:?}"),
+        }
     }
 
     #[test]
