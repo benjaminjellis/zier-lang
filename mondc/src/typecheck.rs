@@ -3453,8 +3453,7 @@ mod tests {
     #[test]
     fn reject_or_pattern_type_mismatch() {
         // or-pattern alternatives must agree with the target type; 1 is Int, True is Bool
-        let result =
-            check("(let pred {x} (match x 1 | True ~> 0 _ ~> 1))\n(let main {} (pred 1))");
+        let result = check("(let pred {x} (match x 1 | True ~> 0 _ ~> 1))\n(let main {} (pred 1))");
         assert!(
             result.is_err(),
             "expected type error: Int vs Bool in or-pattern"

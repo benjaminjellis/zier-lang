@@ -19,6 +19,6 @@ The aim of Phase 2 is to make `Mond` more usable, primarily through completing t
 - [ ] increase test coverage across entire compiler pipeline 
 
 ## Phase 3
-The aim of Phase 3 is to make mond even more usable, primarily through further integration with OTP. 
+The aim of Phase 3 is to make mond even more usable, primarily through further integration with OTP.
 
-- [ ] OTP / eralng libraries (e.g. gen server support, process support)
+- [ ] OTP / erlang libraries (e.g. gen server support, process support)

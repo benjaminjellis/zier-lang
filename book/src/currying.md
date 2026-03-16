@@ -7,7 +7,7 @@ For example we can define a function that adds two numbers
 (let add_two {x y} (+ x y))
 ```
 
-We can reuse that function via partial application to create a new function that adds 10 toe a number
+We can reuse that function via partial application to create a new function that adds 10 to a number
 
 ```mond
 (let add_ten {x} (add_two 10 x))

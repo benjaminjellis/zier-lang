@@ -9,10 +9,10 @@
 - no function coloring
 - errors as values
 - no panics or exceptions
-- friendlily and useful compiler errors
+- friendly and useful compiler errors
 - targets the BEAM
 
-`Mond` draws inspiration from a variety of programming languages but chiefly
+`Mond` draws inspiration from a variety of programming languages but chiefly from:
 - Rust
 - Clojure 
 - OCaml

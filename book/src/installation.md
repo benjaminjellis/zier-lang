@@ -10,7 +10,7 @@ To install everything on Arch Linux, run the following:
 sudo pacman -S rustup erlang rebar3
 ```
 
-You should be able to do something similar on macOS with:
+Or on macOS:
 
 ```
 brew install rustup erlang rebar3
@@ -29,9 +29,8 @@ cargo install --path bahn
 Or without cloning
 
 ```
-cargo install --git https://github.com/benjaminjellis/mond.git --tag 0.0.1 bahn
+cargo install --git https://github.com/benjaminjellis/mond.git --tag 0.0.5 bahn
 ```
-
 
 To verify installation
 ```
@@ -39,7 +38,7 @@ To verify installation
 bahn --help
 ```
 
-And when you see something like below you should be all set
+which should print something like the below
 
 ```shell
 the build tool for the mond programming language

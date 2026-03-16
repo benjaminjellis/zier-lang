@@ -50,10 +50,10 @@
     y 0 0 ~> "both zero"
     _ _ ~> "not both zero"))
 
-;; `or` patterns
+;; `|` patterns
 (let describe_day {day}
   (match day
-    "Saturday" or "Sunday" ~> "weekend"
+    "Saturday" | "Sunday" ~> "weekend"
     _ ~> "weekday"))
 
 ;; record construction + field access

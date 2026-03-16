@@ -5,7 +5,7 @@
 
 (let check_two {x}
   (match x
-    10 or 11 or 12 ~> (println "expected")
+    10 | 11 | 12 ~> (println "expected")
     _ ~> (println "not expected")))
 
 (let main {}

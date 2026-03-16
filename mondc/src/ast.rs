@@ -176,7 +176,7 @@ pub enum Pattern {
     Literal(Literal, Range<usize>),
     /// Matches a constructor: `(Some x)` or `None`
     Constructor(String, Vec<Pattern>, Range<usize>),
-    /// Matches any of several alternatives: `10 or 11 or 12`
+    /// Matches any of several alternatives: `10 | 11 | 12`
     Or(Vec<Pattern>, Range<usize>),
     /// Matches an empty list: `[]`
     EmptyList(Range<usize>),

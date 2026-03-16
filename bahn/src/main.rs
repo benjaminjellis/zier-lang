@@ -35,6 +35,7 @@ pub(crate) enum ProjectType {
 #[derive(Parser)]
 #[command(name = "bahn")]
 #[command(version = VERSION)]
+#[command(styles= utils::get_styles())]
 #[command(about = "the build tool for the mond programming language")]
 struct Cli {
     #[command(subcommand)]
@@ -43,24 +44,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run the current binary project
     Run,
+    /// Test the current project
     Test,
+    /// Mange the current project's dependencies
     Deps {
         #[arg(long)]
         update: bool,
     },
+    /// Run the LSP
     Lsp,
+    /// Format the current project or provided path
     Format {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// Create a new project in the provided directory
     New {
         name: String,
         #[arg(long)]
         lib: bool,
     },
+    /// Build the current project
     Build,
+    /// Create a release for the current project
     Release,
+    /// Clean the /target directory for the current project
     Clean,
 }
 

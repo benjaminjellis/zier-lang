@@ -3,6 +3,7 @@ use std::{
     process::Command,
 };
 
+use clap::builder::styling::{AnsiColor, Color, Style};
 use walkdir::WalkDir;
 
 fn check_dep(dep_name: &str) -> Option<bool> {
@@ -44,6 +45,39 @@ pub(crate) fn find_mond_files(dir: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+pub(crate) fn get_styles() -> clap::builder::Styles {
+    clap::builder::Styles::styled()
+        .usage(
+            Style::new()
+                .bold()
+                .underline()
+                .fg_color(Some(Color::Ansi(AnsiColor::Yellow))),
+        )
+        .header(
+            Style::new()
+                .bold()
+                .underline()
+                .fg_color(Some(Color::Ansi(AnsiColor::Yellow))),
+        )
+        .literal(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green))))
+        .invalid(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Red))),
+        )
+        .error(
+            Style::new()
+                .bold()
+                .fg_color(Some(Color::Ansi(AnsiColor::Red))),
+        )
+        .valid(
+            Style::new()
+                .bold()
+                .underline()
+                .fg_color(Some(Color::Ansi(AnsiColor::Green))),
+        )
+        .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::White))))
 }
 
 #[cfg(test)]

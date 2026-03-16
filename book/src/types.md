@@ -4,7 +4,7 @@
 ## Sum / Variant Types
 e.g. `Result` and `Option`
 
-```
+```mond
 (type ['a] Option
   [None
    (Some ~ 'a)])
@@ -23,7 +23,7 @@ Sum types have two components:
 The constructors can be nullary (like `None`) or encompass data (like `Some`). The `~` is used to provide a type that `Some` encompasses. This can be a concrete type like `Int` or, as above, it could be a polymorphic type like `'a`. By convention variant / sum type constructors use `PascalCase` identifiers.
 
 ## Product / Record Types
-```
+```mond
 (type Point
   [(:x ~ Int)
    (:y ~ Int)])
@@ -34,6 +34,7 @@ The constructors can be nullary (like `None`) or encompass data (like `Some`). T
 ```
 
 Record types have fields which, by convention, are `snake_case` identifiers. Each is prefixed with `:`. You can access a field with `(:field record)`. `~` is again used to specify what type each field is. Just like sum/variant types, you can use a polymorphic type like `'a`.
+You can also destructure records in `match` using named field patterns (for example `(Person :age age)`).
 
 e.g.
 ```mond

@@ -1159,7 +1159,7 @@ fn redundant_match_analysis_flags_arm_after_catch_all() {
 
 #[test]
 fn redundant_match_analysis_flags_duplicate_or_alternative() {
-    let src = "(let main {x} (match x True or True ~> 1 False ~> 0))";
+    let src = "(let main {x} (match x True | True ~> 1 False ~> 0))";
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(src).lex();
     let file_id = lowerer.add_file("scan.mond".into(), src.into());

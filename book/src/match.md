@@ -33,13 +33,53 @@ or on lists with the cons operator
 
 ```
 
-For patterns with multiple cases on one branch you can use `or`
+List patterns also support fixed-length and mixed forms:
+
+```mond
+(let describe {list}
+  (match list
+    [x]          ~> "singleton"
+    [a b | rest] ~> "at least two"
+    []           ~> "empty"))
+```
+
+`[x]` is equivalent to `[x | []]`, and `[a b | rest]` is equivalent to `[a | [b | rest]]`.
+
+
+For patterns with multiple cases on one branch you can use `|`
 
 ```mond
 (let is_weekend {day}
   (match day
-    "Saturday" or "Sunday" ~> True
-    _                      ~> False))
+    "Saturday" | "Sunday" ~> True
+    _                     ~> False))
+```
+
+You can also destructure records in `match` arms using named fields:
+
+```mond
+(type Person
+  [(:name ~ String)
+   (:age ~ Int)])
+
+(let age_of {person}
+  (match person
+    (Person :age age) ~> age))
+```
+
+Record patterns can be partial (you do not need to list every field), and they can be nested:
+
+```mond
+(type Address
+  [(:city ~ String)])
+
+(type Person
+  [(:name ~ String)
+   (:address ~ Address)])
+
+(let city_of {person}
+  (match person
+    (Person :address (Address :city city)) ~> city))
 ```
 
 
@@ -67,4 +107,3 @@ error: type mismatch: expected `Unit`, found `('a -> 'b)`
   = expected `Unit`, found `('a -> 'b)`
   = hint: `Unit` is not a function — if you meant to sequence multiple expressions, use `(do expr1 expr2 ...)`
 ```
-

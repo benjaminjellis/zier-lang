@@ -1985,9 +1985,8 @@ impl Lowerer {
         let SExpr::Atom(token) = sexpr else {
             return false;
         };
-        matches!(token.kind, TokenKind::Or)
-            || (matches!(token.kind, TokenKind::Operator)
-                && self.source_at(file_id, token.span.clone()) == "|")
+        matches!(token.kind, TokenKind::Operator)
+            && self.source_at(file_id, token.span.clone()) == "|"
     }
 
     fn lower_pattern(&mut self, file_id: usize, sexpr: &SExpr) -> Option<Pattern> {
@@ -3526,6 +3525,26 @@ mod tests {
         } else {
             panic!("expected Match");
         }
+    }
+
+    #[test]
+    fn test_match_or_keyword_separator_is_rejected() {
+        let src = "(match x 1 or 2 ~> True _ ~> False)";
+        let (mut lowerer, file_id, sexprs) = setup(src);
+        let expr = lowerer.lower_expr(file_id, &sexprs[0]);
+        assert!(expr.is_none(), "expected lowering to fail");
+        assert!(
+            lowerer
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("invalid pattern")),
+            "expected invalid pattern diagnostic, got: {:?}",
+            lowerer
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
