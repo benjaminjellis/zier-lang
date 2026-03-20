@@ -87,6 +87,7 @@ fn main() -> eyre::Result<()> {
             build::build(root, false)?;
         }
         Commands::Format { path, check } => {
+            dbg!(check);
             if let Some(path) = path {
                 if path.is_file() {
                     format::format_fie(&path)?;

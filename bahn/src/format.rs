@@ -27,7 +27,7 @@ pub(crate) fn format_dir(dir: &Path, check: bool) -> eyre::Result<Vec<String>> {
         ))?;
 
         let formatted_file = mond_format::format(&source_file, LINE_WIDTH);
-        if source_file == formatted_file && check {
+        if source_file != formatted_file && check {
             check_file_errors.push(format!("{source_file_path:?} not formatted correctly"));
             continue;
         }
