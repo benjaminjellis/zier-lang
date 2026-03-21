@@ -145,6 +145,17 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], input: LowerModuleIn
                     let mut f = lower_letfunc(name, args, value, &ctx);
                     f.is_pub = *is_pub;
                     functions.push(f);
+                    if args.is_empty() {
+                        functions.push(ir::Function {
+                            name: name.clone(),
+                            params: vec![],
+                            body: ir::Expr::LocalCall(
+                                name.clone(),
+                                Box::new(ir::Expr::Atom("unit".into())),
+                            ),
+                            is_pub: false,
+                        });
+                    }
                 }
             }
             ast::Declaration::ExternLet {
@@ -439,9 +450,20 @@ fn lower_expr_with_renames(
         } => {
             let value_ir = lower_expr_with_renames(value, ctx, renames, fresh_idx);
             let mut body_renames = renames.clone();
-            body_renames.remove(name);
+            let binding_var = if name == "_" {
+                "_".to_string()
+            } else {
+                let fresh = format!("{}__l{}", var_name(name), *fresh_idx);
+                *fresh_idx += 1;
+                fresh
+            };
+            if name == "_" {
+                body_renames.remove(name);
+            } else {
+                body_renames.insert(name.clone(), binding_var.clone());
+            }
             let body_ir = lower_expr_with_renames(body, ctx, &body_renames, fresh_idx);
-            ir::Expr::Let(var_name(name), Box::new(value_ir), Box::new(body_ir))
+            ir::Expr::Let(binding_var, Box::new(value_ir), Box::new(body_ir))
         }
 
         ast::Expr::If {
@@ -1362,6 +1384,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_arg_function_emits_arity_zero_wrapper() {
+        let src = r#"
+(let stop {} 1)
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("stop(_Unit) ->"),
+            "missing Unit-arg entry for zero-arg function:\n{erl}"
+        );
+        assert!(
+            erl.contains("stop() ->\n    stop(unit)."),
+            "missing arity-zero wrapper for qualified zero-arg calls:\n{erl}"
+        );
+    }
+
+    #[test]
     fn partial_application_uses_curried_entry() {
         // (add 1) applied partially — must call add/1, not add/2
         let src = r#"
@@ -1484,6 +1522,25 @@ mod tests {
         assert!(
             erl.contains("initialised -> erlang:setelement(2"),
             "expected Initialised selector update index in dispatch:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn let_shadowing_uses_distinct_erlang_bindings() {
+        let src = r#"
+(let main {}
+  (let [x 1
+        x (+ x 1)]
+    x))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("X__l0 = 1"),
+            "expected first let binding to use a fresh local var:\n{erl}"
+        );
+        assert!(
+            erl.contains("X__l1 = (X__l0 + 1)") || erl.contains("X__l1=(X__l0+1)"),
+            "expected inner let to shadow via a different Erlang var:\n{erl}"
         );
     }
 
