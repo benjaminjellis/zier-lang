@@ -87,7 +87,6 @@ fn main() -> eyre::Result<()> {
             build::build(root, false)?;
         }
         Commands::Format { path, check } => {
-            dbg!(check);
             if let Some(path) = path {
                 if path.is_file() {
                     format::format_fie(&path)?;
@@ -99,10 +98,9 @@ fn main() -> eyre::Result<()> {
             }
         }
         Commands::New { name, lib } => {
-            let project_name = name.clone();
-            new::create_new_project(name, root, lib)?;
+            new::create_new_project(&name, root, lib)?;
             let kind = if lib { "library" } else { "binary" };
-            ui::success(&format!("created {kind} project `{project_name}`"));
+            ui::success(&format!("created {kind} project `{name}`"));
         }
         Commands::Run => {
             build::build(root, true)?;

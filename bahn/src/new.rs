@@ -5,8 +5,8 @@ use eyre::Context;
 
 use crate::{MANIFEST_NAME, manifest};
 
-pub(crate) fn create_new_project(name: String, root: &Path, lib: bool) -> eyre::Result<()> {
-    let project_dir = root.join(&name);
+pub(crate) fn create_new_project(name: &String, root: &Path, lib: bool) -> eyre::Result<()> {
+    let project_dir = root.join(name);
 
     // create dir
     std::fs::create_dir_all(&project_dir)
@@ -62,7 +62,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp root");
 
         let project_name = "my_lib".to_string();
-        create_new_project(project_name.clone(), &root, true).expect("create project");
+        create_new_project(&project_name, &root, true).expect("create project");
 
         let project_dir = root.join(project_name);
         assert!(project_dir.join("tests").is_dir());
@@ -77,7 +77,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create temp root");
 
         let project_name = "my_bin".to_string();
-        create_new_project(project_name.clone(), &root, false).expect("create project");
+        create_new_project(&project_name, &root, false).expect("create project");
 
         let project_dir = root.join(project_name);
         assert!(project_dir.join("tests").is_dir());
