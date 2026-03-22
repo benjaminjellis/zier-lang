@@ -17,3 +17,6 @@ This repo is a mono-repo that contains the core of the `Mond` programming langua
 Other parts of the ecosystem are hosted in separate repos:
 - [standard library](https://github.com/benjaminjellis/mond-std)
 - [otp](https://github.com/benjaminjellis/otp)
+
+## AI Policy
+`Mond` has proved a useful project in exploring using LLMs / agentic AI for increasing productivity. At rough estimate the repo is currently 70% LLM generated and 30% human written. All AI generated code is reviewed by a human and considerable effort has been made on code coverage and ensuring that the AI generated code behaves as intended.
