@@ -1442,6 +1442,19 @@ impl Lowerer {
     ) -> Option<Declaration> {
         // items[0]=extern, items[1]=let, items[2]=name, items[3]=~, items[4]=TypeSig, items[5]=target
 
+        if items.len() != 6 {
+            self.error(
+                Diagnostic::error()
+                    .with_message("invalid extern let declaration")
+                    .with_labels(vec![Label::primary(file_id, span.clone())])
+                    .with_notes(vec![
+                        "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
+                        "syntax: (extern let name ~ (Unit -> ReturnType) module/function)".into(),
+                    ]),
+            );
+            return None;
+        }
+
         let name = match &items[2] {
             SExpr::Atom(t) if matches!(t.kind, TokenKind::Ident) => {
                 self.source_at(file_id, t.span.clone()).to_string()
@@ -1455,19 +1468,6 @@ impl Lowerer {
                 return None;
             }
         };
-
-        if items.len() != 6 {
-            self.error(
-                Diagnostic::error()
-                    .with_message("invalid extern let declaration")
-                    .with_labels(vec![Label::primary(file_id, span.clone())])
-                    .with_notes(vec![
-                        "syntax: (extern let name ~ (Type -> Type) module/function)".into(),
-                        "syntax: (extern let name ~ (Unit -> ReturnType) module/function)".into(),
-                    ]),
-            );
-            return None;
-        }
 
         match &items[3] {
             SExpr::Atom(t) if matches!(t.kind, TokenKind::Tilde) => {}
@@ -4026,6 +4026,18 @@ mod tests {
             }
             _ => panic!("expected ExternType"),
         }
+    }
+
+    #[test]
+    fn test_extern_let_missing_fields_is_error_not_panic() {
+        let (mut lowerer, file_id, sexprs) = setup("(extern let)");
+        let decls = lowerer.lower_file(file_id, &sexprs);
+        assert!(decls.is_empty(), "expected lowering to fail");
+        assert!(!lowerer.diagnostics.is_empty());
+        assert_eq!(
+            lowerer.diagnostics[0].message,
+            "invalid extern let declaration"
+        );
     }
 
     // -------------------------------------------------------------------------

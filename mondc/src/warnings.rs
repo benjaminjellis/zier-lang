@@ -244,12 +244,20 @@ fn pattern_summary(
             family_member: Some((MatchFamily::List, MatchMember::EmptyList)),
             is_catch_all: false,
         },
-        ast::Pattern::Cons(_, _, span) => PatternSummary {
-            span: span.clone(),
-            key: Some(PatternKey::NonEmptyList),
-            family_member: Some((MatchFamily::List, MatchMember::NonEmptyList)),
-            is_catch_all: false,
-        },
+        ast::Pattern::Cons(head, tail, span) => {
+            // Only `[h | t]`-style wildcard cons patterns cover every non-empty list.
+            // Specific shapes such as `[""]` or `["" | rest]` must not be treated as
+            // full non-empty coverage or they produce false "unreachable arm" warnings.
+            let covers_non_empty =
+                pattern_is_wildcard_like(head.as_ref()) && pattern_is_wildcard_like(tail.as_ref());
+            PatternSummary {
+                span: span.clone(),
+                key: covers_non_empty.then_some(PatternKey::NonEmptyList),
+                family_member: covers_non_empty
+                    .then_some((MatchFamily::List, MatchMember::NonEmptyList)),
+                is_catch_all: false,
+            }
+        }
         ast::Pattern::Record { span, .. } => PatternSummary {
             span: span.clone(),
             key: None,

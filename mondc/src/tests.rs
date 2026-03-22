@@ -1394,6 +1394,44 @@ fn compile_report_emits_redundant_match_warning() {
 }
 
 #[test]
+fn redundant_match_analysis_does_not_flag_specific_list_prefix_arm() {
+    let src = "(let split_unix {path} (match (string/split path \"/\") [\"\"] ~> [] [\"\" | rest] ~> (list/append [\"/\"] rest) rest ~> rest))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected redundancy warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn redundant_match_analysis_flags_arm_after_non_empty_list_catch_all() {
+    let src = "(let main {xs} (match xs [h | t] ~> 1 [x | xs2] ~> 2 [] ~> 0))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let warnings = warnings::redundant_match_diagnostics(&decls, file_id, &[]);
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "unreachable match arm");
+}
+
+#[test]
 fn unqualified_import_warnings_skip_qualified_only_use() {
     let src = "(use std/io)\n(let main {} (io/println \"hello\"))";
     let mut lowerer = lower::Lowerer::new();
