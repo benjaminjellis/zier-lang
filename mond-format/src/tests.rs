@@ -188,6 +188,30 @@ fn match_multi_target_keeps_targets_on_same_line() {
 }
 
 #[test]
+fn malformed_match_arm_separator_does_not_drop_trailing_arms() {
+    let src = r#"(pub let describe_error {error}
+  (match error
+    Eperm ~> "Operation not permitted"
+    Enoent -> "No such file or directory"
+    Esrch -> "No such process"
+    Unknown inner ~> inner))"#;
+    let out = fmt(src);
+
+    assert!(
+        out.contains("No such file or directory"),
+        "expected malformed `->` arm to be preserved:\n{out}"
+    );
+    assert!(
+        out.contains("No such process"),
+        "expected trailing malformed arm to be preserved:\n{out}"
+    );
+    assert!(
+        out.contains("Unknown"),
+        "expected trailing valid arm to still be present:\n{out}"
+    );
+}
+
+#[test]
 fn nested_match_arm_body_breaks_after_arrow() {
     let src = "(match (self) me ~> (match (spawn (f {} -> (worker me))) pid ~> (do (send pid \"ping\") (match (receive_timeout 1000) (Ok x) ~> (do (io/println \"main got reply~n\") (io/debug x)) (Error _) ~> (io/println \"timed out~n\")))))";
     let out = fmt(src);

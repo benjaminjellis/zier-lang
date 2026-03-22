@@ -50,8 +50,8 @@ impl Backend {
     }
 
     async fn publish_document_diagnostics(&self, uri: Url) {
-        let diagnostics = match self.analyze_document(&uri) {
-            Ok(Some(analysis)) => analysis.diagnostics,
+        let diagnostics = match self.document_diagnostics(&uri) {
+            Ok(Some(diagnostics)) => diagnostics,
             Ok(None) => Vec::new(),
             Err(err) => vec![lsp_error_diagnostic(err)],
         };
@@ -106,6 +106,24 @@ impl Backend {
         };
         let analysis = project.analyze_document(&doc)?;
         Ok(Some(analysis))
+    }
+
+    fn document_diagnostics(
+        &self,
+        uri: &Url,
+    ) -> std::result::Result<Option<Vec<tower_lsp::lsp_types::Diagnostic>>, String> {
+        let path = match uri.to_file_path() {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let root = find_project_root(&path);
+        let project = Project::load(root.as_deref(), &self.state, uri)?;
+        let doc = match project.document_for_path(&path) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let diagnostics = project.diagnostics_for_document(&doc)?;
+        Ok(Some(diagnostics))
     }
 
     fn document_text(&self, uri: &Url) -> Option<String> {
@@ -204,7 +222,7 @@ impl LanguageServer for Backend {
                 },
             );
         }
-        self.publish_project_diagnostics(params.text_document.uri)
+        self.publish_document_diagnostics(params.text_document.uri)
             .await;
     }
 
@@ -217,7 +235,7 @@ impl LanguageServer for Backend {
                 doc.text = text;
             }
         }
-        self.publish_project_diagnostics(params.text_document.uri)
+        self.publish_document_diagnostics(params.text_document.uri)
             .await;
     }
 
