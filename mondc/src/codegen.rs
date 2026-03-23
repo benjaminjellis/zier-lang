@@ -1141,12 +1141,46 @@ fn unary_op(name: &str) -> Option<&'static str> {
 /// Quote an Erlang atom if it doesn't match `[a-z][a-zA-Z0-9_]*`.
 fn quote_atom(name: &str) -> String {
     let needs_quoting = name.starts_with(|c: char| !c.is_lowercase())
-        || name.chars().any(|c| !c.is_alphanumeric() && c != '_');
+        || name.chars().any(|c| !c.is_alphanumeric() && c != '_')
+        || is_erlang_reserved_atom(name);
     if needs_quoting {
         format!("'{name}'")
     } else {
         name.to_string()
     }
+}
+
+fn is_erlang_reserved_atom(name: &str) -> bool {
+    matches!(
+        name,
+        "after"
+            | "and"
+            | "andalso"
+            | "band"
+            | "begin"
+            | "bnot"
+            | "bor"
+            | "bsl"
+            | "bsr"
+            | "bxor"
+            | "case"
+            | "catch"
+            | "cond"
+            | "div"
+            | "end"
+            | "fun"
+            | "if"
+            | "let"
+            | "not"
+            | "of"
+            | "or"
+            | "orelse"
+            | "receive"
+            | "rem"
+            | "try"
+            | "when"
+            | "xor"
+    )
 }
 
 pub fn emit_module(module: &ir::Module) -> String {
@@ -1214,7 +1248,9 @@ fn emit_expr(expr: &ir::Expr) -> String {
         ir::Expr::Str(s) => format!("<<\"{}\"/utf8>>", escape_str(s)),
         ir::Expr::Var(s) => s.clone(),
         ir::Expr::FunRef(name) => format!("fun {}/1", quote_atom(name)),
-        ir::Expr::RemoteFunRef(module, name) => format!("fun {module}:{}/1", quote_atom(name)),
+        ir::Expr::RemoteFunRef(module, name) => {
+            format!("fun {}:{}/1", quote_atom(module), quote_atom(name))
+        }
 
         ir::Expr::Tuple(items) => {
             format!(
@@ -1265,7 +1301,7 @@ fn emit_expr(expr: &ir::Expr) -> String {
 
         ir::Expr::RemoteCall(module, function, args) => {
             let args_s = args.iter().map(emit_expr).collect::<Vec<_>>().join(", ");
-            format!("{module}:{function}({args_s})")
+            format!("{}:{}({args_s})", quote_atom(module), quote_atom(function))
         }
 
         ir::Expr::BinOp(op, lhs, rhs) => {
@@ -1450,6 +1486,30 @@ mod tests {
         assert!(
             erl.contains(" rem "),
             "expected `%` to lower to Erlang rem:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn extern_remote_call_quotes_reserved_band_function_name() {
+        let src = r#"
+(extern let bitwise_and ~ (Int -> Int -> Int) erlang/band)
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("erlang:'band'("),
+            "expected reserved remote function atom to be quoted:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn extern_remote_call_quotes_reserved_bsr_function_name() {
+        let src = r#"
+(extern let bitwise_shift_right ~ (Int -> Int -> Int) erlang/bsr)
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("erlang:'bsr'("),
+            "expected reserved remote function atom to be quoted:\n{erl}"
         );
     }
 

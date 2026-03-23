@@ -156,6 +156,7 @@ pub enum TypeError {
     },
     NonExhaustiveMatch {
         missing: Vec<String>,
+        span: std::ops::Range<usize>,
     },
     UnboundVariable(String, std::ops::Range<usize>),
 }
@@ -487,11 +488,11 @@ impl TypeError {
                     ])
                     .with_notes(vec![format!("missing: {}", missing.join(", "))]),
             ],
-            TypeError::NonExhaustiveMatch { missing } => vec![
+            TypeError::NonExhaustiveMatch { missing, span } => vec![
                 Diagnostic::error()
                     .with_message("non-exhaustive match")
                     .with_labels(vec![
-                        Label::primary(file_id, span)
+                        Label::primary(file_id, span.clone())
                             .with_message("match is missing one or more constructors"),
                     ])
                     .with_notes(vec![format!(
@@ -1198,6 +1199,7 @@ impl TypeChecker {
         subst: &Substitution,
         target_types: &[Rc<Type>],
         arms: &[MatchArm],
+        match_span: std::ops::Range<usize>,
     ) -> Result<(), TypeError> {
         if target_types.len() != 1 {
             return Ok(());
@@ -1233,7 +1235,10 @@ impl TypeChecker {
                 if missing.is_empty() {
                     Ok(())
                 } else {
-                    Err(TypeError::NonExhaustiveMatch { missing })
+                    Err(TypeError::NonExhaustiveMatch {
+                        missing,
+                        span: match_span.clone(),
+                    })
                 }
             }
             Type::Con(type_name, _) if type_name == "Bool" => {
@@ -1258,9 +1263,16 @@ impl TypeChecker {
                 if missing.is_empty() {
                     Ok(())
                 } else {
-                    Err(TypeError::NonExhaustiveMatch { missing })
+                    Err(TypeError::NonExhaustiveMatch {
+                        missing,
+                        span: match_span.clone(),
+                    })
                 }
             }
+            Type::Con(type_name, _) if type_name == "Int" => Err(TypeError::NonExhaustiveMatch {
+                missing: vec!["_".into()],
+                span: match_span,
+            }),
             Type::Con(type_name, _) => {
                 let Some(constructors) = self.variant_constructors.get(type_name) else {
                     return Ok(());
@@ -1284,7 +1296,10 @@ impl TypeChecker {
                 if missing.is_empty() {
                     Ok(())
                 } else {
-                    Err(TypeError::NonExhaustiveMatch { missing })
+                    Err(TypeError::NonExhaustiveMatch {
+                        missing,
+                        span: match_span.clone(),
+                    })
                 }
             }
             Type::Fun(_, _) | Type::Var(_) => Ok(()),
@@ -1604,7 +1619,11 @@ impl TypeChecker {
                 Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
             }
 
-            Expr::Match { targets, arms, .. } => {
+            Expr::Match {
+                targets,
+                arms,
+                span,
+            } => {
                 let mut subst = HashMap::new();
                 let mut target_types = Vec::new();
                 let mut preds = vec![];
@@ -1667,7 +1686,7 @@ impl TypeChecker {
                         self.record_pattern_binding_types(pat, &subst, &pat_env);
                     }
                 }
-                self.ensure_match_exhaustive(&subst, &target_types, arms)?;
+                self.ensure_match_exhaustive(&subst, &target_types, arms, span.clone())?;
                 let ty = apply_subst(&subst, &result_ty);
                 self.record_expr_type(expr.span(), ty.clone());
                 Ok((subst.clone(), ty, apply_subst_preds(&subst, &preds)))
@@ -4216,7 +4235,7 @@ mod tests {
         "#;
         let err = check(src).expect_err("expected non-exhaustive match");
         match err {
-            TypeError::NonExhaustiveMatch { missing } => {
+            TypeError::NonExhaustiveMatch { missing, .. } => {
                 assert_eq!(missing, vec!["Three", "Four", "Five", "Six"]);
             }
             other => panic!("expected NonExhaustiveMatch, got {other:?}"),
@@ -4247,7 +4266,7 @@ mod tests {
         "#;
         let err = check(src).expect_err("expected non-exhaustive match");
         match err {
-            TypeError::NonExhaustiveMatch { missing } => {
+            TypeError::NonExhaustiveMatch { missing, .. } => {
                 assert_eq!(missing, vec!["[]"]);
             }
             other => panic!("expected NonExhaustiveMatch, got {other:?}"),
@@ -4264,7 +4283,7 @@ mod tests {
         "#;
         let err = check(src).expect_err("expected non-exhaustive match");
         match err {
-            TypeError::NonExhaustiveMatch { missing } => {
+            TypeError::NonExhaustiveMatch { missing, .. } => {
                 assert_eq!(missing, vec!["[head | tail]"]);
             }
             other => panic!("expected NonExhaustiveMatch, got {other:?}"),
@@ -4288,7 +4307,7 @@ mod tests {
     fn reject_non_exhaustive_bool_match() {
         let err = check_expr("(match True True ~> 1)").expect_err("expected non-exhaustive match");
         match err {
-            TypeError::NonExhaustiveMatch { missing } => {
+            TypeError::NonExhaustiveMatch { missing, .. } => {
                 assert_eq!(missing, vec!["False"]);
             }
             other => panic!("expected NonExhaustiveMatch, got {other:?}"),
@@ -4298,6 +4317,23 @@ mod tests {
     #[test]
     fn accept_exhaustive_bool_match_with_or_pattern() {
         let ty = check_expr("(match True True | False ~> 1)").unwrap();
+        assert_eq!(ty, Type::int());
+    }
+
+    #[test]
+    fn reject_non_exhaustive_int_match_requires_catch_all() {
+        let err = check_expr("(match 7 7 ~> 1)").expect_err("expected non-exhaustive match");
+        match err {
+            TypeError::NonExhaustiveMatch { missing, .. } => {
+                assert_eq!(missing, vec!["_"]);
+            }
+            other => panic!("expected NonExhaustiveMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_exhaustive_int_match_with_catch_all() {
+        let ty = check_expr("(match 7 7 ~> 1 _ ~> 0)").unwrap();
         assert_eq!(ty, Type::int());
     }
 
