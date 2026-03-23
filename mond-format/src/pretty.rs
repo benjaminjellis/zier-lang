@@ -654,7 +654,12 @@ fn split_match_targets_and_arms<'a>(rest: &'a [SExpr]) -> SplitMatchTargetsAndAr
         }
     }
 
-    SplitMatchTargetsAndArmsResult(vec![&rest[0]], Arms(collect_match_arms(&rest[1..])))
+    let single_target_arms = match collect_match_arms(&rest[1..]) {
+        Some(arms) => arms,
+        None => Arms(vec![]),
+    };
+
+    SplitMatchTargetsAndArmsResult(vec![&rest[0]], single_target_arms)
 }
 
 fn collect_match_arms_n_targets<'a>(items: &'a [SExpr], n_targets: usize) -> Option<Arms<'a>> {
@@ -671,7 +676,10 @@ fn collect_match_arms_n_targets<'a>(items: &'a [SExpr], n_targets: usize) -> Opt
             if i >= items.len() {
                 return None;
             }
-            if matches!(&items[i], SExpr::Atom(t) if t.kind == TokenKind::Arrow) {
+            if matches!(
+                &items[i],
+                SExpr::Atom(t) if matches!(t.kind, TokenKind::Arrow | TokenKind::ThinArrow)
+            ) {
                 return None;
             }
             patterns.push(&items[i]);
@@ -711,7 +719,7 @@ fn arm_body_forces_line_break(body: &SExpr) -> bool {
 }
 
 /// Split a flat SExpr sequence into match arms: `(patterns, guard, body)`.
-fn collect_match_arms(items: &[SExpr]) -> Vec<(Vec<&SExpr>, Option<&SExpr>, &SExpr)> {
+fn collect_match_arms(items: &[SExpr]) -> Option<Arms<'_>> {
     let mut arms = Vec::new();
     let mut i = 0;
     while i < items.len() {
@@ -720,11 +728,17 @@ fn collect_match_arms(items: &[SExpr]) -> Vec<(Vec<&SExpr>, Option<&SExpr>, &SEx
             if matches!(&items[i], SExpr::Atom(t) if t.kind == TokenKind::Arrow) {
                 break;
             }
+            // A thin arrow (`->`) is not a valid match arm separator.
+            // Treat this as a malformed match so callers can fall back to
+            // generic formatting without dropping trailing items.
+            if matches!(&items[i], SExpr::Atom(t) if t.kind == TokenKind::ThinArrow) {
+                return None;
+            }
             pat.push(&items[i]);
             i += 1;
         }
         if i >= items.len() {
-            break;
+            return None;
         }
         let (patterns, guard) = if pat.len() >= 2
             && matches!(&pat[pat.len() - 2], SExpr::Atom(t) if t.kind == TokenKind::If)
@@ -735,15 +749,17 @@ fn collect_match_arms(items: &[SExpr]) -> Vec<(Vec<&SExpr>, Option<&SExpr>, &SEx
         };
         i += 1; // skip `~>`
         if i >= items.len() {
-            break;
+            return None;
         }
         let body = &items[i];
         i += 1;
         if !patterns.is_empty() {
             arms.push((patterns, guard, body));
+        } else {
+            return None;
         }
     }
-    arms
+    Some(Arms(arms))
 }
 
 // ── use / extern (always inline) ─────────────────────────────────────────────

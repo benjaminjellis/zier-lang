@@ -110,7 +110,6 @@ pub(crate) fn project_diagnostic_batches_for_uri(
 }
 
 pub(crate) struct DocumentAnalysis {
-    pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) bindings: mondc::typecheck::TypeEnv,
     pub(crate) expr_types: Vec<(std::ops::Range<usize>, String)>,
     pub(crate) imports: mondc::ResolvedImports,
@@ -531,8 +530,8 @@ pub(super) fn project_diagnostic_batches(
     modules
         .into_iter()
         .map(|module| {
-            let diagnostics = match project.analyze_document(&module) {
-                Ok(analysis) => analysis.diagnostics,
+            let diagnostics = match project.diagnostics_for_document(&module) {
+                Ok(diagnostics) => diagnostics,
                 Err(err) => vec![lsp_error_diagnostic(err)],
             };
             (module, diagnostics)

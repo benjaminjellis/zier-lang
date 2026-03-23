@@ -648,23 +648,6 @@ impl Project {
             &visible_exports,
             &self.analysis,
         );
-        let report = mondc::compile_with_imports_report(
-            &doc.name,
-            &doc.source,
-            &source_path_for_compile(self.root.as_deref(), &doc.path),
-            imports.imports.clone(),
-            &visible_exports,
-            imports.module_aliases.clone(),
-            &imports.imported_type_decls,
-            &imports.imported_extern_types,
-            &imports.imported_field_indices,
-            &imports.imported_schemes,
-        );
-        let diagnostics = report
-            .diagnostics
-            .iter()
-            .map(|diag| diagnostic_to_lsp(&doc.source, diag))
-            .collect();
         let bindings = mondc::infer_module_bindings(
             &doc.name,
             &doc.source,
@@ -684,10 +667,38 @@ impl Project {
             &imports.imported_schemes,
         );
         Ok(DocumentAnalysis {
-            diagnostics,
             bindings,
             expr_types,
             imports,
         })
+    }
+
+    pub(crate) fn diagnostics_for_document(
+        &self,
+        doc: &ModuleSource,
+    ) -> std::result::Result<Vec<tower_lsp::lsp_types::Diagnostic>, String> {
+        let visible_exports = visible_exports(&self.analysis, &self.test_modules, &doc.name);
+        let imports = mondc::resolve_imports_for_source(
+            doc.source.as_str(),
+            &visible_exports,
+            &self.analysis,
+        );
+        let report = mondc::compile_with_imports_report(
+            &doc.name,
+            &doc.source,
+            &source_path_for_compile(self.root.as_deref(), &doc.path),
+            imports.imports,
+            &visible_exports,
+            imports.module_aliases,
+            &imports.imported_type_decls,
+            &imports.imported_extern_types,
+            &imports.imported_field_indices,
+            &imports.imported_schemes,
+        );
+        Ok(report
+            .diagnostics
+            .iter()
+            .map(|diag| diagnostic_to_lsp(&doc.source, diag))
+            .collect())
     }
 }
