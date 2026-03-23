@@ -1266,6 +1266,24 @@ fn unused_local_analysis_ignores_underscore_and_shadowed_outer_usage() {
 }
 
 #[test]
+fn unused_local_analysis_marks_unused_match_pattern_bindings() {
+    let src = "(let main {x} (match x y ~> 1))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let unused: Vec<String> = warnings::unused_local_spans(&decls)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(unused, vec!["y".to_string()]);
+}
+
+#[test]
 fn compile_emits_unused_local_binding_warning() {
     let src = "(let main {} (let [x 1 y 2] x))";
     let report = compile_with_imports_report(
@@ -1287,6 +1305,31 @@ fn compile_emits_unused_local_binding_warning() {
             .iter()
             .any(|m| m.contains("unused local binding `y`")),
         "missing unused local warning: {messages:?}"
+    );
+}
+
+#[test]
+fn compile_emits_unused_match_binding_warning() {
+    let src = "(let main {x} (match x y ~> 1))";
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    let messages: Vec<String> = report.diagnostics.into_iter().map(|d| d.message).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unused local binding `y`")),
+        "missing unused match binding warning: {messages:?}"
     );
 }
 

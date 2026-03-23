@@ -163,6 +163,34 @@ fn bind_pattern_names(pat: &ast::Pattern, out: &mut HashSet<String>) {
     }
 }
 
+fn bind_pattern_name_spans(pat: &ast::Pattern, out: &mut HashMap<String, std::ops::Range<usize>>) {
+    match pat {
+        ast::Pattern::Variable(name, span) => {
+            out.entry(name.clone()).or_insert_with(|| span.clone());
+        }
+        ast::Pattern::Constructor(_, args, _) => {
+            for arg in args {
+                bind_pattern_name_spans(arg, out);
+            }
+        }
+        ast::Pattern::Or(pats, _) => {
+            for p in pats {
+                bind_pattern_name_spans(p, out);
+            }
+        }
+        ast::Pattern::Cons(head, tail, _) => {
+            bind_pattern_name_spans(head, out);
+            bind_pattern_name_spans(tail, out);
+        }
+        ast::Pattern::Record { fields, .. } => {
+            for (_, pat, _) in fields {
+                bind_pattern_name_spans(pat, out);
+            }
+        }
+        ast::Pattern::Any(_) | ast::Pattern::Literal(_, _) | ast::Pattern::EmptyList(_) => {}
+    }
+}
+
 fn pattern_span(pat: &ast::Pattern) -> std::ops::Range<usize> {
     match pat {
         ast::Pattern::Any(span)
@@ -769,12 +797,17 @@ fn collect_unused_local_spans(
                 if let Some(guard) = &arm.guard {
                     body_free.extend(collect_unused_local_spans(guard, out));
                 }
-                let mut bound = HashSet::new();
+                let mut bound_spans: HashMap<String, std::ops::Range<usize>> = HashMap::new();
                 for pat in &arm.patterns {
-                    bind_pattern_names(pat, &mut bound);
+                    bind_pattern_name_spans(pat, &mut bound_spans);
                 }
-                for name in bound {
-                    body_free.remove(&name);
+                for (name, span) in &bound_spans {
+                    if name != "_" && !body_free.contains(name) {
+                        out.push((name.clone(), span.clone()));
+                    }
+                }
+                for name in bound_spans.keys() {
+                    body_free.remove(name.as_str());
                 }
                 free.extend(body_free);
             }

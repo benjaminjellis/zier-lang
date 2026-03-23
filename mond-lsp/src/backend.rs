@@ -16,8 +16,9 @@ use tower_lsp::{
         MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel,
         ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult,
         ServerCapabilities, SignatureHelp, SignatureHelpParams, SignatureInformation,
-        SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Url,
-        WorkspaceEdit, WorkspaceSymbolParams,
+        SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
+        TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit,
+        WorkspaceSymbolParams,
     },
 };
 
@@ -36,6 +37,7 @@ use crate::{
     symbol_at, symbol_documentation_for_symbol, top_level_symbols,
 };
 
+#[derive(Clone)]
 pub struct Backend {
     client: Client,
     state: Arc<Mutex<ServerState>>,
@@ -49,14 +51,51 @@ impl Backend {
         }
     }
 
-    async fn publish_document_diagnostics(&self, uri: Url) {
+    fn current_document_version(&self, uri: &Url) -> Option<i32> {
+        self.state
+            .lock()
+            .unwrap()
+            .open_docs
+            .get(uri)
+            .map(|d| d.version)
+    }
+
+    fn schedule_document_diagnostics(&self, uri: Url, version: i32) {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            backend
+                .publish_document_diagnostics(uri, Some(version))
+                .await;
+        });
+    }
+
+    async fn publish_document_diagnostics(&self, uri: Url, version: Option<i32>) {
+        // If another edit arrived while this diagnostic task was queued/running,
+        // skip publishing stale results to avoid flickering old errors.
+        if let Some(expected) = version {
+            match self.current_document_version(&uri) {
+                Some(current) if current != expected => return,
+                None => return,
+                Some(_) => {}
+            }
+        }
+
         let diagnostics = match self.document_diagnostics(&uri) {
             Ok(Some(diagnostics)) => diagnostics,
             Ok(None) => Vec::new(),
             Err(err) => vec![lsp_error_diagnostic(err)],
         };
+
+        if let Some(expected) = version {
+            match self.current_document_version(&uri) {
+                Some(current) if current != expected => return,
+                None => return,
+                Some(_) => {}
+            }
+        }
+
         self.client
-            .publish_diagnostics(uri, diagnostics, None)
+            .publish_diagnostics(uri, diagnostics, version)
             .await;
     }
 
@@ -64,7 +103,7 @@ impl Backend {
         let path = match focus_uri.to_file_path() {
             Ok(path) => path,
             Err(_) => {
-                self.publish_document_diagnostics(focus_uri).await;
+                self.publish_document_diagnostics(focus_uri, None).await;
                 return;
             }
         };
@@ -73,7 +112,7 @@ impl Backend {
             match project_diagnostic_batches_for_uri(root.as_deref(), &self.state, &focus_uri) {
                 Ok(Some(batches)) => batches,
                 Ok(None) => {
-                    self.publish_document_diagnostics(focus_uri).await;
+                    self.publish_document_diagnostics(focus_uri, None).await;
                     return;
                 }
                 Err(err) => {
@@ -153,8 +192,14 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        will_save: None,
+                        will_save_wait_until: None,
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                    },
                 )),
                 hover_provider: Some(tower_lsp::lsp_types::HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
@@ -212,31 +257,31 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let version = params.text_document.version;
         {
             let mut state = self.state.lock().unwrap();
             state.open_docs.insert(
                 params.text_document.uri.clone(),
                 DocumentState {
-                    version: params.text_document.version,
+                    version,
                     text: params.text_document.text,
                 },
             );
         }
-        self.publish_document_diagnostics(params.text_document.uri)
-            .await;
+        self.schedule_document_diagnostics(params.text_document.uri, version);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let text = full_text_change(params.content_changes);
+        let version = params.text_document.version;
         {
             let mut state = self.state.lock().unwrap();
             if let Some(doc) = state.open_docs.get_mut(&params.text_document.uri) {
-                doc.version = params.text_document.version;
+                doc.version = version;
                 doc.text = text;
             }
         }
-        self.publish_document_diagnostics(params.text_document.uri)
-            .await;
+        self.schedule_document_diagnostics(params.text_document.uri, version);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
