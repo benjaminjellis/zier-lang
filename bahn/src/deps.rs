@@ -667,6 +667,12 @@ fn checkout_dependency_reference(
             ));
         }
         manifest::GitReference::Rev(rev) => {
+            if let Ok(current_rev) = current_dependency_rev(checkout_dir)
+                && current_rev == *rev
+            {
+                return Ok(());
+            }
+
             info(&format!(
                 "Checking out dependency: {dep_name} using rev: {rev}"
             ));
