@@ -138,7 +138,7 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], input: LowerModuleIn
                     functions.push(ir::Function {
                         name: name.clone(),
                         params: args.iter().map(|a| var_name(a)).collect(),
-                        body: lower_expr(value, &ctx),
+                        body: lower_function_body(args, value, &ctx),
                         is_pub: false,
                     });
                 } else {
@@ -193,7 +193,7 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], input: LowerModuleIn
 
 // Only called for 0-arg and 1-arg functions (N >= 2 handled inline in lower_module).
 fn lower_letfunc(name: &str, args: &[String], body: &ast::Expr, ctx: &Ctx) -> ir::Function {
-    let body_ir = lower_expr(body, ctx);
+    let body_ir = lower_function_body(args, body, ctx);
     let param = if args.is_empty() {
         "_Unit".to_string()
     } else {
@@ -546,10 +546,7 @@ fn lower_expr_with_renames(
         }
 
         ast::Expr::Lambda { args, body, .. } => {
-            let mut body_renames = renames.clone();
-            for arg in args {
-                body_renames.remove(arg);
-            }
+            let body_renames = extend_renames_with_binders(renames, args);
             let body_ir = lower_expr_with_renames(body, ctx, &body_renames, fresh_idx);
             make_lambda(args, body_ir)
         }
@@ -1086,6 +1083,27 @@ fn make_lambda(args: &[String], body: ir::Expr) -> ir::Expr {
     }
 }
 
+fn extend_renames_with_binders(
+    base: &HashMap<String, String>,
+    binders: &[String],
+) -> HashMap<String, String> {
+    let mut out = base.clone();
+    for binder in binders {
+        if binder == "_" {
+            out.remove(binder);
+        } else {
+            out.insert(binder.clone(), var_name(binder));
+        }
+    }
+    out
+}
+
+fn lower_function_body(args: &[String], body: &ast::Expr, ctx: &Ctx) -> ir::Expr {
+    let renames = extend_renames_with_binders(&HashMap::new(), args);
+    let mut fresh_idx = 0usize;
+    lower_expr_with_renames(body, ctx, &renames, &mut fresh_idx)
+}
+
 /// Capitalize first character of a variable name for Erlang.
 /// `x` → `X`, `my_var` → `My_var`, `_` → `_`
 fn var_name(name: &str) -> String {
@@ -1601,6 +1619,59 @@ mod tests {
         assert!(
             erl.contains("X__l1 = (X__l0 + 1)") || erl.contains("X__l1=(X__l0+1)"),
             "expected inner let to shadow via a different Erlang var:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn single_arg_function_param_can_shadow_top_level_function_name() {
+        let src = r#"
+(type FileInfo [(:mode ~ Int)])
+(let file_info {x} x)
+(let read_mode {file_info} (:mode file_info))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("erlang:element(2, File_info)"),
+            "expected parameter `file_info` to lower as a local var:\n{erl}"
+        );
+        assert!(
+            !erl.contains("fun file_info/1"),
+            "parameter shadowing should not lower to top-level function reference:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn multi_arg_function_param_can_shadow_top_level_function_name() {
+        let src = r#"
+(let file_info {x} x)
+(let pick_left {file_info y} file_info)
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("pick_left(File_info, Y) ->") && erl.contains("File_info."),
+            "expected multi-arg body to reference parameter binding:\n{erl}"
+        );
+        assert!(
+            !erl.contains("pick_left(File_info, Y) -> fun file_info/1.")
+                && !erl.contains("pick_left(File_info,Y) -> fun file_info/1."),
+            "multi-arg parameter shadowing incorrectly lowered to function ref:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn lambda_param_can_shadow_top_level_function_name() {
+        let src = r#"
+(let file_info {x} x)
+(let main {} ((f {file_info} -> file_info) 1))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("fun(File_info) -> File_info end"),
+            "expected lambda body to reference parameter binding:\n{erl}"
+        );
+        assert!(
+            !erl.contains("fun(File_info) -> fun file_info/1 end"),
+            "lambda parameter shadowing incorrectly lowered to function ref:\n{erl}"
         );
     }
 
