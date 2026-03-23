@@ -529,17 +529,19 @@ fn lower_expr_with_renames(
                 }
                 arm_renames.extend(pattern_renames.clone());
                 let body_ir = lower_expr_with_renames(&arm.body, ctx, &arm_renames, fresh_idx);
-                let pat = if targets.len() == 1 {
-                    lower_pattern(&arm.patterns[0], ctx, &pattern_renames)
+                if targets.len() == 1 {
+                    for pat in top_level_pattern_alternatives(&arm.patterns[0]) {
+                        ir_arms.push((lower_pattern(pat, ctx, &pattern_renames), body_ir.clone()));
+                    }
                 } else {
-                    ir::Pattern::Tuple(
+                    let pat = ir::Pattern::Tuple(
                         arm.patterns
                             .iter()
                             .map(|p| lower_pattern(p, ctx, &pattern_renames))
                             .collect(),
-                    )
-                };
-                expand_or_pattern(pat, body_ir, &mut ir_arms);
+                    );
+                    ir_arms.push((pat, body_ir));
+                }
             }
 
             ir::Expr::Case(Box::new(scrutinee), ir_arms)
@@ -1003,20 +1005,24 @@ fn lower_match_case_clauses(
         body_ir
     };
 
-    let pat = if targets_len == 1 {
-        lower_pattern(&first.patterns[0], ctx, &pattern_renames)
+    let mut clauses = Vec::new();
+    if targets_len == 1 {
+        for pat in top_level_pattern_alternatives(&first.patterns[0]) {
+            clauses.push((
+                lower_pattern(pat, ctx, &pattern_renames),
+                guarded_body.clone(),
+            ));
+        }
     } else {
-        ir::Pattern::Tuple(
+        let pat = ir::Pattern::Tuple(
             first
                 .patterns
                 .iter()
                 .map(|p| lower_pattern(p, ctx, &pattern_renames))
                 .collect(),
-        )
-    };
-
-    let mut clauses = Vec::new();
-    expand_or_pattern(pat, guarded_body, &mut clauses);
+        );
+        clauses.push((pat, guarded_body));
+    }
     clauses.extend(rest);
     clauses
 }
@@ -1062,11 +1068,11 @@ fn collect_pattern_vars(pat: &ast::Pattern, out: &mut Vec<String>) {
     }
 }
 
-/// Expand or-patterns into multiple arms with the same body.
-fn expand_or_pattern(pat: ir::Pattern, body: ir::Expr, arms: &mut Vec<(ir::Pattern, ir::Expr)>) {
-    // Or-patterns have already been lowered at this point, so no special handling needed.
-    // If the original AST had Or patterns, they would need pre-expansion before lowering.
-    arms.push((pat, body));
+fn top_level_pattern_alternatives(pat: &ast::Pattern) -> Vec<&ast::Pattern> {
+    match pat {
+        ast::Pattern::Or(pats, _) => pats.iter().collect(),
+        _ => vec![pat],
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -1504,6 +1510,42 @@ mod tests {
         assert!(
             erl.contains(" rem "),
             "expected `%` to lower to Erlang rem:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn or_pattern_match_expands_all_alternatives() {
+        let src = r#"
+(type Token [A B C D E F])
+(let classify {token}
+  (match token
+    A | B | C ~> 1
+    D | E | F ~> 0))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("a -> 1"),
+            "expected first alternative case arm:\n{erl}"
+        );
+        assert!(
+            erl.contains("b -> 1"),
+            "expected second alternative case arm:\n{erl}"
+        );
+        assert!(
+            erl.contains("c -> 1"),
+            "expected third alternative case arm:\n{erl}"
+        );
+        assert!(
+            erl.contains("d -> 0"),
+            "expected fourth alternative case arm:\n{erl}"
+        );
+        assert!(
+            erl.contains("e -> 0"),
+            "expected fifth alternative case arm:\n{erl}"
+        );
+        assert!(
+            erl.contains("f -> 0"),
+            "expected sixth alternative case arm:\n{erl}"
         );
     }
 
