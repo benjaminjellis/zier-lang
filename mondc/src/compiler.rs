@@ -212,6 +212,37 @@ pub fn compile_with_imports_in_session(
     imported_field_indices: &HashMap<(String, String), usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
+    compile_with_imports_in_session_with_private_records(
+        sess,
+        module_name,
+        source,
+        source_path,
+        imports,
+        module_exports,
+        module_aliases,
+        imported_type_decls,
+        imported_extern_types,
+        imported_field_indices,
+        &HashMap::new(),
+        imported_schemes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_imports_in_session_with_private_records(
+    sess: &mut session::CompilerSession,
+    module_name: &str,
+    source: &str,
+    source_path: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
+    module_aliases: HashMap<String, String>,
+    imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
+    imported_field_indices: &HashMap<(String, String), usize>,
+    imported_private_records: &HashMap<String, Vec<String>>,
+    imported_schemes: &typecheck::TypeEnv,
+) -> session::CompileReport {
     let mut diagnostics = Vec::new();
     let mut lowerer = lower::Lowerer::new();
     let tokens = crate::lexer::Lexer::new(source).lex();
@@ -449,6 +480,7 @@ pub fn compile_with_imports_in_session(
     let mut checker = typecheck::TypeChecker::new();
     checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
     checker.seed_imported_type_info(&imported_type_decls_unqualified);
+    checker.seed_private_record_origins(imported_private_records.clone());
     let mut env = typecheck::primitive_env();
 
     for type_decl in &imported_type_decls_unqualified {
@@ -592,8 +624,37 @@ pub fn compile_with_imports_report(
     imported_field_indices: &HashMap<(String, String), usize>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
+    compile_with_imports_report_with_private_records(
+        module_name,
+        source,
+        source_path,
+        imports,
+        module_exports,
+        module_aliases,
+        imported_type_decls,
+        imported_extern_types,
+        imported_field_indices,
+        &HashMap::new(),
+        imported_schemes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_imports_report_with_private_records(
+    module_name: &str,
+    source: &str,
+    source_path: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
+    module_aliases: HashMap<String, String>,
+    imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
+    imported_field_indices: &HashMap<(String, String), usize>,
+    imported_private_records: &HashMap<String, Vec<String>>,
+    imported_schemes: &typecheck::TypeEnv,
+) -> session::CompileReport {
     let mut sess = session::CompilerSession::default();
-    compile_with_imports_in_session(
+    compile_with_imports_in_session_with_private_records(
         &mut sess,
         module_name,
         source,
@@ -604,6 +665,7 @@ pub fn compile_with_imports_report(
         imported_type_decls,
         imported_extern_types,
         imported_field_indices,
+        imported_private_records,
         imported_schemes,
     )
 }

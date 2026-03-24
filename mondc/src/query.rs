@@ -124,6 +124,21 @@ pub fn exported_type_decls(source: &str) -> Vec<ast::TypeDecl> {
         .collect()
 }
 
+pub fn private_record_type_names(source: &str) -> Vec<String> {
+    parse_decls("scan.mond", source)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|d| match d {
+            ast::Declaration::Type(ast::TypeDecl::Record {
+                is_pub: false,
+                name,
+                ..
+            }) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn exported_extern_types(source: &str) -> Vec<String> {
     parse_decls("scan.mond", source)
         .unwrap_or_default()

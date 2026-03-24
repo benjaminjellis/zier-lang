@@ -856,7 +856,7 @@ fn collect_unqualified_free_vars(
     match expr {
         Expr::Literal(_, _) => {}
         Expr::Variable(name, _) => {
-            if !locals.contains(name.as_str()) {
+            if !locals.contains(name.as_str()) && !name.contains('/') {
                 out.insert(name.clone());
             }
         }
@@ -947,7 +947,12 @@ fn collect_unqualified_free_vars(
 fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
     use ast::Expr;
     match expr {
-        Expr::Literal(_, _) | Expr::Variable(_, _) => {}
+        Expr::Literal(_, _) => {}
+        Expr::Variable(name, _) => {
+            if let Some((module, _)) = name.split_once('/') {
+                out.insert(module.to_string());
+            }
+        }
         Expr::List(items, _) => {
             for item in items {
                 collect_qualified_module_refs(item, out);

@@ -373,7 +373,7 @@ pub(crate) fn generate_erl_sources_with_roots(
             .cloned()
             .unwrap_or_else(|| module_name.clone());
 
-        let report = mondc::compile_with_imports_report(
+        let report = mondc::compile_with_imports_report_with_private_records(
             &erlang_module_name,
             source,
             &format!("{module_name}.mond"),
@@ -383,6 +383,7 @@ pub(crate) fn generate_erl_sources_with_roots(
             &resolved.imported_type_decls,
             &resolved.imported_extern_types,
             &resolved.imported_field_indices,
+            &resolved.imported_private_records,
             &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(
@@ -432,7 +433,7 @@ pub(crate) fn generate_erl_sources_with_roots(
             &dependency_analysis,
         );
 
-        let report = mondc::compile_with_imports_report(
+        let report = mondc::compile_with_imports_report_with_private_records(
             erlang_name,
             source,
             &format!("{erlang_name}.mond"),
@@ -442,6 +443,7 @@ pub(crate) fn generate_erl_sources_with_roots(
             &resolved.imported_type_decls,
             &resolved.imported_extern_types,
             &resolved.imported_field_indices,
+            &resolved.imported_private_records,
             &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(

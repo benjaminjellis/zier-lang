@@ -699,6 +699,27 @@ fn lower_call(
     }
 
     if let ast::Expr::Variable(name, _) = func {
+        // Qualified function variable (`module/function`) in call position.
+        if let Some((module, function)) = name.split_once('/') {
+            let erl_module = ctx
+                .module_aliases
+                .get(module)
+                .cloned()
+                .unwrap_or_else(|| module.to_string());
+            if args.is_empty() {
+                return ir::Expr::RemoteCall(erl_module, function.to_string(), vec![]);
+            }
+            let first = lower_expr_with_renames(&args[0], ctx, renames, fresh_idx);
+            let mut result = ir::Expr::RemoteCall(erl_module, function.to_string(), vec![first]);
+            for arg in &args[1..] {
+                result = ir::Expr::Call(
+                    Box::new(result),
+                    Box::new(lower_expr_with_renames(arg, ctx, renames, fresh_idx)),
+                );
+            }
+            return result;
+        }
+
         // Binary operator
         if args.len() == 2
             && let Some(erl_op) = binary_op(name)
@@ -877,6 +898,15 @@ fn lower_variable(name: &str, ctx: &Ctx, renames: &HashMap<String, String>) -> i
     // Imported function in value position → fun module:f/1
     if let Some(module) = ctx.imports.get(name) {
         return ir::Expr::RemoteFunRef(module.clone(), name.to_string());
+    }
+    // Qualified function in value position → fun module:function/1
+    if let Some((module, function)) = name.split_once('/') {
+        let erl_module = ctx
+            .module_aliases
+            .get(module)
+            .cloned()
+            .unwrap_or_else(|| module.to_string());
+        return ir::Expr::RemoteFunRef(erl_module, function.to_string());
     }
     // Local variable → capitalize
     ir::Expr::Var(var_name(name))

@@ -136,6 +136,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let project = mondc::ProjectAnalysis {
         module_exports: all_exports.clone(),
         module_type_decls: module_type_decls.clone(),
+        module_private_record_types: HashMap::new(),
         module_extern_types: module_extern_types.clone(),
         all_module_schemes: all_module_schemes.clone(),
         module_aliases: module_aliases.clone(),
@@ -146,7 +147,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     for (module_name, source) in &test_module_sources {
         let resolved = mondc::resolve_imports_for_source(source, &all_exports, &project);
 
-        let report = mondc::compile_with_imports_report(
+        let report = mondc::compile_with_imports_report_with_private_records(
             module_name,
             source,
             &format!("tests/{module_name}.mond"),
@@ -156,6 +157,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &resolved.imported_type_decls,
             &resolved.imported_extern_types,
             &resolved.imported_field_indices,
+            &resolved.imported_private_records,
             &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(
@@ -229,7 +231,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &dependency_analysis,
         );
 
-        let report = mondc::compile_with_imports_report(
+        let report = mondc::compile_with_imports_report_with_private_records(
             erlang_name,
             source,
             &format!("{erlang_name}.mond"),
@@ -239,6 +241,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             &resolved.imported_type_decls,
             &resolved.imported_extern_types,
             &resolved.imported_field_indices,
+            &resolved.imported_private_records,
             &resolved.imported_schemes,
         );
         mondc::session::emit_compile_report_with_color(

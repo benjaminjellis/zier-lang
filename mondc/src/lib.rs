@@ -14,7 +14,9 @@ mod query;
 mod warnings;
 
 pub use compiler::{
-    compile_with_imports, compile_with_imports_in_session, compile_with_imports_report,
+    compile_with_imports, compile_with_imports_in_session,
+    compile_with_imports_in_session_with_private_records, compile_with_imports_report,
+    compile_with_imports_report_with_private_records,
 };
 pub use project::{
     ProjectAnalysis, ResolvedImports, alias_package_root_module, build_project_analysis,

@@ -8,6 +8,7 @@ use std::{
 pub struct ProjectAnalysis {
     pub module_exports: HashMap<String, Vec<String>>,
     pub module_type_decls: HashMap<String, Vec<crate::ast::TypeDecl>>,
+    pub module_private_record_types: HashMap<String, Vec<String>>,
     pub module_extern_types: HashMap<String, Vec<String>>,
     pub all_module_schemes: HashMap<String, crate::typecheck::TypeEnv>,
     pub module_aliases: HashMap<String, String>,
@@ -21,6 +22,7 @@ pub struct ResolvedImports {
     pub imported_type_decls: Vec<crate::ast::TypeDecl>,
     pub imported_extern_types: Vec<String>,
     pub imported_field_indices: HashMap<(String, String), usize>,
+    pub imported_private_records: HashMap<String, Vec<String>>,
     pub module_aliases: HashMap<String, String>,
 }
 
@@ -78,16 +80,25 @@ pub fn build_project_analysis_with_modules(
 ) -> Result<ProjectAnalysis, String> {
     let mut module_exports = HashMap::new();
     let mut module_type_decls = HashMap::new();
+    let mut module_private_record_types = HashMap::new();
     let mut module_extern_types = HashMap::new();
 
     for (user_name, _, source) in external_mods {
         module_exports.insert(user_name.clone(), crate::exported_names(source));
         module_type_decls.insert(user_name.clone(), crate::exported_type_decls(source));
+        module_private_record_types.insert(
+            user_name.clone(),
+            crate::query::private_record_type_names(source),
+        );
         module_extern_types.insert(user_name.clone(), crate::exported_extern_types(source));
     }
     for (module_name, source) in src_module_sources {
         module_exports.insert(module_name.clone(), crate::exported_names(source));
         module_type_decls.insert(module_name.clone(), crate::exported_type_decls(source));
+        module_private_record_types.insert(
+            module_name.clone(),
+            crate::query::private_record_type_names(source),
+        );
         module_extern_types.insert(module_name.clone(), crate::exported_extern_types(source));
     }
 
@@ -104,6 +115,7 @@ pub fn build_project_analysis_with_modules(
             &ProjectAnalysis {
                 module_exports: module_exports.clone(),
                 module_type_decls: module_type_decls.clone(),
+                module_private_record_types: module_private_record_types.clone(),
                 module_extern_types: module_extern_types.clone(),
                 all_module_schemes: all_module_schemes.clone(),
                 module_aliases: module_aliases.clone(),
@@ -129,6 +141,7 @@ pub fn build_project_analysis_with_modules(
             &ProjectAnalysis {
                 module_exports: module_exports.clone(),
                 module_type_decls: module_type_decls.clone(),
+                module_private_record_types: module_private_record_types.clone(),
                 module_extern_types: module_extern_types.clone(),
                 all_module_schemes: all_module_schemes.clone(),
                 module_aliases: module_aliases.clone(),
@@ -149,6 +162,7 @@ pub fn build_project_analysis_with_modules(
     Ok(ProjectAnalysis {
         module_exports,
         module_type_decls,
+        module_private_record_types,
         module_extern_types,
         all_module_schemes,
         module_aliases,
@@ -190,6 +204,14 @@ pub fn alias_package_root_module(
             .cloned()
             .unwrap_or_default(),
     );
+    analysis.module_private_record_types.insert(
+        package_name.to_string(),
+        analysis
+            .module_private_record_types
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
     analysis.module_extern_types.insert(
         package_name.to_string(),
         analysis
@@ -224,6 +246,7 @@ pub fn resolve_imports_for_source(
     let mut imported_type_decls = Vec::new();
     let mut imported_extern_types = Vec::new();
     let mut imported_field_indices: HashMap<(String, String), usize> = HashMap::new();
+    let mut imported_private_records: HashMap<String, Vec<String>> = HashMap::new();
     let mut imported_type_keys: HashSet<(String, String)> = HashSet::new();
     let mut imported_extern_type_keys: HashSet<(String, String)> = HashSet::new();
     let mut imported_qualified_type_keys: HashSet<(String, String)> = HashSet::new();
@@ -313,6 +336,25 @@ pub fn resolve_imports_for_source(
             }
         }
 
+        if let Some(private_records) = project.module_private_record_types.get(&mod_name) {
+            for record_name in private_records {
+                let unqualified = imported_private_records
+                    .entry(record_name.clone())
+                    .or_default();
+                if !unqualified.iter().any(|m| m == &mod_name) {
+                    unqualified.push(mod_name.clone());
+                    unqualified.sort();
+                }
+
+                let qualified_key = format!("{mod_name}/{record_name}");
+                let qualified = imported_private_records.entry(qualified_key).or_default();
+                if !qualified.iter().any(|m| m == &mod_name) {
+                    qualified.push(mod_name.clone());
+                    qualified.sort();
+                }
+            }
+        }
+
         if let Some(extern_types) = project.module_extern_types.get(&mod_name) {
             // Always add qualified extern type aliases (module/TypeName) for modules in scope.
             for type_name in extern_types {
@@ -354,6 +396,7 @@ pub fn resolve_imports_for_source(
         imported_type_decls,
         imported_extern_types,
         imported_field_indices,
+        imported_private_records,
         module_aliases: project.module_aliases.clone(),
     }
 }
@@ -723,6 +766,7 @@ mod tests {
             &ProjectAnalysis {
                 module_exports: exports.clone(),
                 module_type_decls: HashMap::new(),
+                module_private_record_types: HashMap::new(),
                 module_extern_types: HashMap::new(),
                 all_module_schemes: HashMap::new(),
                 module_aliases,
@@ -741,6 +785,7 @@ mod tests {
                 ("util".to_string(), vec!["helper".to_string()]),
             ]),
             module_type_decls: HashMap::new(),
+            module_private_record_types: HashMap::new(),
             module_extern_types: HashMap::new(),
             all_module_schemes: HashMap::new(),
             module_aliases: HashMap::new(),
@@ -763,6 +808,7 @@ mod tests {
                 ("time".to_string(), vec!["from_time".to_string()]),
             ]),
             module_type_decls: HashMap::new(),
+            module_private_record_types: HashMap::new(),
             module_extern_types: HashMap::new(),
             all_module_schemes: HashMap::new(),
             module_aliases: HashMap::new(),

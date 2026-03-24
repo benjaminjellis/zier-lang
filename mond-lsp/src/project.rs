@@ -683,7 +683,7 @@ impl Project {
             &visible_exports,
             &self.analysis,
         );
-        let report = mondc::compile_with_imports_report(
+        let report = mondc::compile_with_imports_report_with_private_records(
             &doc.name,
             &doc.source,
             &source_path_for_compile(self.root.as_deref(), &doc.path),
@@ -693,6 +693,7 @@ impl Project {
             &imports.imported_type_decls,
             &imports.imported_extern_types,
             &imports.imported_field_indices,
+            &imports.imported_private_records,
             &imports.imported_schemes,
         );
         Ok(report

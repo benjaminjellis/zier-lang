@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::{
     compile_with_imports, compile_with_imports_in_session, compile_with_imports_report,
-    exported_type_decls, infer_module_exports, infer_module_expr_types, lower, pub_reexports,
-    session, typecheck, warnings,
+    compile_with_imports_report_with_private_records, exported_type_decls, infer_module_exports,
+    infer_module_expr_types, lower, pub_reexports, session, typecheck, warnings,
 };
 
 const RESULT_STD_SRC: &str = r#"
@@ -60,6 +60,33 @@ fn qualified_std_call_requires_use() {
         &HashMap::new(),
     );
     assert!(with_use_result.is_some());
+}
+
+#[test]
+fn qualified_function_value_works_in_pipe_steps() {
+    let mut module_exports = HashMap::new();
+    module_exports.insert(
+        "io".to_string(),
+        vec!["println".to_string(), "debug".to_string()],
+    );
+
+    let src = "(use std/io)\n(let main {} (|> \"hello\" io/debug))";
+    let result = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &module_exports,
+        HashMap::new(),
+        &[],
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    assert!(
+        result.is_some(),
+        "qualified function value in pipe should compile"
+    );
 }
 
 #[test]
@@ -426,6 +453,45 @@ fn qualified_only_use_keeps_record_field_accessors_available() {
             .iter()
             .map(|d| d.message.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn field_access_on_private_imported_record_reports_inaccessible_private_record() {
+    let fs_src = "(type Dir [(:path ~ String)])\n(pub let make_dir {} (Dir :path \"./tmp\"))";
+    let std_mods = vec![("fs".to_string(), "mond_fs".to_string(), fs_src.to_string())];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use fs [make_dir])\n(let main {} (:name (make_dir)))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+
+    let report = compile_with_imports_report_with_private_records(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
+        &resolved.imported_field_indices,
+        &resolved.imported_private_records,
+        &resolved.imported_schemes,
+    );
+
+    assert!(
+        report.has_errors(),
+        "expected private record access to fail"
+    );
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|d| d.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("private record `Dir`") && m.contains("`:name`")),
+        "expected explicit private-record diagnostic, got: {messages:?}"
     );
 }
 

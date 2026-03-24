@@ -91,6 +91,7 @@ fn symbol_at_resolves_top_level_definition_site() {
         imported_type_decls: Vec::new(),
         imported_extern_types: Vec::new(),
         imported_field_indices: HashMap::new(),
+        imported_private_records: HashMap::new(),
         module_aliases: HashMap::new(),
     };
     let offset = src.find("add_one").unwrap();
@@ -118,6 +119,7 @@ fn symbol_at_resolves_import_list_entries() {
         imported_type_decls: Vec::new(),
         imported_extern_types: Vec::new(),
         imported_field_indices: HashMap::new(),
+        imported_private_records: HashMap::new(),
         module_aliases: HashMap::new(),
     };
     let offset = src.find("assert_eq").unwrap();
@@ -145,6 +147,7 @@ fn collect_symbol_occurrences_includes_imports_defs_and_refs() {
         imported_type_decls: Vec::new(),
         imported_extern_types: Vec::new(),
         imported_field_indices: HashMap::new(),
+        imported_private_records: HashMap::new(),
         module_aliases: HashMap::new(),
     };
     let occurrences =
@@ -648,6 +651,7 @@ fn signature_target_finds_unqualified_call_argument_index() {
         imported_type_decls: Vec::new(),
         imported_extern_types: Vec::new(),
         imported_field_indices: HashMap::new(),
+        imported_private_records: HashMap::new(),
         module_aliases: HashMap::new(),
     };
     let offset = src.rfind('2').unwrap();
@@ -669,6 +673,7 @@ fn signature_target_finds_qualified_call_argument_index() {
         imported_type_decls: Vec::new(),
         imported_extern_types: Vec::new(),
         imported_field_indices: HashMap::new(),
+        imported_private_records: HashMap::new(),
         module_aliases: HashMap::new(),
     };
     let offset = src.find("hello").unwrap();

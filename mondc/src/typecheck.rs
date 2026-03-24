@@ -123,6 +123,12 @@ pub enum TypeError {
         /// The file and span of the type definition, if known
         def: Option<(usize, std::ops::Range<usize>)>,
     },
+    InaccessiblePrivateRecordField {
+        field: String,
+        record: String,
+        modules: Vec<String>,
+        field_span: std::ops::Range<usize>,
+    },
     AmbiguousFieldAccess {
         field: String,
         record_ty: Rc<Type>,
@@ -384,6 +390,32 @@ impl TypeError {
                 }
                 diags
             }
+            TypeError::InaccessiblePrivateRecordField {
+                field,
+                record,
+                modules,
+                field_span,
+            } => {
+                let origin = if modules.len() == 1 {
+                    format!("module `{}`", modules[0])
+                } else {
+                    format!("modules {}", modules.join(", "))
+                };
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!(
+                            "cannot access `:{field}` on private record `{record}` from {origin}"
+                        ))
+                        .with_labels(vec![
+                            Label::primary(file_id, field_span.clone()).with_message(format!(
+                                "`{record}` is private and its fields are not accessible here"
+                            )),
+                        ])
+                        .with_notes(vec![format!(
+                            "export `{record}` as `(pub type {record} [...])` to access `:{field}` outside its module"
+                        )]),
+                ]
+            }
             TypeError::AmbiguousFieldAccess {
                 field,
                 record_ty,
@@ -393,9 +425,7 @@ impl TypeError {
                 let ty_s = type_display(record_ty);
                 vec![
                     Diagnostic::error()
-                        .with_message(format!(
-                            "ambiguous field access `:{field}` for `{ty_s}`"
-                        ))
+                        .with_message(format!("ambiguous field access `:{field}` for `{ty_s}`"))
                         .with_labels(vec![
                             Label::primary(file_id, field_span.clone()).with_message(format!(
                                 "cannot determine which record accessor for `:{field}` to use"
@@ -930,6 +960,8 @@ pub struct TypeChecker {
     field_instances: HashMap<String, Vec<String>>,
     /// Maps record type name -> number of type parameters.
     record_param_arity: HashMap<String, usize>,
+    /// Record type name -> module names where the record exists but is private.
+    private_record_origins: HashMap<String, Vec<String>>,
     /// Maps value/function name → (file_id, definition span) for error reporting.
     value_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
     /// Best-effort inferred types for expression spans, used by editor tooling.
@@ -947,6 +979,7 @@ impl TypeChecker {
             record_fields: HashMap::new(),
             field_instances: HashMap::new(),
             record_param_arity: HashMap::new(),
+            private_record_origins: HashMap::new(),
             value_def_spans: HashMap::new(),
             expr_types: Vec::new(),
             qualified_type_aliases: HashMap::new(),
@@ -984,6 +1017,13 @@ impl TypeChecker {
         }
     }
 
+    pub fn seed_private_record_origins(
+        &mut self,
+        imported_private_records: HashMap<String, Vec<String>>,
+    ) {
+        self.private_record_origins = imported_private_records;
+    }
+
     fn register_record_type_info(&mut self, name: String, fields: Vec<String>, arity: usize) {
         self.record_fields.insert(name.clone(), fields.clone());
         self.record_param_arity.insert(name.clone(), arity);
@@ -998,6 +1038,19 @@ impl TypeChecker {
 
     fn field_instance_candidates(&self, label: &str) -> Vec<String> {
         self.field_instances.get(label).cloned().unwrap_or_default()
+    }
+
+    fn inaccessible_private_record_modules(&self, record_ty: &Rc<Type>) -> Option<Vec<String>> {
+        let Type::Con(record_name, _) = record_ty.as_ref() else {
+            return None;
+        };
+        if self.record_fields.contains_key(record_name) {
+            return None;
+        }
+        if self.type_def_spans.contains_key(record_name) {
+            return None;
+        }
+        self.private_record_origins.get(record_name).cloned()
     }
 
     fn solve_has_field_against_record(
@@ -1807,6 +1860,17 @@ impl TypeChecker {
                 }
 
                 if candidates.is_empty() {
+                    if let Some(modules) =
+                        self.inaccessible_private_record_modules(&resolved_record)
+                        && let Type::Con(record_name, _) = resolved_record.as_ref()
+                    {
+                        return Err(TypeError::InaccessiblePrivateRecordField {
+                            field: field.clone(),
+                            record: record_name.clone(),
+                            modules,
+                            field_span: span.clone(),
+                        });
+                    }
                     return Err(TypeError::UnknownField {
                         field: field.clone(),
                         record_ty: resolved_record.clone(),
@@ -2153,9 +2217,20 @@ impl TypeChecker {
                     let value_span = value_expr.span();
                     let candidates = self.field_instance_candidates(field_name);
                     if candidates.is_empty() {
+                        let record_ty = apply_subst(&subst, &t_record);
+                        if let Some(modules) = self.inaccessible_private_record_modules(&record_ty)
+                            && let Type::Con(record_name, _) = record_ty.as_ref()
+                        {
+                            return Err(TypeError::InaccessiblePrivateRecordField {
+                                field: field_name.clone(),
+                                record: record_name.clone(),
+                                modules,
+                                field_span: value_span.clone(),
+                            });
+                        }
                         return Err(TypeError::UnknownField {
                             field: field_name.clone(),
-                            record_ty: apply_subst(&subst, &t_record),
+                            record_ty,
                             field_span: value_span.clone(),
                             def: None,
                         });
@@ -3263,7 +3338,10 @@ mod tests {
             Scheme {
                 vars: vec![subject_var],
                 preds: vec![],
-                ty: Type::con("Subject", vec![Rc::new(Type::Var(subject_var))]),
+                ty: Type::fun(
+                    Type::unit(),
+                    Type::con("Subject", vec![Rc::new(Type::Var(subject_var))]),
+                ),
             },
         );
         env.insert(
@@ -3281,7 +3359,7 @@ mod tests {
             },
         );
 
-        let src = "(let main {} (let [subject process/new_subject a (process/send subject \"hello\") b (process/send subject 10)] a))";
+        let src = "(let main {} (let [subject (process/new_subject) a (process/send subject \"hello\") b (process/send subject 10)] a))";
         let err = check_with_env(src, env).expect_err("expected monomorphic subject binding");
         assert!(matches!(err, TypeError::Mismatch { .. }));
     }
@@ -3356,6 +3434,48 @@ mod tests {
                 .any(|n| n.contains("nullary constructor")),
             "expected nullary constructor hint in notes: {:?}",
             diags[0].notes
+        );
+    }
+
+    #[test]
+    fn unknown_field_diagnostic_has_no_visibility_hint_by_default() {
+        let err = TypeError::UnknownField {
+            field: "name".into(),
+            record_ty: Type::con("Dir", vec![]),
+            field_span: 0..4,
+            def: None,
+        };
+        let diags = err.to_diagnostics(0, 0..4);
+
+        assert!(
+            diags[0].notes.is_empty(),
+            "did not expect visibility notes for plain unknown-field errors, got: {:?}",
+            diags[0].notes
+        );
+    }
+
+    #[test]
+    fn inaccessible_private_record_field_diagnostic_is_explicit() {
+        let err = TypeError::InaccessiblePrivateRecordField {
+            field: "name".into(),
+            record: "Dir".into(),
+            modules: vec!["fs".into()],
+            field_span: 0..1,
+        };
+        let diags = err.to_diagnostics(0, 0..1);
+
+        assert!(
+            diags[0].message.contains("private record `Dir`"),
+            "expected explicit private-record message, got: {}",
+            diags[0].message
+        );
+        assert!(
+            diags[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("(pub type Dir [...])")),
+            "expected concrete pub-type export instruction, got notes: {:?}",
+            diags[0].notes,
         );
     }
 

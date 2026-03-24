@@ -583,14 +583,12 @@ impl Lowerer {
                 Some(Expr::Variable(name.to_string(), token.span.clone()))
             }
 
-            // Qualified ident in value position — zero-arg cross-module call
-            TokenKind::QualifiedIdent((module, function)) => Some(Expr::QualifiedCall {
-                module: module.clone(),
-                function: function.clone(),
-                args: vec![],
-                fn_span: token.span.clone(),
-                span: token.span.clone(),
-            }),
+            // Qualified ident in value position — function value (like any other identifier).
+            // Calls remain explicit via `(module/function ...)`.
+            TokenKind::QualifiedIdent((module, function)) => Some(Expr::Variable(
+                format!("{module}/{function}"),
+                token.span.clone(),
+            )),
 
             // Field accessor used as a bare atom, not wrapped in parens
             TokenKind::NamedField(name) => {
@@ -3478,6 +3476,33 @@ mod tests {
             } else {
                 panic!("expected nested call for first pipe step");
             }
+        } else {
+            panic!("expected Call");
+        }
+    }
+
+    #[test]
+    fn test_qualified_ident_in_value_position_lowers_to_variable() {
+        let (mut lowerer, file_id, sexprs) = setup("io/debug");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+        assert!(matches!(expr, Expr::Variable(ref name, _) if name == "io/debug"));
+    }
+
+    #[test]
+    fn test_pipe_desugars_qualified_step_to_qualified_variable_call() {
+        let (mut lowerer, file_id, sexprs) = setup("(|> x io/debug)");
+        let expr = lowerer
+            .lower_expr(file_id, &sexprs[0])
+            .expect("lowering failed");
+        assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+
+        if let Expr::Call { func, args, .. } = expr {
+            assert!(matches!(*func, Expr::Variable(ref name, _) if name == "io/debug"));
+            assert_eq!(args.len(), 1);
+            assert!(matches!(args[0], Expr::Variable(ref name, _) if name == "x"));
         } else {
             panic!("expected Call");
         }
