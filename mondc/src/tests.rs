@@ -1350,6 +1350,23 @@ fn unused_local_analysis_marks_unused_match_pattern_bindings() {
 }
 
 #[test]
+fn unused_local_analysis_marks_unused_letq_pattern_bindings() {
+    let src = "(let main {} (let? [scheme (Ok \"http\")] (Ok ())))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let unused = warnings::unused_local_spans(&decls);
+    assert_eq!(unused.len(), 1, "unexpected unused locals: {unused:?}");
+    assert_eq!(unused[0].0, "scheme");
+    assert_eq!(&src[unused[0].1.clone()], "scheme");
+}
+
+#[test]
 fn compile_emits_unused_local_binding_warning() {
     let src = "(let main {} (let [x 1 y 2] x))";
     let report = compile_with_imports_report(
