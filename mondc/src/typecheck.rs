@@ -719,6 +719,54 @@ pub fn apply_subst_env(subst: &Substitution, env: &TypeEnv) -> TypeEnv {
         .collect()
 }
 
+fn apply_type_aliases(ty: &Rc<Type>, aliases: &HashMap<String, String>) -> Rc<Type> {
+    match ty.as_ref() {
+        Type::Var(_) => ty.clone(),
+        Type::Fun(arg, ret) => Type::fun(
+            apply_type_aliases(arg, aliases),
+            apply_type_aliases(ret, aliases),
+        ),
+        Type::Con(name, args) => Type::con(
+            resolve_type_name(name, aliases),
+            args.iter()
+                .map(|arg| apply_type_aliases(arg, aliases))
+                .collect(),
+        ),
+    }
+}
+
+fn apply_predicate_type_aliases(pred: &Predicate, aliases: &HashMap<String, String>) -> Predicate {
+    match pred {
+        Predicate::HasField {
+            label,
+            record_ty,
+            field_ty,
+        } => Predicate::HasField {
+            label: label.clone(),
+            record_ty: apply_type_aliases(record_ty, aliases),
+            field_ty: apply_type_aliases(field_ty, aliases),
+        },
+    }
+}
+
+pub fn normalize_scheme_type_aliases(scheme: &Scheme, aliases: &HashMap<String, String>) -> Scheme {
+    Scheme {
+        vars: scheme.vars.clone(),
+        preds: scheme
+            .preds
+            .iter()
+            .map(|pred| apply_predicate_type_aliases(pred, aliases))
+            .collect(),
+        ty: apply_type_aliases(&scheme.ty, aliases),
+    }
+}
+
+pub fn normalize_env_type_aliases(env: &TypeEnv, aliases: &HashMap<String, String>) -> TypeEnv {
+    env.iter()
+        .map(|(name, scheme)| (name.clone(), normalize_scheme_type_aliases(scheme, aliases)))
+        .collect()
+}
+
 pub fn compose_subst(s_later: &Substitution, s_earlier: &Substitution) -> Substitution {
     let mut result: Substitution = s_earlier
         .iter()
@@ -1040,6 +1088,26 @@ impl TypeChecker {
         self.field_instances.get(label).cloned().unwrap_or_default()
     }
 
+    fn field_instance_candidates_with_env(&self, env: &TypeEnv, label: &str) -> Vec<String> {
+        let mut candidates = self.field_instance_candidates(label);
+        for key in env.keys() {
+            let Some(rest) = key.strip_prefix(':') else {
+                continue;
+            };
+            let Some((record_name, field_name)) = rest.rsplit_once(':') else {
+                continue;
+            };
+            if field_name != label || record_name.is_empty() {
+                continue;
+            }
+            if !candidates.iter().any(|existing| existing == record_name) {
+                candidates.push(record_name.to_string());
+            }
+        }
+        candidates.sort();
+        candidates
+    }
+
     fn inaccessible_private_record_modules(&self, record_ty: &Rc<Type>) -> Option<Vec<String>> {
         let Type::Con(record_name, _) = record_ty.as_ref() else {
             return None;
@@ -1066,7 +1134,7 @@ impl TypeChecker {
                 field: label.to_string(),
                 record_ty: record_ty.clone(),
                 field_ty: field_ty.clone(),
-                candidates: self.field_instance_candidates(label),
+                candidates: self.field_instance_candidates_with_env(env, label),
             }
         })?;
         let accessor_ty = self.instantiate(accessor_scheme);
@@ -1099,19 +1167,9 @@ impl TypeChecker {
                     record_ty,
                     field_ty,
                 } => {
-                    let candidates = self.field_instance_candidates(&label);
+                    let candidates = self.field_instance_candidates_with_env(env, &label);
                     match record_ty.as_ref() {
                         Type::Con(record_name, _) => {
-                            if !candidates.is_empty()
-                                && !candidates.iter().any(|candidate| candidate == record_name)
-                            {
-                                return Err(TypeError::UnsatisfiedFieldConstraint {
-                                    field: label,
-                                    record_ty,
-                                    field_ty,
-                                    candidates,
-                                });
-                            }
                             let s = self
                                 .solve_has_field_against_record(
                                     env,
@@ -1139,12 +1197,29 @@ impl TypeChecker {
                         }
                         Type::Var(_) => match candidates.as_slice() {
                             [] => {
-                                return Err(TypeError::UnsatisfiedFieldConstraint {
-                                    field: label,
-                                    record_ty,
-                                    field_ty,
-                                    candidates,
-                                });
+                                let accessor_name = format!(":{label}");
+                                let Some(accessor_scheme) = env.get(&accessor_name) else {
+                                    return Err(TypeError::UnsatisfiedFieldConstraint {
+                                        field: label,
+                                        record_ty,
+                                        field_ty,
+                                        candidates,
+                                    });
+                                };
+                                let accessor_ty = self.instantiate(accessor_scheme);
+                                match accessor_ty.as_ref() {
+                                    Type::Fun(accessor_record_ty, accessor_field_ty) => {
+                                        let s1 = unify(accessor_record_ty, &record_ty)?;
+                                        let s2 = unify(
+                                            &apply_subst(&s1, accessor_field_ty),
+                                            &apply_subst(&s1, &field_ty),
+                                        )?;
+                                        let s = compose_subst(&s2, &s1);
+                                        subst = compose_subst(&s, &subst);
+                                        residual = apply_subst_preds(&s, &residual);
+                                    }
+                                    _ => unreachable!("record accessor must be a unary function"),
+                                }
                             }
                             [record_name] => {
                                 let s = self.solve_has_field_against_record(
@@ -2220,7 +2295,7 @@ impl TypeChecker {
                 // Fallback for unresolved record layouts: preserve the input record type.
                 for (field_name, value_expr) in updates {
                     let value_span = value_expr.span();
-                    let candidates = self.field_instance_candidates(field_name);
+                    let candidates = self.field_instance_candidates_with_env(env, field_name);
                     if candidates.is_empty() {
                         let record_ty = apply_subst(&subst, &t_record);
                         if let Some(modules) = self.inaccessible_private_record_modules(&record_ty)

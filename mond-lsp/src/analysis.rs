@@ -131,12 +131,11 @@ pub(super) fn build_project_analysis(
         .iter()
         .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect();
-    let mut analysis =
-        mondc::build_project_analysis_with_modules(&external_mods, &src_module_sources)?;
-    if let Some(package_name) = package_name {
-        mondc::alias_package_root_module(&mut analysis, package_name)?;
-    }
-    Ok(analysis)
+    mondc::build_project_analysis_with_modules_and_package(
+        &external_mods,
+        &src_module_sources,
+        package_name,
+    )
 }
 
 pub(super) fn visible_exports(
@@ -688,6 +687,51 @@ pub(super) fn scan_ident_start(source: &str, offset: usize) -> usize {
         idx -= 1;
     }
     idx
+}
+
+pub(super) fn scan_ident_end(source: &str, offset: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut idx = offset;
+    while idx < bytes.len() && is_ident_byte(bytes[idx]) {
+        idx += 1;
+    }
+    idx
+}
+
+pub(super) fn field_accessor_at_offset(source: &str, offset: usize) -> Option<String> {
+    if source.is_empty() || offset > source.len() {
+        return None;
+    }
+
+    let bytes = source.as_bytes();
+
+    if offset < bytes.len() && bytes[offset] == b':' {
+        let start = offset + 1;
+        if start >= bytes.len() || !is_ident_byte(bytes[start]) {
+            return None;
+        }
+        let end = scan_ident_end(source, start);
+        return source.get(start..end).map(|name| format!(":{name}"));
+    }
+
+    let mut ident_offset = if offset == bytes.len() {
+        offset.saturating_sub(1)
+    } else {
+        offset
+    };
+    if !is_ident_byte(bytes[ident_offset]) {
+        if ident_offset == 0 || !is_ident_byte(bytes[ident_offset - 1]) {
+            return None;
+        }
+        ident_offset -= 1;
+    }
+
+    let start = scan_ident_start(source, ident_offset + 1);
+    if start == 0 || bytes[start - 1] != b':' {
+        return None;
+    }
+    let end = scan_ident_end(source, ident_offset);
+    source.get(start..end).map(|name| format!(":{name}"))
 }
 
 pub(super) fn is_ident_byte(byte: u8) -> bool {
@@ -1739,6 +1783,10 @@ pub(super) fn find_hover_target(
     source: &str,
     offset: usize,
 ) -> Option<HoverTarget> {
+    if let Some(field_accessor) = field_accessor_at_offset(source, offset) {
+        return Some(HoverTarget::Unqualified(field_accessor));
+    }
+
     let mut lowerer = mondc::lower::Lowerer::new();
     let tokens = mondc::lexer::Lexer::new(source).lex();
     let file_id = lowerer.add_file(

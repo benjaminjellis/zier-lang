@@ -78,6 +78,14 @@ pub fn build_project_analysis_with_modules(
     external_mods: &[(String, String, String)],
     src_module_sources: &[(String, String)],
 ) -> Result<ProjectAnalysis, String> {
+    build_project_analysis_with_modules_and_package(external_mods, src_module_sources, None)
+}
+
+pub fn build_project_analysis_with_modules_and_package(
+    external_mods: &[(String, String, String)],
+    src_module_sources: &[(String, String)],
+    package_name: Option<&str>,
+) -> Result<ProjectAnalysis, String> {
     let mut module_exports = HashMap::new();
     let mut module_type_decls = HashMap::new();
     let mut module_private_record_types = HashMap::new();
@@ -102,10 +110,34 @@ pub fn build_project_analysis_with_modules(
         module_extern_types.insert(module_name.clone(), crate::exported_extern_types(source));
     }
 
-    let module_aliases: HashMap<String, String> = external_mods
+    let mut module_aliases: HashMap<String, String> = external_mods
         .iter()
         .map(|(user_name, erlang_name, _)| (user_name.clone(), erlang_name.clone()))
         .collect();
+
+    apply_package_root_alias_to_metadata(
+        &mut module_exports,
+        &mut module_type_decls,
+        &mut module_private_record_types,
+        &mut module_extern_types,
+        &mut module_aliases,
+        package_name,
+    )?;
+
+    let mut src_module_sources_for_inference = src_module_sources.to_vec();
+    if let Some(package_name) = package_name
+        && package_name != "lib"
+        && !src_module_sources_for_inference
+            .iter()
+            .any(|(module_name, _)| module_name == package_name)
+        && let Some((_, lib_source)) = src_module_sources
+            .iter()
+            .find(|(module_name, _)| module_name == "lib")
+    {
+        // Add a synthetic root-module source (package name -> lib source) so dependency
+        // ordering and export inference both understand `(use <package>)` imports.
+        src_module_sources_for_inference.push((package_name.to_string(), lib_source.clone()));
+    }
 
     let mut all_module_schemes: HashMap<String, crate::typecheck::TypeEnv> = HashMap::new();
     for (user_name, _, source) in external_mods {
@@ -133,7 +165,7 @@ pub fn build_project_analysis_with_modules(
         all_module_schemes.insert(user_name.clone(), schemes);
     }
 
-    let ordered_module_sources = ordered_module_sources(src_module_sources)?;
+    let ordered_module_sources = ordered_module_sources(&src_module_sources_for_inference)?;
     for (module_name, source) in &ordered_module_sources {
         let imports = resolve_imports_for_source(
             source,
@@ -167,6 +199,64 @@ pub fn build_project_analysis_with_modules(
         all_module_schemes,
         module_aliases,
     })
+}
+
+fn apply_package_root_alias_to_metadata(
+    module_exports: &mut HashMap<String, Vec<String>>,
+    module_type_decls: &mut HashMap<String, Vec<crate::ast::TypeDecl>>,
+    module_private_record_types: &mut HashMap<String, Vec<String>>,
+    module_extern_types: &mut HashMap<String, Vec<String>>,
+    module_aliases: &mut HashMap<String, String>,
+    package_name: Option<&str>,
+) -> Result<(), String> {
+    const LIB_MODULE_NAME: &str = "lib";
+
+    let Some(package_name) = package_name else {
+        return Ok(());
+    };
+    if package_name == LIB_MODULE_NAME {
+        return Ok(());
+    }
+
+    let Some(lib_exports) = module_exports.get(LIB_MODULE_NAME).cloned() else {
+        return Ok(());
+    };
+
+    if module_exports.contains_key(package_name)
+        || module_type_decls.contains_key(package_name)
+        || module_extern_types.contains_key(package_name)
+        || module_aliases.contains_key(package_name)
+    {
+        return Err(format!(
+            "module name collision: package `{package_name}` conflicts with an existing module name; cannot alias `src/lib.mond` as `{package_name}`"
+        ));
+    }
+
+    module_exports.insert(package_name.to_string(), lib_exports);
+    module_type_decls.insert(
+        package_name.to_string(),
+        module_type_decls
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    module_private_record_types.insert(
+        package_name.to_string(),
+        module_private_record_types
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    module_extern_types.insert(
+        package_name.to_string(),
+        module_extern_types
+            .get(LIB_MODULE_NAME)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    module_aliases.insert(package_name.to_string(), LIB_MODULE_NAME.to_string());
+
+    Ok(())
 }
 
 pub fn alias_package_root_module(
@@ -268,7 +358,13 @@ pub fn resolve_imports_for_source(
             }
         }
 
-        if let Some(mod_schemes) = project.all_module_schemes.get(&mod_name) {
+        let mod_schemes = project.all_module_schemes.get(&mod_name).or_else(|| {
+            project
+                .module_aliases
+                .get(&mod_name)
+                .and_then(|alias_target| project.all_module_schemes.get(alias_target))
+        });
+        if let Some(mod_schemes) = mod_schemes {
             for (fn_name, scheme) in mod_schemes {
                 if unqualified.includes(fn_name) {
                     imported_schemes.insert(fn_name.clone(), scheme.clone());
@@ -821,6 +917,71 @@ mod tests {
         assert_eq!(
             analysis.module_aliases.get("time").map(String::as_str),
             Some("lib")
+        );
+    }
+
+    #[test]
+    fn resolve_imports_falls_back_to_alias_target_schemes() {
+        let project = ProjectAnalysis {
+            module_exports: HashMap::from([("time".to_string(), vec!["now".to_string()])]),
+            module_type_decls: HashMap::new(),
+            module_private_record_types: HashMap::new(),
+            module_extern_types: HashMap::new(),
+            all_module_schemes: HashMap::from([(
+                "lib".to_string(),
+                HashMap::from([(
+                    "now".to_string(),
+                    crate::typecheck::Scheme {
+                        vars: vec![],
+                        preds: vec![],
+                        ty: crate::typecheck::Type::int(),
+                    },
+                )]),
+            )]),
+            module_aliases: HashMap::from([("time".to_string(), "lib".to_string())]),
+        };
+
+        let resolved = resolve_imports_for_source(
+            "(use time)\n(let main {} (time/now))",
+            &project.module_exports,
+            &project,
+        );
+        let scheme = resolved
+            .imported_schemes
+            .get("time/now")
+            .expect("time/now scheme");
+        assert_eq!(crate::typecheck::scheme_display(scheme), "Int");
+    }
+
+    #[test]
+    fn build_project_analysis_with_package_infers_precise_types_for_package_imports() {
+        let src_modules = vec![
+            (
+                "lib".to_string(),
+                "(pub type Header [(:name ~ String)])\n\
+                 (pub let to_header {value} (Header :name value))"
+                    .to_string(),
+            ),
+            (
+                "cookie".to_string(),
+                "(use time)\n\
+                 (pub let parse {value}\n\
+                   [(time/to_header value)])"
+                    .to_string(),
+            ),
+        ];
+
+        let analysis =
+            build_project_analysis_with_modules_and_package(&[], &src_modules, Some("time"))
+                .expect("project analysis with package alias");
+        let cookie_schemes = analysis
+            .all_module_schemes
+            .get("cookie")
+            .expect("cookie schemes");
+        let parse_scheme = cookie_schemes.get("parse").expect("parse scheme");
+        assert_eq!(
+            crate::typecheck::scheme_display(parse_scheme),
+            "String -> List Header"
         );
     }
 

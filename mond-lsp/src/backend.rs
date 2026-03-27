@@ -23,14 +23,14 @@ use tower_lsp::{
 };
 
 use crate::{
-    CompletionContext, DocumentAnalysis, HoverTarget, OccurrenceKind, Symbol,
+    CompletionContext, DocumentAnalysis, HoverTarget, ModuleSource, OccurrenceKind, Symbol,
     analysis::project_diagnostic_batches_for_uri,
     best_expr_type_at_offset, byte_range_to_lsp_range, collect_local_occurrences,
     completion_context, find_hover_target, find_project_root, full_document_range,
     full_text_change, function_arity, local_symbol_at, lsp_documentation, lsp_error_diagnostic,
     position_to_offset,
     project::Project,
-    scheme_for_symbol,
+    record_field_context, scheme_for_symbol,
     semantic_tokens::{compute_semantic_tokens_full, semantic_tokens_capabilities},
     signature_target_at,
     state::{DocumentState, ServerState},
@@ -132,7 +132,12 @@ impl Backend {
         }
     }
 
-    fn analyze_document(&self, uri: &Url) -> std::result::Result<Option<DocumentAnalysis>, String> {
+    fn analyze_document(
+        &self,
+        uri: &Url,
+        include_bindings: bool,
+        include_expr_types: bool,
+    ) -> std::result::Result<Option<(Project, ModuleSource, DocumentAnalysis)>, String> {
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
@@ -143,8 +148,9 @@ impl Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let analysis = project.analyze_document(&doc)?;
-        Ok(Some(analysis))
+        let analysis =
+            project.analyze_document_with_options(&doc, include_bindings, include_expr_types)?;
+        Ok(Some((project, doc, analysis)))
     }
 
     fn document_diagnostics(
@@ -185,6 +191,24 @@ impl Backend {
         let root = find_project_root(&path);
         Project::load(root.as_deref(), &self.state, &uri).map(Some)
     }
+}
+
+fn render_hover_signature(
+    source: &str,
+    offset: usize,
+    name: &str,
+    scheme: &mondc::typecheck::Scheme,
+) -> String {
+    let display_ty = if name.starts_with(':') && record_field_context(source, offset).is_some() {
+        match scheme.ty.as_ref() {
+            mondc::typecheck::Type::Fun(_, ret) => mondc::typecheck::type_display(ret),
+            _ => mondc::typecheck::type_display(&scheme.ty),
+        }
+    } else {
+        mondc::typecheck::type_display(&scheme.ty)
+    };
+
+    format!("{name} : {display_ty}")
 }
 
 #[tower_lsp::async_trait]
@@ -246,10 +270,10 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let imported_type_decls = self
-            .analyze_document(&uri)
+            .analyze_document(&uri, false, false)
             .ok()
             .flatten()
-            .map(|analysis| analysis.imports.imported_type_decls)
+            .map(|(_, _, analysis)| analysis.imports.imported_type_decls)
             .unwrap_or_default();
         let tokens = compute_semantic_tokens_full(&path, &source, &imported_type_decls)
             .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
@@ -301,63 +325,55 @@ impl LanguageServer for Backend {
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
-        let Some(analysis) = self
-            .analyze_document(&uri)
+        let Some((project, doc, analysis)) = self
+            .analyze_document(&uri, false, false)
             .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
         else {
             return Ok(None);
-        };
-        let path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let root = find_project_root(&path);
-        let project = Project::load(root.as_deref(), &self.state, &uri)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-        let doc = match project.document_for_path(&path) {
-            Some(doc) => doc,
-            None => return Ok(None),
         };
         let Some(offset) =
             position_to_offset(&doc.source, params.text_document_position_params.position)
         else {
             return Ok(None);
         };
-        let scheme = if let Some(target) = find_hover_target(&doc.path, &doc.source, offset) {
+        let hover_target = find_hover_target(&doc.path, &doc.source, offset);
+        let mut scheme = if let Some(target) = hover_target.as_ref() {
             match target {
                 HoverTarget::Unqualified(name) => {
-                    if let Some(scheme) = analysis.bindings.get(&name).cloned() {
+                    if let Some(scheme) = project
+                        .analysis
+                        .all_module_schemes
+                        .get(&doc.name)
+                        .and_then(|env| env.get(name))
+                        .cloned()
+                    {
                         Some((
                             name.clone(),
                             scheme,
                             Some(Symbol {
                                 module: doc.name.clone(),
-                                function: name,
+                                function: name.clone(),
                             }),
                         ))
                     } else if let Some(scheme) =
-                        analysis.imports.imported_schemes.get(&name).cloned()
+                        analysis.imports.imported_schemes.get(name).cloned()
                     {
-                        analysis
-                            .imports
-                            .import_origins
-                            .get(&name)
-                            .cloned()
-                            .map(|module| {
-                                (
-                                    name.clone(),
-                                    scheme,
-                                    Some(Symbol {
-                                        module,
-                                        function: name,
-                                    }),
-                                )
-                            })
+                        let symbol =
+                            analysis
+                                .imports
+                                .import_origins
+                                .get(name)
+                                .cloned()
+                                .map(|module| Symbol {
+                                    module,
+                                    function: name.clone(),
+                                });
+                        Some((name.clone(), scheme, symbol))
                     } else {
                         mondc::typecheck::primitive_env()
-                            .get(&name)
+                            .get(name.as_str())
                             .cloned()
-                            .map(|scheme| (name, scheme, None))
+                            .map(|scheme| (name.clone(), scheme, None))
                     }
                 }
                 HoverTarget::Qualified { module, function } => analysis
@@ -369,15 +385,18 @@ impl LanguageServer for Backend {
                         project
                             .analysis
                             .all_module_schemes
-                            .get(&module)
-                            .and_then(|env| env.get(&function))
+                            .get(module.as_str())
+                            .and_then(|env| env.get(function.as_str()))
                             .cloned()
                     })
                     .map(|scheme| {
                         (
                             format!("{module}/{function}"),
                             scheme,
-                            Some(Symbol { module, function }),
+                            Some(Symbol {
+                                module: module.clone(),
+                                function: function.clone(),
+                            }),
                         )
                     }),
             }
@@ -391,9 +410,11 @@ impl LanguageServer for Backend {
                         format!("{}/{}", symbol.module, symbol.function)
                     };
                     if symbol.module == doc.name {
-                        analysis
-                            .bindings
-                            .get(&symbol.function)
+                        project
+                            .analysis
+                            .all_module_schemes
+                            .get(&symbol.module)
+                            .and_then(|env| env.get(&symbol.function))
                             .cloned()
                             .map(|scheme| (name, scheme, Some(symbol)))
                     } else {
@@ -415,6 +436,23 @@ impl LanguageServer for Backend {
                 })
         };
 
+        if scheme.is_none()
+            && let Some(HoverTarget::Unqualified(name)) = hover_target.as_ref()
+            && let Ok(binding_analysis) = project.analyze_document_with_options(&doc, true, false)
+            && let Some(local_scheme) = binding_analysis.bindings.get(name).cloned()
+        {
+            let symbol = project
+                .analysis
+                .all_module_schemes
+                .get(&doc.name)
+                .and_then(|env| env.get(name))
+                .map(|_| Symbol {
+                    module: doc.name.clone(),
+                    function: name.clone(),
+                });
+            scheme = Some((name.clone(), local_scheme, symbol));
+        }
+
         let Some((name, scheme, symbol)) = scheme else {
             if let Some(ty) = best_expr_type_at_offset(&analysis.expr_types, offset) {
                 return Ok(Some(Hover {
@@ -422,9 +460,19 @@ impl LanguageServer for Backend {
                     range: None,
                 }));
             }
+
+            // Only run expr-type inference when symbol lookup fails.
+            if let Ok(fallback_analysis) = project.analyze_document_with_options(&doc, false, true)
+                && let Some(ty) = best_expr_type_at_offset(&fallback_analysis.expr_types, offset)
+            {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Scalar(MarkedString::String(ty)),
+                    range: None,
+                }));
+            }
             return Ok(None);
         };
-        let rendered = format!("{name} : {}", mondc::typecheck::type_display(&scheme.ty));
+        let rendered = render_hover_signature(&doc.source, offset, &name, &scheme);
         let docs = symbol
             .and_then(|symbol| symbol_documentation_for_symbol(&project, &doc, &analysis, &symbol));
         let contents = if let Some(docs) = docs {
@@ -788,5 +836,42 @@ impl LanguageServer for Backend {
             active_signature: Some(0),
             active_parameter: Some(target.arg_index.min(arity.saturating_sub(1)) as u32),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_hover_signature;
+
+    #[test]
+    fn record_field_label_hover_shows_field_type_not_accessor_function() {
+        let scheme = mondc::typecheck::Scheme {
+            vars: vec![],
+            preds: vec![],
+            ty: mondc::typecheck::Type::fun(
+                mondc::typecheck::Type::con("Attributes", vec![]),
+                mondc::typecheck::Type::con("option/Option", vec![mondc::typecheck::Type::int()]),
+            ),
+        };
+        let source = "(with attrs :max_age (Some 0))";
+        let offset = source.find("max_age").expect("field token") + 2;
+        let rendered = render_hover_signature(source, offset, ":max_age", &scheme);
+        assert_eq!(rendered, ":max_age : option/Option Int");
+    }
+
+    #[test]
+    fn accessor_call_hover_keeps_function_type() {
+        let scheme = mondc::typecheck::Scheme {
+            vars: vec![],
+            preds: vec![],
+            ty: mondc::typecheck::Type::fun(
+                mondc::typecheck::Type::con("Attributes", vec![]),
+                mondc::typecheck::Type::con("option/Option", vec![mondc::typecheck::Type::int()]),
+            ),
+        };
+        let source = "(:max_age attrs)";
+        let offset = source.find("max_age").expect("accessor token") + 2;
+        let rendered = render_hover_signature(source, offset, ":max_age", &scheme);
+        assert_eq!(rendered, ":max_age : Attributes -> option/Option Int");
     }
 }

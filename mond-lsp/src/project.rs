@@ -642,30 +642,47 @@ impl Project {
         &self,
         doc: &ModuleSource,
     ) -> std::result::Result<DocumentAnalysis, String> {
+        self.analyze_document_with_options(doc, true, true)
+    }
+
+    pub(crate) fn analyze_document_with_options(
+        &self,
+        doc: &ModuleSource,
+        include_bindings: bool,
+        include_expr_types: bool,
+    ) -> std::result::Result<DocumentAnalysis, String> {
         let visible_exports = visible_exports(&self.analysis, &self.test_modules, &doc.name);
         let imports = mondc::resolve_imports_for_source(
             doc.source.as_str(),
             &visible_exports,
             &self.analysis,
         );
-        let bindings = mondc::infer_module_bindings(
-            &doc.name,
-            &doc.source,
-            imports.imports.clone(),
-            &visible_exports,
-            &imports.imported_type_decls,
-            &imports.imported_extern_types,
-            &imports.imported_schemes,
-        );
-        let expr_types = mondc::infer_module_expr_types(
-            &doc.name,
-            &doc.source,
-            imports.imports.clone(),
-            &visible_exports,
-            &imports.imported_type_decls,
-            &imports.imported_extern_types,
-            &imports.imported_schemes,
-        );
+        let bindings = if include_bindings {
+            mondc::infer_module_bindings(
+                &doc.name,
+                &doc.source,
+                imports.imports.clone(),
+                &visible_exports,
+                &imports.imported_type_decls,
+                &imports.imported_extern_types,
+                &imports.imported_schemes,
+            )
+        } else {
+            HashMap::new()
+        };
+        let expr_types = if include_expr_types {
+            mondc::infer_module_expr_types(
+                &doc.name,
+                &doc.source,
+                imports.imports.clone(),
+                &visible_exports,
+                &imports.imported_type_decls,
+                &imports.imported_extern_types,
+                &imports.imported_schemes,
+            )
+        } else {
+            Vec::new()
+        };
         Ok(DocumentAnalysis {
             bindings,
             expr_types,

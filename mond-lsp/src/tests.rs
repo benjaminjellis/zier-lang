@@ -54,6 +54,17 @@ fn hover_target_ignores_local_bindings() {
 }
 
 #[test]
+fn hover_target_finds_record_update_field_accessor_reference() {
+    let src = "(let expire_cookie {attributes} (with attributes :max_age (Some 0)))";
+    let offset = src.find("max_age").unwrap() + 2;
+    let target = find_hover_target(Path::new("src/main.mond"), src, offset);
+    match target {
+        Some(HoverTarget::Unqualified(name)) => assert_eq!(name, ":max_age"),
+        other => panic!("unexpected target: {other:?}"),
+    }
+}
+
+#[test]
 fn full_document_range_covers_entire_source() {
     let src = "(let add {a b} (+ a b))\n";
     let range = full_document_range(src);

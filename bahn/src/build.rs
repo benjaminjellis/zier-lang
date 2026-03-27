@@ -316,10 +316,12 @@ pub(crate) fn generate_erl_sources_with_roots(
         mondc::ordered_module_sources(&module_sources).map_err(|err| eyre::eyre!(err))?;
 
     // Phase 1b: seed module_exports with dependency modules provided in manifest deps.
-    let mut analysis = mondc::build_project_analysis(&dependency_mods, &module_sources)
-        .map_err(|err| eyre::eyre!(err))?;
-    mondc::alias_package_root_module(&mut analysis, &manifest.package.name)
-        .map_err(|err| eyre::eyre!(err))?;
+    let mut analysis = mondc::build_project_analysis_with_modules_and_package(
+        &dependency_mods,
+        &module_sources,
+        Some(&manifest.package.name),
+    )
+    .map_err(|err| eyre::eyre!(err))?;
     apply_local_module_aliases(&mut analysis, &module_sources, &manifest.package.name);
     module_exports = analysis.module_exports.clone();
     module_type_decls = analysis.module_type_decls.clone();

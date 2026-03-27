@@ -90,6 +90,55 @@ fn qualified_function_value_works_in_pipe_steps() {
 }
 
 #[test]
+fn imported_record_update_normalizes_qualified_constructor_types() {
+    let src = "(let expire_cookie {attributes} (with attributes :max_age (Some 0)))";
+
+    let imported_type_decls =
+        exported_type_decls("(pub type Attributes [(:max_age ~ (option/Option Int))])");
+
+    let mut imported_schemes = HashMap::new();
+    imported_schemes.insert(
+        "Some".to_string(),
+        typecheck::Scheme {
+            vars: vec![],
+            preds: vec![],
+            ty: typecheck::Type::fun(
+                typecheck::Type::int(),
+                typecheck::Type::con("Option", vec![typecheck::Type::int()]),
+            ),
+        },
+    );
+    imported_schemes.insert(
+        ":max_age".to_string(),
+        typecheck::Scheme {
+            vars: vec![],
+            preds: vec![],
+            ty: typecheck::Type::fun(
+                typecheck::Type::con("Attributes", vec![]),
+                typecheck::Type::con("option/Option", vec![typecheck::Type::int()]),
+            ),
+        },
+    );
+
+    let result = compile_with_imports(
+        "main",
+        src,
+        "main.mond",
+        HashMap::new(),
+        &HashMap::new(),
+        HashMap::new(),
+        &imported_type_decls,
+        &[],
+        &HashMap::new(),
+        &imported_schemes,
+    );
+    assert!(
+        result.is_some(),
+        "record update should accept equivalent qualified and unqualified constructor types"
+    );
+}
+
+#[test]
 fn error_identifier_is_allowed_in_bindings() {
     let src = "(let main {error} (match error _ ~> error))";
     let result = compile_with_imports(
@@ -550,6 +599,40 @@ fn qualified_only_use_keeps_record_field_accessors_available() {
     assert!(
         !report.has_errors(),
         "record field access should work without unqualified type import: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_only_use_keeps_record_updates_available() {
+    let map_src = "(pub type ['a 'b] TakeResult [(:value ~ 'a) (:rest ~ 'b)])\n(pub let take {} (TakeResult :value \"mond\" :rest \"std\"))";
+    let std_mods = vec![(
+        "map".to_string(),
+        "mond_map".to_string(),
+        map_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src = "(use map)\n(let main {} (with (map/take) :value \"next\"))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report(
+        "main",
+        src,
+        "main.mond",
+        resolved.imports,
+        &analysis.module_exports,
+        resolved.module_aliases,
+        &resolved.imported_type_decls,
+        &resolved.imported_extern_types,
+        &resolved.imported_field_indices,
+        &resolved.imported_schemes,
+    );
+    assert!(
+        !report.has_errors(),
+        "record update should work without unqualified type import: {:?}",
         report
             .diagnostics
             .iter()
