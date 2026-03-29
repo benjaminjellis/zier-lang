@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use codespan_reporting::{diagnostic::Diagnostic, files::SimpleFiles};
+
 use crate::{ast, codegen, lower, resolve, session, sexpr, typecheck, warnings};
 
 const PRIMITIVE_TYPE_NAMES: [&str; 6] = ["Int", "Float", "Bool", "String", "Unit", "List"];
@@ -255,6 +257,44 @@ fn known_type_names(
     known
 }
 
+fn push_and_emit_diag(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    diag: Diagnostic<usize>,
+) {
+    sess.emit(files, &diag);
+    diagnostics.push(diag);
+}
+
+fn push_and_emit_diags<I>(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    diags: I,
+) -> usize
+where
+    I: IntoIterator<Item = Diagnostic<usize>>,
+{
+    let mut count = 0;
+    for diag in diags {
+        push_and_emit_diag(sess, files, diagnostics, diag);
+        count += 1;
+    }
+    count
+}
+
+fn compile_error_report(
+    files: SimpleFiles<String, String>,
+    diagnostics: Vec<Diagnostic<usize>>,
+) -> session::CompileReport {
+    session::CompileReport {
+        output: None,
+        files,
+        diagnostics,
+    }
+}
+
 /// Compile without any imports (single-file or when imports are already resolved).
 #[cfg(test)]
 pub(crate) fn compile(module_name: &str, source: &str) -> Option<String> {
@@ -326,28 +366,21 @@ pub fn compile_with_imports_in_session_with_private_records(
     let sexprs = match sexpr::SExprParser::new(tokens, file_id).parse() {
         Ok(res) => res,
         Err(diag) => {
-            diagnostics.push(diag.clone());
-            sess.emit(&lowerer.files, &diag);
-            return session::CompileReport {
-                output: None,
-                files: lowerer.files,
-                diagnostics,
-            };
+            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
+            return compile_error_report(lowerer.files, diagnostics);
         }
     };
 
     let decls = lowerer.lower_file(file_id, &sexprs);
 
-    for diag in &lowerer.diagnostics {
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, diag);
-    }
-    if !lowerer.diagnostics.is_empty() {
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+    let lowerer_diag_count = push_and_emit_diags(
+        sess,
+        &lowerer.files,
+        &mut diagnostics,
+        lowerer.diagnostics.iter().cloned(),
+    );
+    if lowerer_diag_count > 0 {
+        return compile_error_report(lowerer.files, diagnostics);
     }
 
     let mut use_errors = false;
@@ -365,45 +398,36 @@ pub fn compile_with_imports_in_session_with_private_records(
                     codespan_reporting::diagnostic::Label::primary(file_id, span.clone())
                         .with_message(format!("`{mod_name}` is not a module in this project")),
                 ]);
-            diagnostics.push(diag.clone());
-            sess.emit(&lowerer.files, &diag);
+            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
             use_errors = true;
         }
     }
     if use_errors {
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+        return compile_error_report(lowerer.files, diagnostics);
     }
 
     let duplicate_top_level_values =
         warnings::duplicate_top_level_value_diagnostics(&decls, file_id, module_exports);
-    for diag in &duplicate_top_level_values {
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, diag);
-    }
-    if !duplicate_top_level_values.is_empty() {
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+    if push_and_emit_diags(
+        sess,
+        &lowerer.files,
+        &mut diagnostics,
+        duplicate_top_level_values,
+    ) > 0
+    {
+        return compile_error_report(lowerer.files, diagnostics);
     }
 
     let duplicate_type_constructors =
         warnings::duplicate_type_constructor_diagnostics(&decls, file_id);
-    for diag in &duplicate_type_constructors {
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, diag);
-    }
-    if !duplicate_type_constructors.is_empty() {
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+    if push_and_emit_diags(
+        sess,
+        &lowerer.files,
+        &mut diagnostics,
+        duplicate_type_constructors,
+    ) > 0
+    {
+        return compile_error_report(lowerer.files, diagnostics);
     }
 
     let known_types = known_type_names(&decls, imported_type_decls, imported_extern_types);
@@ -466,8 +490,7 @@ pub fn compile_with_imports_in_session_with_private_records(
                         "declare these types in this module or import them unqualified before using them here",
                     ),
                 ]);
-            diagnostics.push(diag.clone());
-            sess.emit(&lowerer.files, &diag);
+            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
             type_decl_errors = true;
         }
 
@@ -491,17 +514,12 @@ pub fn compile_with_imports_in_session_with_private_records(
                     codespan_reporting::diagnostic::Label::primary(file_id, usage_span)
                         .with_message("use the required number of type arguments here"),
                 ]);
-            diagnostics.push(diag.clone());
-            sess.emit(&lowerer.files, &diag);
+            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
             type_decl_errors = true;
         }
     }
     if type_decl_errors {
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+        return compile_error_report(lowerer.files, diagnostics);
     }
 
     let mut extern_type_errors = false;
@@ -531,16 +549,11 @@ pub fn compile_with_imports_in_session_with_private_records(
                     "import these types (for example: `(use option [Option])`) or declare them in this module",
                 ),
             ]);
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
+        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
         extern_type_errors = true;
     }
     if extern_type_errors {
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+        return compile_error_report(lowerer.files, diagnostics);
     }
 
     let qualified_type_aliases =
@@ -574,15 +587,8 @@ pub fn compile_with_imports_in_session_with_private_records(
 
     if let Err(err) = checker.check_program(&mut env, &decls, file_id) {
         let type_diags = err.0.to_diagnostics(file_id, err.1.span());
-        for diag in type_diags {
-            diagnostics.push(diag.clone());
-            sess.emit(&lowerer.files, &diag);
-        }
-        return session::CompileReport {
-            output: None,
-            files: lowerer.files,
-            diagnostics,
-        };
+        push_and_emit_diags(sess, &lowerer.files, &mut diagnostics, type_diags);
+        return compile_error_report(lowerer.files, diagnostics);
     }
     let inferred_record_expr_types = checker.inferred_record_expr_types();
 
@@ -593,8 +599,7 @@ pub fn compile_with_imports_in_session_with_private_records(
                 codespan_reporting::diagnostic::Label::primary(file_id, span)
                     .with_message("this private function is never used"),
             ]);
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
+        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
     }
     for (name, span) in warnings::unused_type_spans(&decls) {
         let diag = codespan_reporting::diagnostic::Diagnostic::warning()
@@ -603,8 +608,7 @@ pub fn compile_with_imports_in_session_with_private_records(
                 codespan_reporting::diagnostic::Label::primary(file_id, span)
                     .with_message("this private type is never referenced"),
             ]);
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
+        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
     }
     for (type_name, param, span) in warnings::unused_type_param_spans(&decls) {
         let diag = codespan_reporting::diagnostic::Diagnostic::warning()
@@ -615,8 +619,7 @@ pub fn compile_with_imports_in_session_with_private_records(
                 codespan_reporting::diagnostic::Label::primary(file_id, span)
                     .with_message("this type parameter is never used in the type definition"),
             ]);
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
+        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
     }
     for (name, span) in warnings::unused_local_spans(&decls) {
         let diag = codespan_reporting::diagnostic::Diagnostic::warning()
@@ -625,22 +628,25 @@ pub fn compile_with_imports_in_session_with_private_records(
                 codespan_reporting::diagnostic::Label::primary(file_id, span)
                     .with_message("this local binding is never used"),
             ]);
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
+        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
     }
-    for diag in warnings::unused_unqualified_import_diagnostics(
-        &decls,
-        file_id,
-        module_exports,
-        imported_type_decls,
-    ) {
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
-    }
-    for diag in warnings::redundant_match_diagnostics(&decls, file_id, imported_type_decls) {
-        diagnostics.push(diag.clone());
-        sess.emit(&lowerer.files, &diag);
-    }
+    push_and_emit_diags(
+        sess,
+        &lowerer.files,
+        &mut diagnostics,
+        warnings::unused_unqualified_import_diagnostics(
+            &decls,
+            file_id,
+            module_exports,
+            imported_type_decls,
+        ),
+    );
+    push_and_emit_diags(
+        sess,
+        &lowerer.files,
+        &mut diagnostics,
+        warnings::redundant_match_diagnostics(&decls, file_id, imported_type_decls),
+    );
 
     let mut imported_constructors: HashMap<String, usize> = HashMap::new();
     let mut merged_imported_field_indices = imported_field_indices.clone();
