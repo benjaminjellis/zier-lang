@@ -1,8 +1,10 @@
 pub mod ast;
 pub mod codegen;
+pub mod hir;
 pub mod ir;
 pub mod lexer;
 pub mod lower;
+pub mod pipeline;
 pub mod project;
 pub mod resolve;
 pub mod session;
@@ -11,12 +13,16 @@ pub mod typecheck;
 
 mod compiler;
 mod query;
+mod typing;
 mod warnings;
 
 pub use compiler::{
     compile_with_imports, compile_with_imports_in_session,
     compile_with_imports_in_session_with_private_records, compile_with_imports_report,
     compile_with_imports_report_with_private_records,
+};
+pub use pipeline::{
+    CompilePipeline, CompileSession, ModuleInput, PassContext, ResolvedModuleInput,
 };
 pub use project::{
     ProjectAnalysis, ResolvedImports, alias_package_root_module, build_project_analysis,

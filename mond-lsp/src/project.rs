@@ -695,24 +695,16 @@ impl Project {
         doc: &ModuleSource,
     ) -> std::result::Result<Vec<tower_lsp::lsp_types::Diagnostic>, String> {
         let visible_exports = visible_exports(&self.analysis, &self.test_modules, &doc.name);
-        let imports = mondc::resolve_imports_for_source(
-            doc.source.as_str(),
-            &visible_exports,
-            &self.analysis,
-        );
-        let report = mondc::compile_with_imports_report_with_private_records(
-            &doc.name,
-            &doc.source,
-            &source_path_for_compile(self.root.as_deref(), &doc.path),
-            imports.imports,
-            &visible_exports,
-            imports.module_aliases,
-            &imports.imported_type_decls,
-            &imports.imported_extern_types,
-            &imports.imported_field_indices,
-            &imports.imported_private_records,
-            &imports.imported_schemes,
-        );
+        let pipeline = mondc::CompilePipeline::new(mondc::PassContext {
+            visible_exports: &visible_exports,
+            analysis: &self.analysis,
+        });
+        let source_path = source_path_for_compile(self.root.as_deref(), &doc.path);
+        let report = pipeline.compile_module_report(mondc::ModuleInput {
+            output_module_name: &doc.name,
+            source: &doc.source,
+            source_path: &source_path,
+        });
         Ok(report
             .diagnostics
             .iter()

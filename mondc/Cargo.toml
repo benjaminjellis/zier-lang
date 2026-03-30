@@ -6,3 +6,5 @@ version.workspace = true
 [dependencies]
 codespan-reporting  = { workspace = true }
 logos = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+eyre = { workspace = true }

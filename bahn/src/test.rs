@@ -150,7 +150,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let (test_outputs, test_had_error) =
         compile_flow::compile_units(&test_compile_units, &all_exports, &project, true);
     for output in test_outputs {
-        let Some(erl_source) = output.erl_source else {
+        let Some(erl_source) = output.erl_source() else {
             continue;
         };
         let erl_path = erl_dir.join(format!("{}.erl", output.output_module_name));
@@ -164,7 +164,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         erl_paths.push(compile_flow::write_erl_output(
             &erl_dir,
             &output.output_module_name,
-            &erl_source,
+            erl_source,
         )?);
     }
 
@@ -218,7 +218,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         .zip(dependency_outputs.into_iter())
     {
         debug_assert_eq!(output.output_module_name, *erlang_name);
-        let Some(erl_source) = output.erl_source else {
+        let Some(erl_source) = output.erl_source() else {
             continue;
         };
         let erl_path = erl_dir.join(format!("{}.erl", output.output_module_name));
@@ -234,7 +234,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         erl_paths.push(compile_flow::write_erl_output(
             &erl_dir,
             &output.output_module_name,
-            &erl_source,
+            erl_source,
         )?);
     }
     if dependency_had_error {
