@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use crate::{BIN_ENTRY_POINT, LIB_ROOT, TARGET_DIR, gitignore, manifest::BahnManifest};
@@ -250,7 +251,7 @@ pub(crate) fn reachable_dependency_modules(
 
 /// Compile all Mond source files and write `.erl` output into `erl_dir`.
 /// Returns the generated file paths, the project manifest, and detected project type.
-pub(crate) fn generate_erl_sources(
+pub(crate) async fn generate_erl_sources(
     manifest: BahnManifest,
     project_dir: &Path,
     erl_dir: &Path,
@@ -264,10 +265,10 @@ pub(crate) fn generate_erl_sources(
         )));
     }
 
-    generate_erl_sources_with_roots(manifest, project_dir, erl_dir, &[])
+    generate_erl_sources_with_roots(manifest, project_dir, erl_dir, &[]).await
 }
 
-pub(crate) fn generate_erl_sources_with_roots(
+pub(crate) async fn generate_erl_sources_with_roots(
     manifest: BahnManifest,
     project_dir: &Path,
     erl_dir: &Path,
@@ -327,6 +328,7 @@ pub(crate) fn generate_erl_sources_with_roots(
     )
     .map_err(|err| eyre::eyre!(err))?;
     apply_local_module_aliases(&mut analysis, &module_sources, &manifest.package.name);
+    let analysis = Arc::new(analysis);
     module_exports = analysis.module_exports.clone();
     module_type_decls = analysis.module_type_decls.clone();
     module_extern_types = analysis.module_extern_types.clone();
@@ -382,7 +384,7 @@ pub(crate) fn generate_erl_sources_with_roots(
         })
         .collect();
     let (source_outputs, source_had_error) =
-        compile_flow::compile_units(&source_compile_units, &module_exports, &analysis, true);
+        compile_flow::compile_units(&source_compile_units, Arc::clone(&analysis), true).await;
     for output in source_outputs {
         if let Some(erl_source) = output.erl_source() {
             erl_paths.push(compile_flow::write_erl_output(
@@ -399,9 +401,9 @@ pub(crate) fn generate_erl_sources_with_roots(
 
     validate_bin_entrypoint(&project_type, &selected_module_sources)?;
 
-    let dependency_analysis =
-        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?;
-    let dependency_module_exports = compile_flow::dependency_module_exports(&dependency_mods);
+    let dependency_analysis = Arc::new(
+        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?,
+    );
     let dependency_compile_units: Vec<compile_flow::CompileUnit<'_>> = selected_dependency_mods
         .iter()
         .map(|(_, erlang_name, source)| compile_flow::CompileUnit {
@@ -412,10 +414,10 @@ pub(crate) fn generate_erl_sources_with_roots(
         .collect();
     let (dependency_outputs, dependency_had_error) = compile_flow::compile_units(
         &dependency_compile_units,
-        &dependency_module_exports,
-        &dependency_analysis,
+        Arc::clone(&dependency_analysis),
         true,
-    );
+    )
+    .await;
     for output in dependency_outputs {
         if let Some(erl_source) = output.erl_source() {
             erl_paths.push(compile_flow::write_erl_output(
@@ -481,7 +483,7 @@ fn validate_bin_entrypoint(
     Ok(())
 }
 
-pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
+pub(crate) async fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
     let build_dir = project_dir.join(TARGET_DIR).join(DEBUG_BUILD_DIR);
     let erl_dir = build_dir.join(ERL_SOURCE_SUBDIR);
     let ebin_dir = build_dir.join(ERL_BEAM_SUBDIR);
@@ -501,7 +503,7 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
         project_type,
         module_aliases,
         ..
-    } = generate_erl_sources(manifest, project_dir, &erl_dir)?;
+    } = generate_erl_sources(manifest, project_dir, &erl_dir).await?;
 
     if matches!(project_type, ProjectType::Lib) && run {
         return Err(eyre::eyre!("bahn cannot run a library project"));
@@ -510,12 +512,20 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
     crate::utils::verify_erlc_installed()?;
 
     // Run erlc on all .erl files at once
-    let erlc = Command::new("erlc")
-        .arg("-o")
-        .arg(&ebin_dir)
-        .args(&erl_paths)
-        .output()
-        .context("could not run erlc")?;
+    let erlc = {
+        let ebin_dir = ebin_dir.clone();
+        let erl_paths = erl_paths.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new("erlc")
+                .arg("-o")
+                .arg(&ebin_dir)
+                .args(&erl_paths)
+                .output()
+                .context("could not run erlc")
+        })
+        .await
+        .map_err(|err| eyre::eyre!("failed to join erlc task: {err}"))??
+    };
 
     if !erlc.status.success() {
         return Err(eyre::eyre!(
@@ -528,14 +538,22 @@ pub(crate) fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
             .get("main")
             .map(String::as_str)
             .unwrap_or("main");
-        let status = Command::new("erl")
-            .arg("-noinput")
-            .arg("-pa")
-            .arg(&ebin_dir)
-            .arg("-eval")
-            .arg(format!("{main_module}:main(unit), init:stop()."))
-            .status()
-            .context("could not run erl")?;
+        let status = {
+            let ebin_dir = ebin_dir.clone();
+            let main_module = main_module.to_string();
+            tokio::task::spawn_blocking(move || {
+                Command::new("erl")
+                    .arg("-noinput")
+                    .arg("-pa")
+                    .arg(&ebin_dir)
+                    .arg("-eval")
+                    .arg(format!("{main_module}:main(unit), init:stop()."))
+                    .status()
+                    .context("could not run erl")
+            })
+            .await
+            .map_err(|err| eyre::eyre!("failed to join erl task: {err}"))??
+        };
 
         if !status.success() {
             return Err(eyre::eyre!(
@@ -589,7 +607,10 @@ fn verify_project_type(source_files: &[PathBuf]) -> Option<ProjectType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        future::Future,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn unique_temp_root() -> PathBuf {
         let nanos = SystemTime::now()
@@ -597,6 +618,12 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("mond-build-test-{}-{nanos}", std::process::id()))
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(future)
     }
 
     #[test]
@@ -635,11 +662,11 @@ mod tests {
         )
         .expect("write main");
 
-        let err = match generate_erl_sources(
+        let err = match block_on(generate_erl_sources(
             manifest,
             &project_dir,
             &project_dir.join("target/test-build"),
-        ) {
+        )) {
             Ok(_) => panic!("malformed main should fail compilation first"),
             Err(err) => err,
         };
@@ -841,8 +868,8 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let generated =
-            generate_erl_sources(manifest, &project_dir, &out_dir).expect("generate sources");
+        let generated = block_on(generate_erl_sources(manifest, &project_dir, &out_dir))
+            .expect("generate sources");
         let helper_path = out_dir.join("mond_local_helpers.erl");
         assert!(helper_path.exists(), "local helper should be copied");
         assert!(
@@ -885,8 +912,8 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let generated =
-            generate_erl_sources(manifest, &project_dir, &out_dir).expect("generate sources");
+        let generated = block_on(generate_erl_sources(manifest, &project_dir, &out_dir))
+            .expect("generate sources");
         assert!(
             generated.erl_paths.iter().any(|p| {
                 p.file_name()
@@ -934,8 +961,8 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let generated =
-            generate_erl_sources(manifest, &project_dir, &out_dir).expect("generate sources");
+        let generated = block_on(generate_erl_sources(manifest, &project_dir, &out_dir))
+            .expect("generate sources");
         assert!(generated.module_exports.contains_key("lib"));
         assert!(generated.module_exports.contains_key("time"));
         assert_eq!(
@@ -971,7 +998,7 @@ mod tests {
 
         let out_dir = project_dir.join("target/test-build");
         std::fs::create_dir_all(&out_dir).expect("create output dir");
-        let err = match generate_erl_sources(manifest, &project_dir, &out_dir) {
+        let err = match block_on(generate_erl_sources(manifest, &project_dir, &out_dir)) {
             Ok(_) => panic!("expected alias collision"),
             Err(err) => err,
         };

@@ -23,7 +23,7 @@ fn sanitize_erlang_component(name: &str) -> String {
     sanitized
 }
 
-pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
+pub(crate) async fn release(project_dir: &Path) -> eyre::Result<()> {
     // Stage the rebar3 project under target/release/
     // Wipe first to prevent stale .erl files from previous builds causing conflicts.
     let staging = project_dir.join(TARGET_DIR).join("release");
@@ -41,7 +41,7 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
         project_type,
         module_aliases,
         ..
-    } = generate_erl_sources(manifest, project_dir, &src_dir)?;
+    } = generate_erl_sources(manifest, project_dir, &src_dir).await?;
 
     if matches!(project_type, ProjectType::Lib) {
         return Err(eyre::eyre!("bahn cannot release a library project"));
@@ -103,11 +103,18 @@ pub(crate) fn release(project_dir: &Path) -> eyre::Result<()> {
     crate::utils::verify_rebar3_installed()?;
 
     // Run rebar3 escriptize
-    let rebar3 = Command::new("rebar3")
-        .arg("escriptize")
-        .current_dir(&staging)
-        .output()
-        .context("could not run rebar3 — is it installed?")?;
+    let rebar3 = {
+        let staging = staging.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new("rebar3")
+                .arg("escriptize")
+                .current_dir(&staging)
+                .output()
+                .context("could not run rebar3 — is it installed?")
+        })
+        .await
+        .map_err(|err| eyre::eyre!("failed to join rebar3 task: {err}"))??
+    };
 
     if !rebar3.status.success() {
         ui::error("rebar3 failed:");

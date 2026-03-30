@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, process::Command};
+use std::{collections::HashMap, path::Path, process::Command, sync::Arc};
 
 use eyre::Context;
 
@@ -35,7 +35,7 @@ fn prepare_test_build_dir(build_dir: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
+pub(crate) async fn test(project_dir: &Path) -> eyre::Result<()> {
     let build_dir = project_dir.join(TARGET_DIR).join(TEST_BUILD_DIR);
     prepare_test_build_dir(&build_dir)?;
     let erl_dir = build_dir.join(ERL_SOURCE_SUBDIR);
@@ -116,7 +116,8 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         project_dir,
         &erl_dir,
         &extra_src_roots.into_iter().collect::<Vec<_>>(),
-    )?;
+    )
+    .await?;
 
     // Combined export map: dependencies + src + test modules
     let mut all_exports = module_exports.clone();
@@ -129,14 +130,14 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     }
 
     // Compile each test file
-    let project = mondc::ProjectAnalysis {
+    let project = Arc::new(mondc::ProjectAnalysis {
         module_exports: all_exports.clone(),
         module_type_decls: module_type_decls.clone(),
         module_private_record_types: HashMap::new(),
         module_extern_types: module_extern_types.clone(),
         all_module_schemes: all_module_schemes.clone(),
         module_aliases: module_aliases.clone(),
-    };
+    });
     // (module_name, Vec<(display_name, erlang_fn_name)>)
     let mut test_fns_by_module: Vec<(String, Vec<(String, String)>)> = Vec::new();
     let test_compile_units: Vec<compile_flow::CompileUnit<'_>> = test_module_sources
@@ -148,7 +149,7 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         })
         .collect();
     let (test_outputs, test_had_error) =
-        compile_flow::compile_units(&test_compile_units, &all_exports, &project, true);
+        compile_flow::compile_units(&test_compile_units, Arc::clone(&project), true).await;
     for output in test_outputs {
         let Some(erl_source) = output.erl_source() else {
             continue;
@@ -196,8 +197,9 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     let selected_test_dependency_mods =
         reachable_dependency_modules(&dependency_mods, &needed_dependencies)?;
 
-    let dependency_analysis =
-        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?;
+    let dependency_analysis = Arc::new(
+        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?,
+    );
     let dependency_compile_units: Vec<compile_flow::CompileUnit<'_>> =
         selected_test_dependency_mods
             .iter()
@@ -209,10 +211,10 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
             .collect();
     let (dependency_outputs, dependency_had_error) = compile_flow::compile_units(
         &dependency_compile_units,
-        &dependency_module_exports,
-        &dependency_analysis,
+        Arc::clone(&dependency_analysis),
         true,
-    );
+    )
+    .await;
     for ((user_name, erlang_name, _), output) in selected_test_dependency_mods
         .iter()
         .zip(dependency_outputs.into_iter())
@@ -268,12 +270,20 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
     crate::utils::verify_erlc_installed()?;
 
     // Compile all .erl files
-    let erlc = Command::new("erlc")
-        .arg("-o")
-        .arg(&ebin_dir)
-        .args(&erl_paths)
-        .output()
-        .context("could not run erlc")?;
+    let erlc = {
+        let ebin_dir = ebin_dir.clone();
+        let erl_paths = erl_paths.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new("erlc")
+                .arg("-o")
+                .arg(&ebin_dir)
+                .args(&erl_paths)
+                .output()
+                .context("could not run erlc")
+        })
+        .await
+        .map_err(|err| eyre::eyre!("failed to join erlc task: {err}"))??
+    };
 
     if !erlc.status.success() {
         return Err(eyre::eyre!(
@@ -287,14 +297,21 @@ pub(crate) fn test(project_dir: &Path) -> eyre::Result<()> {
         "running {total} test{}",
         if total == 1 { "" } else { "s" }
     ));
-    let status = Command::new("erl")
-        .arg("-noshell")
-        .arg("-pz")
-        .arg(&ebin_dir)
-        .arg("-eval")
-        .arg(format!("{runner_module}:run()."))
-        .status()
-        .context("could not run erl")?;
+    let status = {
+        let ebin_dir = ebin_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new("erl")
+                .arg("-noshell")
+                .arg("-pz")
+                .arg(&ebin_dir)
+                .arg("-eval")
+                .arg(format!("{runner_module}:run()."))
+                .status()
+                .context("could not run erl")
+        })
+        .await
+        .map_err(|err| eyre::eyre!("failed to join erl task: {err}"))??
+    };
 
     if !status.success() {
         return Err(eyre::eyre!(
@@ -329,27 +346,34 @@ fn generate_runner(
 -export([run/0]).
 
 run() ->
+    Green = "\e[32m",
+    Red = "\e[31m",
+    Reset = "\e[0m",
     Tests = [
         {tests_list}
     ],
+    % Keep deterministic execution order to avoid flakiness from shared state.
     Results = lists:map(fun({{Name, Mod, Fun}}) ->
         try Mod:Fun(unit) of
             {{ok, _}} ->
-                io:format("  ~s ... ok~n", [Name]),
+                io:format("  ~s ... ~sok~s~n", [Name, Green, Reset]),
                 ok;
             {{error, Msg}} ->
-                io:format("  ~s ... FAILED~n    ~s~n", [Name, Msg]),
+                io:format("  ~s ... ~sFAILED~s~n    ~s~s~s~n", [Name, Red, Reset, Red, Msg, Reset]),
                 failed
         catch
             Class:Reason:Stack ->
-                io:format("  ~s ... CRASHED~n    ~p:~p~n    ~p~n", [Name, Class, Reason, Stack]),
+                io:format("  ~s ... ~sCRASHED~s~n    ~s~p:~p~s~n    ~s~p~s~n",
+                          [Name, Red, Reset, Red, Class, Reason, Reset, Red, Stack, Reset]),
                 failed
         end
     end, Tests),
     Passed = length(lists:filter(fun(R) -> R =:= ok end, Results)),
     Failed = length(lists:filter(fun(R) -> R =:= failed end, Results)),
-    io:format("~ntest result: ~s. ~p passed; ~p failed~n",
-              [case Failed of 0 -> "ok"; _ -> "FAILED" end, Passed, Failed]),
+    Summary = case Failed of 0 -> {{Green, "ok"}}; _ -> {{Red, "FAILED"}} end,
+    {{SummaryColor, SummaryText}} = Summary,
+    io:format("~ntest result: ~s~s~s. ~p passed; ~p failed~n",
+              [SummaryColor, SummaryText, Reset, Passed, Failed]),
     case Failed of
         0 -> erlang:halt(0);
         _ -> erlang:halt(1)

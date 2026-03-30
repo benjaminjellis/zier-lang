@@ -1257,7 +1257,7 @@ pub(super) fn active_argument_index(args: &[mondc::ast::Expr], offset: usize) ->
         .unwrap_or(0)
 }
 
-pub(super) fn function_arity(ty: &std::rc::Rc<mondc::typecheck::Type>) -> usize {
+pub(super) fn function_arity(ty: &std::sync::Arc<mondc::typecheck::Type>) -> usize {
     let mut count = 0;
     let mut current = ty.as_ref();
     while let mondc::typecheck::Type::Fun(_, ret) = current {

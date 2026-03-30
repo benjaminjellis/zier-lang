@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    rc::Rc,
+    sync::Arc as Rc,
 };
 
 use crate::ast::{Expr, Literal, MatchArm, Pattern, TypeDecl};
@@ -803,10 +803,14 @@ impl TypeChecker {
                 let ret_ty = self.fresh();
                 // 0-arg functions are compiled as `f(_Unit) -> body` on the BEAM.
                 // Type them as `Unit -> ReturnType` so `(f)` calls unify correctly.
-                let fun_ty = arg_tys
-                    .iter()
-                    .rev()
-                    .fold(ret_ty.clone(), |acc, a| Type::fun(a.clone(), acc));
+                let fun_ty = if arg_tys.is_empty() {
+                    Type::fun(Type::unit(), ret_ty.clone())
+                } else {
+                    arg_tys
+                        .iter()
+                        .rev()
+                        .fold(ret_ty.clone(), |acc, a| Type::fun(a.clone(), acc))
+                };
 
                 let mut inner_env = env.clone();
                 for ((arg, span), ty) in args.iter().zip(arg_spans.iter()).zip(&arg_tys) {
@@ -1078,14 +1082,16 @@ impl TypeChecker {
                 }
 
                 let (s, t_body, body_preds) = self.infer(&inner_env, body)?;
+                let body_ty = apply_subst(&s, &t_body);
 
                 // Apply substitution to arg types, then build curried Fun type
-                let ty = arg_tys
-                    .iter()
-                    .rev()
-                    .fold(apply_subst(&s, &t_body), |acc, arg_ty| {
+                let ty = if arg_tys.is_empty() {
+                    Type::fun(Type::unit(), body_ty)
+                } else {
+                    arg_tys.iter().rev().fold(body_ty, |acc, arg_ty| {
                         Type::fun(apply_subst(&s, arg_ty), acc)
-                    });
+                    })
+                };
 
                 for (span, ty) in arg_spans.iter().zip(arg_tys.iter()) {
                     self.record_expr_type(span.clone(), apply_subst(&s, ty));
@@ -1855,11 +1861,7 @@ impl TypeChecker {
                     ty = apply_subst(&s_pred, &ty);
                     preds = apply_subst_preds(&s_pred, &solved_preds);
 
-                    let mut env_ty = if args.is_empty() {
-                        Type::fun(Type::unit(), ty.clone())
-                    } else {
-                        ty.clone()
-                    };
+                    let mut env_ty = ty.clone();
                     let declared_ty = env
                         .get(name)
                         .map(|scheme| scheme.ty.clone())
@@ -1877,7 +1879,17 @@ impl TypeChecker {
                     generalize_env.remove(name);
                     let scheme = generalize(&generalize_env, &env_ty, &preds);
                     env.insert(name.clone(), scheme);
-                    inferred_top_level_raw_by_decl.insert(*decl_idx, ty);
+                    let raw_decl_ty = if args.is_empty() {
+                        match ty.as_ref() {
+                            Type::Fun(arg, ret) if arg.as_ref() == Type::unit().as_ref() => {
+                                ret.clone()
+                            }
+                            _ => ty.clone(),
+                        }
+                    } else {
+                        ty.clone()
+                    };
+                    inferred_top_level_raw_by_decl.insert(*decl_idx, raw_decl_ty);
                 }
                 Err(error) => return Err(Box::new((error, expr.clone()))),
             }

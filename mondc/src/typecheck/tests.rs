@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc as Rc;
 
 use super::*;
 
@@ -641,6 +641,12 @@ fn infer_lambda_identity() {
 }
 
 #[test]
+fn infer_nullary_lambda_as_unit_function() {
+    let ty = check_expr("(f {} -> ())").unwrap();
+    assert_eq!(ty, Type::fun(Type::unit(), Type::unit()));
+}
+
+#[test]
 fn infer_lambda_applied() {
     // Immediately apply a lambda
     let ty = check_expr("((f {x} -> (+ x 1)) 5)").unwrap();
@@ -655,6 +661,31 @@ fn infer_lambda_as_arg() {
         "#;
     let ty = check(src).unwrap();
     assert_eq!(ty, Type::int());
+}
+
+#[test]
+fn infer_nullary_lambda_as_arg() {
+    let src = r#"
+            (let run {task} (task))
+            (let main {} (run (f {} -> ())))
+        "#;
+    let ty = check(src).unwrap();
+    assert_eq!(ty, Type::unit());
+}
+
+#[test]
+fn infer_nullary_named_function_as_unit_function() {
+    let env = check_and_env("(let my_func {} ())").unwrap();
+    let scheme = env
+        .get("my_func")
+        .expect("expected `my_func` to be present in type environment");
+    assert_eq!(scheme.ty, Type::fun(Type::unit(), Type::unit()));
+}
+
+#[test]
+fn infer_nullary_named_function_last_type_is_body_type() {
+    let ty = check("(let my_func {} ())").unwrap();
+    assert_eq!(ty, Type::unit());
 }
 
 #[test]

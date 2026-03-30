@@ -4,6 +4,7 @@ use std::{
 };
 
 use clap::builder::styling::{AnsiColor, Color, Style};
+use eyre::Context;
 use walkdir::WalkDir;
 
 const REQUIRED_OTP_MAJOR: u32 = 28;
@@ -132,6 +133,14 @@ pub(crate) fn get_styles() -> clap::builder::Styles {
                 .fg_color(Some(Color::Ansi(AnsiColor::Green))),
         )
         .placeholder(Style::new().fg_color(Some(Color::Ansi(AnsiColor::White))))
+}
+
+pub(crate) fn run_async(
+    command: impl std::future::Future<Output = eyre::Result<()>>,
+) -> eyre::Result<()> {
+    tokio::runtime::Runtime::new()
+        .context("failed to create async runtime")?
+        .block_on(command)
 }
 
 #[cfg(test)]

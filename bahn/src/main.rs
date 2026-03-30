@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 pub(crate) const STD_GIT_URL: &str = "git@github.com:benjaminjellis/mond-std.git";
-pub(crate) const STD_GIT_TAG: &str = "0.0.6";
+pub(crate) const STD_GIT_TAG: &str = "0.0.9";
 pub(crate) const MANIFEST_NAME: &str = "bahn.toml";
 pub(crate) const LOCKFILE_NAME: &str = "bahn.lock";
 pub(crate) const TARGET_DIR: &str = "target";
@@ -85,7 +85,7 @@ fn main() -> eyre::Result<()> {
     let root = Path::new(".");
     match cli.command {
         Commands::Build => {
-            build::build(root, false)?;
+            utils::run_async(build::build(root, false))?;
         }
         Commands::Format { path, check } => {
             if let Some(path) = path {
@@ -104,10 +104,10 @@ fn main() -> eyre::Result<()> {
             ui::success(&format!("created {kind} project `{name}`"));
         }
         Commands::Run => {
-            build::build(root, true)?;
+            utils::run_async(build::build(root, true))?;
         }
         Commands::Test => {
-            test::test(root)?;
+            utils::run_async(test::test(root))?;
         }
         Commands::Deps { update } => {
             if update {
@@ -124,12 +124,13 @@ fn main() -> eyre::Result<()> {
             }
         }
         Commands::Lsp => {
-            tokio::runtime::Runtime::new()?.block_on(async {
+            utils::run_async(async {
                 mond_lsp::serve(tokio::io::stdin(), tokio::io::stdout()).await;
-            });
+                Ok(())
+            })?;
         }
         Commands::Release => {
-            release::release(root)?;
+            utils::run_async(release::release(root))?;
         }
         Commands::Clean => {
             clean::clean(root)?;

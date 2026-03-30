@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, sync::Arc as Rc};
 
 use crate::ast::{TypeDecl, TypeUsage};
 
