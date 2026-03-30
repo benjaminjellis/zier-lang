@@ -562,7 +562,9 @@ dependencies = [
 name = "mondc"
 version = "0.0.14"
 dependencies = [
+ "clap",
  "codespan-reporting",
+ "eyre",
  "logos",
 ]
 

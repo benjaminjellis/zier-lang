@@ -4,6 +4,7 @@ use std::{
 };
 
 use eyre::Context;
+use mondc::session::CompileReport;
 
 pub(crate) struct CompileUnit<'a> {
     pub(crate) output_module_name: &'a str,
@@ -13,43 +14,38 @@ pub(crate) struct CompileUnit<'a> {
 
 pub(crate) struct CompileOutput {
     pub(crate) output_module_name: String,
-    pub(crate) erl_source: Option<String>,
-    pub(crate) had_errors: bool,
+    report: CompileReport,
 }
 
-pub(crate) fn compile_unit(
+impl CompileOutput {
+    fn had_errors(&self) -> bool {
+        self.report.has_errors() || self.report.output.is_none()
+    }
+
+    pub(crate) fn erl_source(&self) -> Option<&String> {
+        self.report.output.as_ref()
+    }
+}
+
+fn compile_unit_with_session(
     unit: &CompileUnit<'_>,
-    module_exports: &HashMap<String, Vec<String>>,
-    analysis: &mondc::ProjectAnalysis,
+    pipeline_session: &mut mondc::CompileSession<'_>,
     emit_warnings: bool,
 ) -> CompileOutput {
-    let resolved = mondc::resolve_imports_for_source(unit.source, module_exports, analysis);
-    let report = mondc::compile_with_imports_report_with_private_records(
-        unit.output_module_name,
-        unit.source,
-        &unit.source_label,
-        resolved.imports,
-        module_exports,
-        resolved.module_aliases,
-        &resolved.imported_type_decls,
-        &resolved.imported_extern_types,
-        &resolved.imported_field_indices,
-        &resolved.imported_private_records,
-        &resolved.imported_schemes,
-    );
+    let report = pipeline_session.compile_module_report(mondc::ModuleInput {
+        output_module_name: unit.output_module_name,
+        source: unit.source,
+        source_path: &unit.source_label,
+    });
     mondc::session::emit_compile_report_with_color(
         &report,
         emit_warnings,
         crate::ui::diagnostic_color_choice(),
     );
 
-    let had_errors = report.has_errors() || report.output.is_none();
-    let erl_source = if had_errors { None } else { report.output };
-
     CompileOutput {
         output_module_name: unit.output_module_name.to_string(),
-        erl_source,
-        had_errors,
+        report,
     }
 }
 
@@ -59,12 +55,17 @@ pub(crate) fn compile_units(
     analysis: &mondc::ProjectAnalysis,
     emit_warnings: bool,
 ) -> (Vec<CompileOutput>, bool) {
+    let pipeline = mondc::CompilePipeline::new(mondc::PassContext {
+        visible_exports: module_exports,
+        analysis,
+    });
+    let mut pipeline_session = pipeline.session();
     let mut had_error = false;
     let mut outputs = Vec::with_capacity(units.len());
 
     for unit in units {
-        let output = compile_unit(unit, module_exports, analysis, emit_warnings);
-        had_error |= output.had_errors;
+        let output = compile_unit_with_session(unit, &mut pipeline_session, emit_warnings);
+        had_error |= output.had_errors();
         outputs.push(output);
     }
 
@@ -96,33 +97,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compile_unit_returns_erl_for_valid_module() {
+    fn compile_units_returns_erl_for_valid_single_module() {
         let module_exports = HashMap::new();
         let analysis = mondc::build_project_analysis(&[], &[]).expect("analysis");
-        let unit = CompileUnit {
+        let units = vec![CompileUnit {
             output_module_name: "main",
             source: "(let main {} 1)",
             source_label: "main.mond".to_string(),
-        };
+        }];
 
-        let output = compile_unit(&unit, &module_exports, &analysis, true);
-        assert!(!output.had_errors);
-        assert!(output.erl_source.is_some());
+        let (outputs, had_error) = compile_units(&units, &module_exports, &analysis, true);
+        assert_eq!(outputs.len(), 1);
+        assert!(!had_error);
+        let output = &outputs[0];
+        assert!(!output.had_errors());
+        assert!(output.erl_source().is_some());
     }
 
     #[test]
-    fn compile_unit_reports_errors_for_invalid_module() {
+    fn compile_units_reports_errors_for_invalid_single_module() {
         let module_exports = HashMap::new();
         let analysis = mondc::build_project_analysis(&[], &[]).expect("analysis");
-        let unit = CompileUnit {
+        let units = vec![CompileUnit {
             output_module_name: "main",
             source: "(let main {} unknown)",
             source_label: "main.mond".to_string(),
-        };
+        }];
 
-        let output = compile_unit(&unit, &module_exports, &analysis, true);
-        assert!(output.had_errors);
-        assert!(output.erl_source.is_none());
+        let (outputs, had_error) = compile_units(&units, &module_exports, &analysis, true);
+        assert_eq!(outputs.len(), 1);
+        assert!(had_error);
+        let output = &outputs[0];
+        assert!(output.had_errors());
+        assert!(output.erl_source().is_none());
     }
 
     #[test]

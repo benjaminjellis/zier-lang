@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use codespan_reporting::{diagnostic::Diagnostic, files::SimpleFiles};
 
-use crate::{ast, codegen, lower, resolve, session, sexpr, typecheck, warnings};
+use crate::{ast, codegen, resolve, session, typecheck, typing, warnings};
 
 const PRIMITIVE_TYPE_NAMES: [&str; 6] = ["Int", "Float", "Bool", "String", "Unit", "List"];
 
@@ -42,110 +42,6 @@ fn collect_type_usage_names(usage: &ast::TypeUsage, out: &mut HashSet<String>) {
             collect_type_usage_names(ret, out);
         }
     }
-}
-
-fn type_decl_name(type_decl: &ast::TypeDecl) -> &str {
-    match type_decl {
-        ast::TypeDecl::Record { name, .. } => name,
-        ast::TypeDecl::Variant { name, .. } => name,
-    }
-}
-
-fn is_qualified_type_name(name: &str) -> bool {
-    name.contains('/')
-}
-
-fn add_qualified_type_alias(name: &str, aliases: &mut HashMap<String, String>) {
-    if let Some((_, local_name)) = name.rsplit_once('/') {
-        aliases
-            .entry(name.to_string())
-            .or_insert_with(|| local_name.to_string());
-    }
-}
-
-fn collect_usage_aliases(usage: &ast::TypeUsage, aliases: &mut HashMap<String, String>) {
-    match usage {
-        ast::TypeUsage::Named(name, _) => add_qualified_type_alias(name, aliases),
-        ast::TypeUsage::Generic(_, _) => {}
-        ast::TypeUsage::App(head, args, _) => {
-            add_qualified_type_alias(head, aliases);
-            for arg in args {
-                collect_usage_aliases(arg, aliases);
-            }
-        }
-        ast::TypeUsage::Fun(arg, ret, _) => {
-            collect_usage_aliases(arg, aliases);
-            collect_usage_aliases(ret, aliases);
-        }
-    }
-}
-
-fn collect_decl_aliases(type_decl: &ast::TypeDecl, aliases: &mut HashMap<String, String>) {
-    add_qualified_type_alias(type_decl_name(type_decl), aliases);
-    match type_decl {
-        ast::TypeDecl::Record { fields, .. } => {
-            for (_, field_ty) in fields {
-                collect_usage_aliases(field_ty, aliases);
-            }
-        }
-        ast::TypeDecl::Variant { constructors, .. } => {
-            for (_, payload) in constructors {
-                if let Some(payload_ty) = payload {
-                    collect_usage_aliases(payload_ty, aliases);
-                }
-            }
-        }
-    }
-}
-
-fn collect_type_aliases(ty: &typecheck::Type, aliases: &mut HashMap<String, String>) {
-    match ty {
-        typecheck::Type::Var(_) => {}
-        typecheck::Type::Fun(arg, ret) => {
-            collect_type_aliases(arg, aliases);
-            collect_type_aliases(ret, aliases);
-        }
-        typecheck::Type::Con(name, args) => {
-            add_qualified_type_alias(name, aliases);
-            for arg in args {
-                collect_type_aliases(arg, aliases);
-            }
-        }
-    }
-}
-
-fn collect_scheme_aliases(scheme: &typecheck::Scheme, aliases: &mut HashMap<String, String>) {
-    collect_type_aliases(&scheme.ty, aliases);
-    for predicate in &scheme.preds {
-        match predicate {
-            typecheck::Predicate::HasField {
-                record_ty,
-                field_ty,
-                ..
-            } => {
-                collect_type_aliases(record_ty, aliases);
-                collect_type_aliases(field_ty, aliases);
-            }
-        }
-    }
-}
-
-fn build_qualified_type_aliases(
-    imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
-    imported_schemes: &typecheck::TypeEnv,
-) -> HashMap<String, String> {
-    let mut aliases = HashMap::new();
-    for type_decl in imported_type_decls {
-        collect_decl_aliases(type_decl, &mut aliases);
-    }
-    for name in imported_extern_types {
-        add_qualified_type_alias(name, &mut aliases);
-    }
-    for scheme in imported_schemes.values() {
-        collect_scheme_aliases(scheme, &mut aliases);
-    }
-    aliases
 }
 
 fn known_type_arities(
@@ -295,6 +191,376 @@ fn compile_error_report(
     }
 }
 
+struct TypecheckStageInput<'a> {
+    file_id: usize,
+    decls: &'a [ast::Declaration],
+    imports: &'a HashMap<String, String>,
+    module_exports: &'a HashMap<String, Vec<String>>,
+    imported_type_decls: &'a [ast::TypeDecl],
+    imported_extern_types: &'a [String],
+    imported_private_records: &'a HashMap<String, Vec<String>>,
+    imported_schemes: &'a typecheck::TypeEnv,
+}
+
+struct ImportedTypeRuntimeInfo {
+    imported_constructors: HashMap<String, usize>,
+    imported_field_indices: HashMap<(String, String), usize>,
+    imported_record_layouts: HashMap<String, Vec<String>>,
+}
+
+fn run_lower_stage(
+    sess: &mut session::CompilerSession,
+    source_path: &str,
+    source: &str,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+) -> Result<crate::hir::HirModule, session::CompileReport> {
+    let hir = crate::hir::lower_source_to_hir(source_path, source);
+    if push_and_emit_diags(
+        sess,
+        &hir.files,
+        diagnostics,
+        hir.diagnostics.iter().cloned(),
+    ) > 0
+    {
+        return Err(compile_error_report(hir.files, std::mem::take(diagnostics)));
+    }
+    Ok(hir)
+}
+
+fn validate_use_declarations(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    file_id: usize,
+    decls: &[ast::Declaration],
+    module_exports: &HashMap<String, Vec<String>>,
+) -> bool {
+    let mut use_errors = false;
+    for decl in decls {
+        if let ast::Declaration::Use {
+            path: (_, mod_name),
+            span,
+            ..
+        } = decl
+            && !module_exports.contains_key(mod_name.as_str())
+        {
+            let diag = codespan_reporting::diagnostic::Diagnostic::error()
+                .with_message(format!("unknown module `{mod_name}`"))
+                .with_labels(vec![
+                    codespan_reporting::diagnostic::Label::primary(file_id, span.clone())
+                        .with_message(format!("`{mod_name}` is not a module in this project")),
+                ]);
+            push_and_emit_diag(sess, files, diagnostics, diag);
+            use_errors = true;
+        }
+    }
+    use_errors
+}
+
+fn validate_declaration_collisions(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    file_id: usize,
+    decls: &[ast::Declaration],
+    module_exports: &HashMap<String, Vec<String>>,
+) -> bool {
+    let duplicate_top_level_values =
+        warnings::duplicate_top_level_value_diagnostics(decls, file_id, module_exports);
+    let duplicate_type_constructors =
+        warnings::duplicate_type_constructor_diagnostics(decls, file_id);
+
+    let has_duplicate_values =
+        push_and_emit_diags(sess, files, diagnostics, duplicate_top_level_values) > 0;
+    let has_duplicate_type_constructors =
+        push_and_emit_diags(sess, files, diagnostics, duplicate_type_constructors) > 0;
+
+    has_duplicate_values || has_duplicate_type_constructors
+}
+
+fn validate_type_declarations(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    file_id: usize,
+    decls: &[ast::Declaration],
+    imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
+) -> bool {
+    let known_types = known_type_names(decls, imported_type_decls, imported_extern_types);
+    let known_type_arities = known_type_arities(decls, imported_type_decls);
+    let mut type_decl_errors = false;
+    for decl in decls {
+        let (name, params, usages, span) = match decl {
+            ast::Declaration::Type(ast::TypeDecl::Record {
+                name,
+                params,
+                fields,
+                span,
+                ..
+            }) => (
+                name.as_str(),
+                params.as_slice(),
+                fields.iter().map(|(_, usage)| usage).collect::<Vec<_>>(),
+                span.clone(),
+            ),
+            ast::Declaration::Type(ast::TypeDecl::Variant {
+                name,
+                params,
+                constructors,
+                span,
+                ..
+            }) => (
+                name.as_str(),
+                params.as_slice(),
+                constructors
+                    .iter()
+                    .filter_map(|(_, usage)| usage.as_ref())
+                    .collect::<Vec<_>>(),
+                span.clone(),
+            ),
+            _ => continue,
+        };
+
+        let generic_params = params.iter().cloned().collect::<HashSet<_>>();
+        let mut referenced_types = HashSet::new();
+        for usage in &usages {
+            collect_type_usage_names(usage, &mut referenced_types);
+        }
+        let mut unknown: Vec<String> = referenced_types
+            .into_iter()
+            .filter(|type_name| {
+                !known_types.contains(type_name) && !generic_params.contains(type_name)
+            })
+            .collect();
+        unknown.sort();
+        if !unknown.is_empty() {
+            let plural = if unknown.len() == 1 { "" } else { "s" };
+            let diag = codespan_reporting::diagnostic::Diagnostic::error()
+                .with_message(format!(
+                    "unknown type{plural} in type declaration `{name}`: {}",
+                    unknown.join(", ")
+                ))
+                .with_labels(vec![
+                    codespan_reporting::diagnostic::Label::primary(file_id, span.clone()).with_message(
+                        "declare these types in this module or import them unqualified before using them here",
+                    ),
+                ]);
+            push_and_emit_diag(sess, files, diagnostics, diag);
+            type_decl_errors = true;
+        }
+
+        let mut arity_errors = Vec::new();
+        for usage in &usages {
+            collect_type_usage_arity_errors(
+                usage,
+                &known_type_arities,
+                &generic_params,
+                &mut arity_errors,
+            );
+        }
+        arity_errors.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        arity_errors.dedup();
+        for (type_name, expected, found, usage_span) in arity_errors {
+            let diag = codespan_reporting::diagnostic::Diagnostic::error()
+                .with_message(format!(
+                    "wrong number of type arguments for `{type_name}` in type declaration `{name}`: expected {expected}, found {found}"
+                ))
+                .with_labels(vec![
+                    codespan_reporting::diagnostic::Label::primary(file_id, usage_span)
+                        .with_message("use the required number of type arguments here"),
+                ]);
+            push_and_emit_diag(sess, files, diagnostics, diag);
+            type_decl_errors = true;
+        }
+    }
+    type_decl_errors
+}
+
+fn validate_extern_signatures(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    file_id: usize,
+    decls: &[ast::Declaration],
+    imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[String],
+) -> bool {
+    let known_types = known_type_names(decls, imported_type_decls, imported_extern_types);
+    let mut extern_type_errors = false;
+    for decl in decls {
+        let ast::Declaration::ExternLet { name, ty, span, .. } = decl else {
+            continue;
+        };
+        let mut referenced_types = HashSet::new();
+        collect_type_sig_names(ty, &mut referenced_types);
+        let mut unknown: Vec<String> = referenced_types
+            .into_iter()
+            .filter(|type_name| !known_types.contains(type_name))
+            .collect();
+        unknown.sort();
+        if unknown.is_empty() {
+            continue;
+        }
+
+        let plural = if unknown.len() == 1 { "" } else { "s" };
+        let diag = codespan_reporting::diagnostic::Diagnostic::error()
+            .with_message(format!(
+                "unknown type{plural} in extern signature for `{name}`: {}",
+                unknown.join(", ")
+            ))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span.clone()).with_message(
+                    "import these types (for example: `(use option [Option])`) or declare them in this module",
+                ),
+            ]);
+        push_and_emit_diag(sess, files, diagnostics, diag);
+        extern_type_errors = true;
+    }
+    extern_type_errors
+}
+
+fn run_typecheck_stage(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    input: TypecheckStageInput<'_>,
+) -> Option<HashMap<(usize, usize), String>> {
+    let (mut checker, mut env) = typing::prepare_typechecker(
+        input.imported_type_decls,
+        input.imported_extern_types,
+        input.imported_private_records,
+        input.imported_schemes,
+    );
+
+    let symbols = sess.symbol_table(input.module_exports);
+    let unresolved =
+        resolve::unresolved_env_names(input.decls, input.imports.keys().cloned(), &env, symbols);
+    env.extend(typecheck::import_env(&unresolved));
+
+    if let Err(err) = checker.check_program(&mut env, input.decls, input.file_id) {
+        let type_diags = err.0.to_diagnostics(input.file_id, err.1.span());
+        push_and_emit_diags(sess, files, diagnostics, type_diags);
+        return None;
+    }
+
+    Some(checker.inferred_record_expr_types())
+}
+
+fn emit_warning_stage(
+    sess: &mut session::CompilerSession,
+    files: &SimpleFiles<String, String>,
+    diagnostics: &mut Vec<Diagnostic<usize>>,
+    file_id: usize,
+    decls: &[ast::Declaration],
+    module_exports: &HashMap<String, Vec<String>>,
+    imported_type_decls: &[ast::TypeDecl],
+) {
+    for (name, span) in warnings::unused_function_spans(decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!("unused function `{name}`"))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this private function is never used"),
+            ]);
+        push_and_emit_diag(sess, files, diagnostics, diag);
+    }
+    for (name, span) in warnings::unused_type_spans(decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!("unused type `{name}`"))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this private type is never referenced"),
+            ]);
+        push_and_emit_diag(sess, files, diagnostics, diag);
+    }
+    for (type_name, param, span) in warnings::unused_type_param_spans(decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!(
+                "unused type parameter `{param}` in type `{type_name}`"
+            ))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this type parameter is never used in the type definition"),
+            ]);
+        push_and_emit_diag(sess, files, diagnostics, diag);
+    }
+    for (name, span) in warnings::unused_local_spans(decls) {
+        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
+            .with_message(format!("unused local binding `{name}`"))
+            .with_labels(vec![
+                codespan_reporting::diagnostic::Label::primary(file_id, span)
+                    .with_message("this local binding is never used"),
+            ]);
+        push_and_emit_diag(sess, files, diagnostics, diag);
+    }
+    push_and_emit_diags(
+        sess,
+        files,
+        diagnostics,
+        warnings::unused_unqualified_import_diagnostics(
+            decls,
+            file_id,
+            module_exports,
+            imported_type_decls,
+        ),
+    );
+    push_and_emit_diags(
+        sess,
+        files,
+        diagnostics,
+        warnings::redundant_match_diagnostics(decls, file_id, imported_type_decls),
+    );
+}
+
+fn build_imported_type_runtime_info(
+    imported_type_decls: &[ast::TypeDecl],
+    imported_field_indices: &HashMap<(String, String), usize>,
+) -> ImportedTypeRuntimeInfo {
+    let mut imported_constructors: HashMap<String, usize> = HashMap::new();
+    let mut merged_imported_field_indices = imported_field_indices.clone();
+    let mut imported_record_layouts: HashMap<String, Vec<String>> = HashMap::new();
+
+    for type_decl in imported_type_decls {
+        match type_decl {
+            ast::TypeDecl::Variant {
+                name, constructors, ..
+            } => {
+                let qualified_module = name.split_once('/').map(|(module, _)| module.to_string());
+                for (ctor_name, payload) in constructors {
+                    let arity = if payload.is_some() { 1 } else { 0 };
+                    imported_constructors.insert(ctor_name.clone(), arity);
+                    if let Some(module) = &qualified_module {
+                        imported_constructors.insert(format!("{module}/{ctor_name}"), arity);
+                    }
+                }
+            }
+            ast::TypeDecl::Record { name, fields, .. } => {
+                imported_constructors.insert(name.clone(), fields.len());
+                if let Some((module, record_name)) = name.split_once('/') {
+                    imported_constructors.insert(format!("{module}/{record_name}"), fields.len());
+                }
+                for (i, (field_name, _)) in fields.iter().enumerate() {
+                    merged_imported_field_indices.insert((name.clone(), field_name.clone()), i + 2);
+                }
+                imported_record_layouts.insert(
+                    name.clone(),
+                    fields
+                        .iter()
+                        .map(|(field_name, _)| field_name.clone())
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    ImportedTypeRuntimeInfo {
+        imported_constructors,
+        imported_field_indices: merged_imported_field_indices,
+        imported_record_layouts,
+    }
+}
+
 /// Compile without any imports (single-file or when imports are already resolved).
 #[cfg(test)]
 pub(crate) fn compile(module_name: &str, source: &str) -> Option<String> {
@@ -358,331 +624,91 @@ pub fn compile_with_imports_in_session_with_private_records(
     imported_schemes: &typecheck::TypeEnv,
 ) -> session::CompileReport {
     let mut diagnostics = Vec::new();
-    let mut lowerer = lower::Lowerer::new();
-    let tokens = crate::lexer::Lexer::new(source).lex();
-
-    let file_id = lowerer.add_file(source_path.to_string(), source.to_string());
-
-    let sexprs = match sexpr::SExprParser::new(tokens, file_id).parse() {
-        Ok(res) => res,
-        Err(diag) => {
-            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-            return compile_error_report(lowerer.files, diagnostics);
-        }
+    let hir = match run_lower_stage(sess, source_path, source, &mut diagnostics) {
+        Ok(hir) => hir,
+        Err(report) => return report,
     };
+    let file_id = hir.file_id;
+    let decls = hir.decls;
+    let files = hir.files;
 
-    let decls = lowerer.lower_file(file_id, &sexprs);
-
-    let lowerer_diag_count = push_and_emit_diags(
+    if validate_use_declarations(
         sess,
-        &lowerer.files,
+        &files,
         &mut diagnostics,
-        lowerer.diagnostics.iter().cloned(),
-    );
-    if lowerer_diag_count > 0 {
-        return compile_error_report(lowerer.files, diagnostics);
+        file_id,
+        &decls,
+        module_exports,
+    ) {
+        return compile_error_report(files, diagnostics);
     }
 
-    let mut use_errors = false;
-    for decl in &decls {
-        if let ast::Declaration::Use {
-            path: (_, mod_name),
-            span,
-            ..
-        } = decl
-            && !module_exports.contains_key(mod_name.as_str())
-        {
-            let diag = codespan_reporting::diagnostic::Diagnostic::error()
-                .with_message(format!("unknown module `{mod_name}`"))
-                .with_labels(vec![
-                    codespan_reporting::diagnostic::Label::primary(file_id, span.clone())
-                        .with_message(format!("`{mod_name}` is not a module in this project")),
-                ]);
-            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-            use_errors = true;
-        }
-    }
-    if use_errors {
-        return compile_error_report(lowerer.files, diagnostics);
-    }
-
-    let duplicate_top_level_values =
-        warnings::duplicate_top_level_value_diagnostics(&decls, file_id, module_exports);
-    if push_and_emit_diags(
+    if validate_declaration_collisions(
         sess,
-        &lowerer.files,
+        &files,
         &mut diagnostics,
-        duplicate_top_level_values,
-    ) > 0
-    {
-        return compile_error_report(lowerer.files, diagnostics);
+        file_id,
+        &decls,
+        module_exports,
+    ) {
+        return compile_error_report(files, diagnostics);
     }
 
-    let duplicate_type_constructors =
-        warnings::duplicate_type_constructor_diagnostics(&decls, file_id);
-    if push_and_emit_diags(
+    if validate_type_declarations(
         sess,
-        &lowerer.files,
+        &files,
         &mut diagnostics,
-        duplicate_type_constructors,
-    ) > 0
-    {
-        return compile_error_report(lowerer.files, diagnostics);
+        file_id,
+        &decls,
+        imported_type_decls,
+        imported_extern_types,
+    ) {
+        return compile_error_report(files, diagnostics);
     }
 
-    let known_types = known_type_names(&decls, imported_type_decls, imported_extern_types);
-    let known_type_arities = known_type_arities(&decls, imported_type_decls);
-    let mut type_decl_errors = false;
-    for decl in &decls {
-        let (name, params, usages, span) = match decl {
-            ast::Declaration::Type(ast::TypeDecl::Record {
-                name,
-                params,
-                fields,
-                span,
-                ..
-            }) => (
-                name.as_str(),
-                params.as_slice(),
-                fields.iter().map(|(_, usage)| usage).collect::<Vec<_>>(),
-                span.clone(),
-            ),
-            ast::Declaration::Type(ast::TypeDecl::Variant {
-                name,
-                params,
-                constructors,
-                span,
-                ..
-            }) => (
-                name.as_str(),
-                params.as_slice(),
-                constructors
-                    .iter()
-                    .filter_map(|(_, usage)| usage.as_ref())
-                    .collect::<Vec<_>>(),
-                span.clone(),
-            ),
-            _ => continue,
-        };
-
-        let generic_params = params.iter().cloned().collect::<HashSet<_>>();
-        let mut referenced_types = HashSet::new();
-        for usage in &usages {
-            collect_type_usage_names(usage, &mut referenced_types);
-        }
-        let mut unknown: Vec<String> = referenced_types
-            .into_iter()
-            .filter(|type_name| {
-                !known_types.contains(type_name) && !generic_params.contains(type_name)
-            })
-            .collect();
-        unknown.sort();
-        if unknown.is_empty() {
-        } else {
-            let plural = if unknown.len() == 1 { "" } else { "s" };
-            let diag = codespan_reporting::diagnostic::Diagnostic::error()
-                .with_message(format!(
-                    "unknown type{plural} in type declaration `{name}`: {}",
-                    unknown.join(", ")
-                ))
-                .with_labels(vec![
-                    codespan_reporting::diagnostic::Label::primary(file_id, span.clone()).with_message(
-                        "declare these types in this module or import them unqualified before using them here",
-                    ),
-                ]);
-            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-            type_decl_errors = true;
-        }
-
-        let mut arity_errors = Vec::new();
-        for usage in &usages {
-            collect_type_usage_arity_errors(
-                usage,
-                &known_type_arities,
-                &generic_params,
-                &mut arity_errors,
-            );
-        }
-        arity_errors.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-        arity_errors.dedup();
-        for (type_name, expected, found, usage_span) in arity_errors {
-            let diag = codespan_reporting::diagnostic::Diagnostic::error()
-                .with_message(format!(
-                    "wrong number of type arguments for `{type_name}` in type declaration `{name}`: expected {expected}, found {found}"
-                ))
-                .with_labels(vec![
-                    codespan_reporting::diagnostic::Label::primary(file_id, usage_span)
-                        .with_message("use the required number of type arguments here"),
-                ]);
-            push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-            type_decl_errors = true;
-        }
-    }
-    if type_decl_errors {
-        return compile_error_report(lowerer.files, diagnostics);
-    }
-
-    let mut extern_type_errors = false;
-    for decl in &decls {
-        let ast::Declaration::ExternLet { name, ty, span, .. } = decl else {
-            continue;
-        };
-        let mut referenced_types = HashSet::new();
-        collect_type_sig_names(ty, &mut referenced_types);
-        let mut unknown: Vec<String> = referenced_types
-            .into_iter()
-            .filter(|type_name| !known_types.contains(type_name))
-            .collect();
-        unknown.sort();
-        if unknown.is_empty() {
-            continue;
-        }
-
-        let plural = if unknown.len() == 1 { "" } else { "s" };
-        let diag = codespan_reporting::diagnostic::Diagnostic::error()
-            .with_message(format!(
-                "unknown type{plural} in extern signature for `{name}`: {}",
-                unknown.join(", ")
-            ))
-            .with_labels(vec![
-                codespan_reporting::diagnostic::Label::primary(file_id, span.clone()).with_message(
-                    "import these types (for example: `(use option [Option])`) or declare them in this module",
-                ),
-            ]);
-        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-        extern_type_errors = true;
-    }
-    if extern_type_errors {
-        return compile_error_report(lowerer.files, diagnostics);
-    }
-
-    let qualified_type_aliases =
-        build_qualified_type_aliases(imported_type_decls, imported_extern_types, imported_schemes);
-    let imported_type_decls_unqualified: Vec<ast::TypeDecl> = imported_type_decls
-        .iter()
-        .filter(|type_decl| !is_qualified_type_name(type_decl_name(type_decl)))
-        .cloned()
-        .collect();
-
-    let mut checker = typecheck::TypeChecker::new();
-    checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
-    checker.seed_imported_type_info(&imported_type_decls_unqualified);
-    checker.seed_private_record_origins(imported_private_records.clone());
-    let mut env = typecheck::primitive_env();
-
-    for type_decl in &imported_type_decls_unqualified {
-        env.extend(typecheck::constructor_schemes_with_aliases(
-            type_decl,
-            &qualified_type_aliases,
-        ));
-    }
-    env.extend(typecheck::normalize_env_type_aliases(
-        imported_schemes,
-        &qualified_type_aliases,
-    ));
-
-    let symbols = sess.symbol_table(module_exports);
-    let unresolved = resolve::unresolved_env_names(&decls, imports.keys().cloned(), &env, symbols);
-    env.extend(typecheck::import_env(&unresolved));
-
-    if let Err(err) = checker.check_program(&mut env, &decls, file_id) {
-        let type_diags = err.0.to_diagnostics(file_id, err.1.span());
-        push_and_emit_diags(sess, &lowerer.files, &mut diagnostics, type_diags);
-        return compile_error_report(lowerer.files, diagnostics);
-    }
-    let inferred_record_expr_types = checker.inferred_record_expr_types();
-
-    for (name, span) in warnings::unused_function_spans(&decls) {
-        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
-            .with_message(format!("unused function `{name}`"))
-            .with_labels(vec![
-                codespan_reporting::diagnostic::Label::primary(file_id, span)
-                    .with_message("this private function is never used"),
-            ]);
-        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-    }
-    for (name, span) in warnings::unused_type_spans(&decls) {
-        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
-            .with_message(format!("unused type `{name}`"))
-            .with_labels(vec![
-                codespan_reporting::diagnostic::Label::primary(file_id, span)
-                    .with_message("this private type is never referenced"),
-            ]);
-        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-    }
-    for (type_name, param, span) in warnings::unused_type_param_spans(&decls) {
-        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
-            .with_message(format!(
-                "unused type parameter `{param}` in type `{type_name}`"
-            ))
-            .with_labels(vec![
-                codespan_reporting::diagnostic::Label::primary(file_id, span)
-                    .with_message("this type parameter is never used in the type definition"),
-            ]);
-        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-    }
-    for (name, span) in warnings::unused_local_spans(&decls) {
-        let diag = codespan_reporting::diagnostic::Diagnostic::warning()
-            .with_message(format!("unused local binding `{name}`"))
-            .with_labels(vec![
-                codespan_reporting::diagnostic::Label::primary(file_id, span)
-                    .with_message("this local binding is never used"),
-            ]);
-        push_and_emit_diag(sess, &lowerer.files, &mut diagnostics, diag);
-    }
-    push_and_emit_diags(
+    if validate_extern_signatures(
         sess,
-        &lowerer.files,
+        &files,
         &mut diagnostics,
-        warnings::unused_unqualified_import_diagnostics(
-            &decls,
+        file_id,
+        &decls,
+        imported_type_decls,
+        imported_extern_types,
+    ) {
+        return compile_error_report(files, diagnostics);
+    }
+
+    let inferred_record_expr_types = match run_typecheck_stage(
+        sess,
+        &files,
+        &mut diagnostics,
+        TypecheckStageInput {
             file_id,
+            decls: &decls,
+            imports: &imports,
             module_exports,
             imported_type_decls,
-        ),
-    );
-    push_and_emit_diags(
+            imported_extern_types,
+            imported_private_records,
+            imported_schemes,
+        },
+    ) {
+        Some(inferred_record_expr_types) => inferred_record_expr_types,
+        None => return compile_error_report(files, diagnostics),
+    };
+
+    emit_warning_stage(
         sess,
-        &lowerer.files,
+        &files,
         &mut diagnostics,
-        warnings::redundant_match_diagnostics(&decls, file_id, imported_type_decls),
+        file_id,
+        &decls,
+        module_exports,
+        imported_type_decls,
     );
 
-    let mut imported_constructors: HashMap<String, usize> = HashMap::new();
-    let mut merged_imported_field_indices = imported_field_indices.clone();
-    let mut imported_record_layouts: HashMap<String, Vec<String>> = HashMap::new();
-    for type_decl in imported_type_decls {
-        match type_decl {
-            ast::TypeDecl::Variant {
-                name, constructors, ..
-            } => {
-                let qualified_module = name.split_once('/').map(|(module, _)| module.to_string());
-                for (ctor_name, payload) in constructors {
-                    let arity = if payload.is_some() { 1 } else { 0 };
-                    imported_constructors.insert(ctor_name.clone(), arity);
-                    if let Some(module) = &qualified_module {
-                        imported_constructors.insert(format!("{module}/{ctor_name}"), arity);
-                    }
-                }
-            }
-            ast::TypeDecl::Record { name, fields, .. } => {
-                imported_constructors.insert(name.clone(), fields.len());
-                if let Some((module, record_name)) = name.split_once('/') {
-                    imported_constructors.insert(format!("{module}/{record_name}"), fields.len());
-                }
-                for (i, (field_name, _)) in fields.iter().enumerate() {
-                    merged_imported_field_indices.insert((name.clone(), field_name.clone()), i + 2);
-                }
-                imported_record_layouts.insert(
-                    name.clone(),
-                    fields
-                        .iter()
-                        .map(|(field_name, _)| field_name.clone())
-                        .collect(),
-                );
-            }
-        }
-    }
+    let imported_runtime =
+        build_imported_type_runtime_info(imported_type_decls, imported_field_indices);
 
     let module = codegen::lower_module(
         module_name,
@@ -690,15 +716,15 @@ pub fn compile_with_imports_in_session_with_private_records(
         codegen::LowerModuleInput {
             imports,
             module_aliases,
-            imported_constructors,
-            imported_field_indices: merged_imported_field_indices,
-            imported_record_layouts,
+            imported_constructors: imported_runtime.imported_constructors,
+            imported_field_indices: imported_runtime.imported_field_indices,
+            imported_record_layouts: imported_runtime.imported_record_layouts,
             inferred_record_expr_types,
         },
     );
     session::CompileReport {
         output: Some(codegen::emit_module(&module)),
-        files: lowerer.files,
+        files,
         diagnostics,
     }
 }

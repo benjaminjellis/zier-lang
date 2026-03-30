@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{ast, lower, resolve, session, sexpr, typecheck};
+use crate::{ast, hir, lower, resolve, session, sexpr, typecheck, typing};
 
 fn parse_decls(source_path: &str, source: &str) -> Option<Vec<ast::Declaration>> {
     let mut lowerer = lower::Lowerer::new();
@@ -12,108 +12,58 @@ fn parse_decls(source_path: &str, source: &str) -> Option<Vec<ast::Declaration>>
     Some(lowerer.lower_file(file_id, &sexprs))
 }
 
-fn type_decl_name(type_decl: &ast::TypeDecl) -> &str {
-    match type_decl {
-        ast::TypeDecl::Record { name, .. } => name,
-        ast::TypeDecl::Variant { name, .. } => name,
-    }
+struct TypeInferenceResult {
+    decls: Vec<ast::Declaration>,
+    env: typecheck::TypeEnv,
+    checker: typecheck::TypeChecker,
 }
 
-fn is_qualified_type_name(name: &str) -> bool {
-    name.contains('/')
-}
-
-fn add_qualified_type_alias(name: &str, aliases: &mut HashMap<String, String>) {
-    if let Some((_, local_name)) = name.rsplit_once('/') {
-        aliases
-            .entry(name.to_string())
-            .or_insert_with(|| local_name.to_string());
-    }
-}
-
-fn collect_usage_aliases(usage: &ast::TypeUsage, aliases: &mut HashMap<String, String>) {
-    match usage {
-        ast::TypeUsage::Named(name, _) => add_qualified_type_alias(name, aliases),
-        ast::TypeUsage::Generic(_, _) => {}
-        ast::TypeUsage::App(head, args, _) => {
-            add_qualified_type_alias(head, aliases);
-            for arg in args {
-                collect_usage_aliases(arg, aliases);
-            }
-        }
-        ast::TypeUsage::Fun(arg, ret, _) => {
-            collect_usage_aliases(arg, aliases);
-            collect_usage_aliases(ret, aliases);
-        }
-    }
-}
-
-fn collect_decl_aliases(type_decl: &ast::TypeDecl, aliases: &mut HashMap<String, String>) {
-    add_qualified_type_alias(type_decl_name(type_decl), aliases);
-    match type_decl {
-        ast::TypeDecl::Record { fields, .. } => {
-            for (_, field_ty) in fields {
-                collect_usage_aliases(field_ty, aliases);
-            }
-        }
-        ast::TypeDecl::Variant { constructors, .. } => {
-            for (_, payload) in constructors {
-                if let Some(payload_ty) = payload {
-                    collect_usage_aliases(payload_ty, aliases);
-                }
-            }
-        }
-    }
-}
-
-fn collect_type_aliases(ty: &typecheck::Type, aliases: &mut HashMap<String, String>) {
-    match ty {
-        typecheck::Type::Var(_) => {}
-        typecheck::Type::Fun(arg, ret) => {
-            collect_type_aliases(arg, aliases);
-            collect_type_aliases(ret, aliases);
-        }
-        typecheck::Type::Con(name, args) => {
-            add_qualified_type_alias(name, aliases);
-            for arg in args {
-                collect_type_aliases(arg, aliases);
-            }
-        }
-    }
-}
-
-fn collect_scheme_aliases(scheme: &typecheck::Scheme, aliases: &mut HashMap<String, String>) {
-    collect_type_aliases(&scheme.ty, aliases);
-    for predicate in &scheme.preds {
-        match predicate {
-            typecheck::Predicate::HasField {
-                record_ty,
-                field_ty,
-                ..
-            } => {
-                collect_type_aliases(record_ty, aliases);
-                collect_type_aliases(field_ty, aliases);
-            }
-        }
-    }
-}
-
-fn build_qualified_type_aliases(
+fn infer_module_types(
+    module_name: &str,
+    source: &str,
+    imports: HashMap<String, String>,
+    module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
     imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
-) -> HashMap<String, String> {
-    let mut aliases = HashMap::new();
-    for type_decl in imported_type_decls {
-        collect_decl_aliases(type_decl, &mut aliases);
+) -> Option<TypeInferenceResult> {
+    let mut sess = session::CompilerSession::new(session::SessionOptions {
+        emit_diagnostics: false,
+        emit_warnings: false,
+    });
+    let lowered = hir::lower_source_to_hir(&format!("{module_name}.mond"), source);
+    if !lowered.diagnostics.is_empty() {
+        return None;
     }
-    for name in imported_extern_types {
-        add_qualified_type_alias(name, &mut aliases);
+
+    let imported_private_records: HashMap<String, Vec<String>> = HashMap::new();
+    let (mut checker, mut env) = typing::prepare_typechecker(
+        imported_type_decls,
+        imported_extern_types,
+        &imported_private_records,
+        imported_schemes,
+    );
+
+    let unresolved = resolve::unresolved_env_names(
+        &lowered.decls,
+        imports.keys().cloned(),
+        &env,
+        sess.symbol_table(module_exports),
+    );
+    env.extend(typecheck::import_env(&unresolved));
+
+    if checker
+        .check_program(&mut env, &lowered.decls, lowered.file_id)
+        .is_err()
+    {
+        return None;
     }
-    for scheme in imported_schemes.values() {
-        collect_scheme_aliases(scheme, &mut aliases);
-    }
-    aliases
+
+    Some(TypeInferenceResult {
+        decls: lowered.decls,
+        env,
+        checker,
+    })
 }
 
 pub fn exported_names(source: &str) -> Vec<String> {
@@ -235,67 +185,20 @@ pub fn infer_module_bindings(
     imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
-    let mut sess = session::CompilerSession::new(session::SessionOptions {
-        emit_diagnostics: false,
-        emit_warnings: false,
-    });
-    let mut lowerer = lower::Lowerer::new();
-    let tokens = crate::lexer::Lexer::new(source).lex();
-    let file_id = lowerer.add_file(format!("{module_name}.mond"), source.to_string());
-
-    let sexprs = match sexpr::SExprParser::new(tokens, file_id).parse() {
-        Ok(s) => s,
-        Err(_) => return HashMap::new(),
-    };
-    let decls = lowerer.lower_file(file_id, &sexprs);
-    if !lowerer.diagnostics.is_empty() {
-        return HashMap::new();
-    }
-
-    let qualified_type_aliases =
-        build_qualified_type_aliases(imported_type_decls, imported_extern_types, imported_schemes);
-    let imported_type_decls_unqualified: Vec<ast::TypeDecl> = imported_type_decls
-        .iter()
-        .filter(|type_decl| !is_qualified_type_name(type_decl_name(type_decl)))
-        .cloned()
-        .collect();
-
-    let mut checker = typecheck::TypeChecker::new();
-    checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
-    checker.seed_imported_type_info(&imported_type_decls_unqualified);
-    let mut env = typecheck::primitive_env();
-
-    for type_decl in &imported_type_decls_unqualified {
-        env.extend(typecheck::constructor_schemes_with_aliases(
-            type_decl,
-            &qualified_type_aliases,
-        ));
-    }
-    env.extend(typecheck::normalize_env_type_aliases(
+    let Some(inferred) = infer_module_types(
+        module_name,
+        source,
+        imports,
+        module_exports,
+        imported_type_decls,
+        imported_extern_types,
         imported_schemes,
-        &qualified_type_aliases,
-    ));
-
-    let unresolved = resolve::unresolved_env_names(
-        &decls,
-        imports.keys().cloned(),
-        &env,
-        sess.symbol_table(module_exports),
-    );
-    env.extend(typecheck::import_env(&unresolved));
-
-    for type_decl in &imported_type_decls_unqualified {
-        env.extend(typecheck::constructor_schemes_with_aliases(
-            type_decl,
-            &qualified_type_aliases,
-        ));
-    }
-
-    if checker.check_program(&mut env, &decls, file_id).is_err() {
+    ) else {
         return HashMap::new();
-    }
+    };
 
-    let binding_names: std::collections::HashSet<&str> = decls
+    let binding_names: HashSet<&str> = inferred
+        .decls
         .iter()
         .filter_map(|d| match d {
             ast::Declaration::Expression(ast::Expr::LetFunc { name, .. }) => Some(name.as_str()),
@@ -304,7 +207,9 @@ pub fn infer_module_bindings(
         })
         .collect();
 
-    env.into_iter()
+    inferred
+        .env
+        .into_iter()
         .filter(|(k, _)| binding_names.contains(k.as_str()))
         .collect()
 }
@@ -318,59 +223,20 @@ pub fn infer_module_expr_types(
     imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
 ) -> Vec<(std::ops::Range<usize>, String)> {
-    let mut sess = session::CompilerSession::new(session::SessionOptions {
-        emit_diagnostics: false,
-        emit_warnings: false,
-    });
-    let mut lowerer = lower::Lowerer::new();
-    let tokens = crate::lexer::Lexer::new(source).lex();
-    let file_id = lowerer.add_file(format!("{module_name}.mond"), source.to_string());
-
-    let sexprs = match sexpr::SExprParser::new(tokens, file_id).parse() {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let decls = lowerer.lower_file(file_id, &sexprs);
-    if !lowerer.diagnostics.is_empty() {
-        return Vec::new();
-    }
-
-    let qualified_type_aliases =
-        build_qualified_type_aliases(imported_type_decls, imported_extern_types, imported_schemes);
-    let imported_type_decls_unqualified: Vec<ast::TypeDecl> = imported_type_decls
-        .iter()
-        .filter(|type_decl| !is_qualified_type_name(type_decl_name(type_decl)))
-        .cloned()
-        .collect();
-
-    let mut checker = typecheck::TypeChecker::new();
-    checker.seed_qualified_type_aliases(qualified_type_aliases.clone());
-    checker.seed_imported_type_info(&imported_type_decls_unqualified);
-    let mut env = typecheck::primitive_env();
-    for type_decl in &imported_type_decls_unqualified {
-        env.extend(typecheck::constructor_schemes_with_aliases(
-            type_decl,
-            &qualified_type_aliases,
-        ));
-    }
-    env.extend(typecheck::normalize_env_type_aliases(
+    let Some(inferred) = infer_module_types(
+        module_name,
+        source,
+        imports,
+        module_exports,
+        imported_type_decls,
+        imported_extern_types,
         imported_schemes,
-        &qualified_type_aliases,
-    ));
-
-    let unresolved = resolve::unresolved_env_names(
-        &decls,
-        imports.keys().cloned(),
-        &env,
-        sess.symbol_table(module_exports),
-    );
-    env.extend(typecheck::import_env(&unresolved));
-
-    if checker.check_program(&mut env, &decls, file_id).is_err() {
+    ) else {
         return Vec::new();
-    }
+    };
 
-    checker
+    inferred
+        .checker
         .inferred_expr_types()
         .iter()
         .map(|(span, ty)| (span.clone(), typecheck::type_display(ty)))
@@ -386,7 +252,7 @@ pub fn infer_module_exports(
     imported_extern_types: &[String],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
-    let all_bindings = infer_module_bindings(
+    let Some(inferred) = infer_module_types(
         module_name,
         source,
         imports,
@@ -394,20 +260,12 @@ pub fn infer_module_exports(
         imported_type_decls,
         imported_extern_types,
         imported_schemes,
-    );
-
-    let mut lowerer = lower::Lowerer::new();
-    let tokens = crate::lexer::Lexer::new(source).lex();
-    let file_id = lowerer.add_file(format!("{module_name}.mond"), source.to_string());
-    let Ok(sexprs) = sexpr::SExprParser::new(tokens, file_id).parse() else {
+    ) else {
         return HashMap::new();
     };
-    let decls = lowerer.lower_file(file_id, &sexprs);
-    if !lowerer.diagnostics.is_empty() {
-        return HashMap::new();
-    }
 
-    let pub_names: std::collections::HashSet<&str> = decls
+    let pub_names: HashSet<&str> = inferred
+        .decls
         .iter()
         .filter_map(|d| match d {
             ast::Declaration::Expression(ast::Expr::LetFunc {
@@ -420,22 +278,17 @@ pub fn infer_module_exports(
         })
         .collect();
 
-    all_bindings
+    inferred
+        .env
         .into_iter()
         .filter(|(k, _)| pub_names.contains(k.as_str()))
         .collect()
 }
 
 pub fn test_declarations(source: &str) -> Vec<(String, String)> {
-    let mut lowerer = lower::Lowerer::new();
-    let tokens = crate::lexer::Lexer::new(source).lex();
-    let file_id = lowerer.add_file("tests/scan.mond".into(), source.into());
-    let Ok(sexprs) = sexpr::SExprParser::new(tokens, file_id).parse() else {
-        return vec![];
-    };
-    let decls = lowerer.lower_file(file_id, &sexprs);
     let mut test_idx = 0;
-    decls
+    parse_decls("tests/scan.mond", source)
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|d| {
             if let ast::Declaration::Test { name, .. } = d {

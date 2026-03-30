@@ -384,11 +384,11 @@ pub(crate) fn generate_erl_sources_with_roots(
     let (source_outputs, source_had_error) =
         compile_flow::compile_units(&source_compile_units, &module_exports, &analysis, true);
     for output in source_outputs {
-        if let Some(erl_source) = output.erl_source {
+        if let Some(erl_source) = output.erl_source() {
             erl_paths.push(compile_flow::write_erl_output(
                 erl_dir,
                 &output.output_module_name,
-                &erl_source,
+                erl_source,
             )?);
         }
     }
@@ -417,11 +417,11 @@ pub(crate) fn generate_erl_sources_with_roots(
         true,
     );
     for output in dependency_outputs {
-        if let Some(erl_source) = output.erl_source {
+        if let Some(erl_source) = output.erl_source() {
             erl_paths.push(compile_flow::write_erl_output(
                 erl_dir,
                 &output.output_module_name,
-                &erl_source,
+                erl_source,
             )?);
         }
     }
