@@ -27,9 +27,9 @@ pub use pipeline::{
 pub use project::{
     ProjectAnalysis, ResolvedImports, alias_package_root_module, build_project_analysis,
     build_project_analysis_with_modules, build_project_analysis_with_modules_and_package,
-    dependency_erlang_module_name, load_dependency_modules_from_checkout, ordered_module_sources,
+    dependency_erlang_module_name, external_modules_from_package_sources,
+    external_modules_from_sources, load_dependency_modules_from_checkout, ordered_module_sources,
     reachable_module_sources, referenced_modules, resolve_imports_for_source,
-    std_modules_from_sources,
 };
 pub use query::{
     exported_extern_types, exported_names, exported_type_decls, has_nullary_main,

@@ -739,14 +739,14 @@ mod tests {
     }
 
     #[test]
-    fn std_modules_from_sources_discovers_files_without_lib_reexports() {
+    fn external_modules_from_sources_discovers_files_without_lib_reexports() {
         let modules = vec![
             ("io".to_string(), "(let println {x} x)".to_string()),
             ("extra".to_string(), "(let helper {} 1)".to_string()),
             ("std".to_string(), "(let hello {} 1)".to_string()),
         ];
 
-        let discovered = mondc::std_modules_from_sources(&modules).expect("std modules");
+        let discovered = mondc::external_modules_from_sources(&modules).expect("external modules");
         let names: Vec<String> = discovered.into_iter().map(|(name, _, _)| name).collect();
 
         assert!(names.contains(&"io".to_string()));

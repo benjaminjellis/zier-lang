@@ -7,7 +7,7 @@ use crate::{project::Project, state::DocumentState};
 
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleSource {
     pub(crate) name: String,
     pub(crate) path: PathBuf,
@@ -116,21 +116,15 @@ pub(crate) struct DocumentAnalysis {
 }
 
 pub(super) fn build_project_analysis(
-    std_modules: &BTreeMap<String, ModuleSource>,
-    dep_modules: &BTreeMap<String, ModuleSource>,
+    external_modules: &BTreeMap<String, ModuleSource>,
     src_modules: &BTreeMap<String, ModuleSource>,
     package_name: Option<&str>,
 ) -> std::result::Result<mondc::ProjectAnalysis, String> {
-    let std_mods = std_modules
-        .iter()
-        .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
-        .collect::<Vec<(String, String)>>();
-    let mut external_mods = mondc::std_modules_from_sources(&std_mods)?;
-    external_mods.extend(load_dependency_analysis_modules(dep_modules));
     let src_module_sources: Vec<(String, String)> = src_modules
         .iter()
         .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect();
+    let external_mods = load_external_analysis_modules(external_modules);
     mondc::build_project_analysis_with_modules_and_package(
         &external_mods,
         &src_module_sources,
@@ -211,22 +205,6 @@ pub(super) fn collect_mond_files_from_dir(
     }
 }
 
-pub(super) fn std_source_root(root: Option<&Path>) -> Option<PathBuf> {
-    if let Some(root) = root {
-        let dep_root = root.join("target").join("deps").join("std").join("src");
-        if dep_root.exists() {
-            return Some(dep_root);
-        }
-    }
-
-    let workspace_std = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../mond-std/src");
-    if workspace_std.exists() {
-        return Some(workspace_std);
-    }
-
-    None
-}
-
 pub(super) fn package_name_from_manifest(root: Option<&Path>) -> Option<String> {
     let root = root?;
     let manifest_path = root.join("bahn.toml");
@@ -239,28 +217,7 @@ pub(super) fn package_name_from_manifest(root: Option<&Path>) -> Option<String> 
         .map(str::to_string)
 }
 
-pub(super) fn collect_std_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
-    let Some(std_root) = std_source_root(root) else {
-        return BTreeMap::new();
-    };
-
-    let mut discovered = BTreeMap::new();
-    collect_mond_files_from_dir(&std_root, &mut discovered);
-
-    let mut modules = BTreeMap::new();
-    for (_, mut module) in discovered {
-        let name = if module.name == "lib" {
-            "std".to_string()
-        } else {
-            module.name.clone()
-        };
-        module.name = name.clone();
-        modules.insert(name, module);
-    }
-    modules
-}
-
-pub(super) fn collect_dependency_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
+pub(super) fn collect_external_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
     let Some(root) = root else {
         return BTreeMap::new();
     };
@@ -279,7 +236,7 @@ pub(super) fn collect_dependency_modules(root: Option<&Path>) -> BTreeMap<String
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        if dep_name.is_empty() || dep_name == "std" {
+        if dep_name.is_empty() {
             continue;
         }
         let src_dir = dep_dir.join("src");
@@ -298,33 +255,29 @@ pub(super) fn collect_dependency_modules(root: Option<&Path>) -> BTreeMap<String
     modules
 }
 
-pub(super) fn load_dependency_analysis_modules(
-    dep_modules: &BTreeMap<String, ModuleSource>,
+pub(super) fn load_external_analysis_modules(
+    external_modules: &BTreeMap<String, ModuleSource>,
 ) -> Vec<(String, String, String)> {
     let mut loaded = Vec::new();
-    let mut dep_dirs = BTreeMap::new();
-    for module in dep_modules.values() {
-        let Some(dep_dir) = module.path.ancestors().find(|ancestor| {
-            ancestor.parent().and_then(|parent| parent.file_name())
-                == Some(std::ffi::OsStr::new("deps"))
-        }) else {
-            continue;
-        };
-        let dep_name = dep_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if dep_name.is_empty() {
-            continue;
-        }
-        dep_dirs
-            .entry(dep_name)
-            .or_insert_with(|| dep_dir.to_path_buf());
+    let mut package_sources: BTreeMap<Option<String>, Vec<(String, String)>> = BTreeMap::new();
+
+    for module in external_modules.values() {
+        let package_name = external_package_name_for_module_path(&module.path).map(str::to_string);
+        package_sources
+            .entry(package_name)
+            .or_default()
+            .push((module.name.clone(), module.source.clone()));
     }
-    for (dep_name, dep_dir) in dep_dirs {
-        if let Ok(dep_loaded) = mondc::load_dependency_modules_from_checkout(&dep_name, &dep_dir) {
-            loaded.extend(dep_loaded);
+
+    for (package_name, module_sources) in package_sources {
+        let discovered = match package_name {
+            Some(package_name) => {
+                mondc::external_modules_from_package_sources(&package_name, &module_sources)
+            }
+            None => mondc::external_modules_from_sources(&module_sources),
+        };
+        if let Ok(discovered) = discovered {
+            loaded.extend(discovered);
         }
     }
     loaded
@@ -768,7 +721,7 @@ pub(super) fn enclosing_round_list_start(source: &str, offset: usize) -> Option<
     None
 }
 
-pub(super) fn dependency_name_for_module_path(path: &Path) -> Option<&str> {
+pub(super) fn external_package_name_for_module_path(path: &Path) -> Option<&str> {
     path.ancestors().find_map(|ancestor| {
         let parent = ancestor.parent()?;
         if parent.file_name()? != std::ffi::OsStr::new("deps") {

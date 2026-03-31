@@ -9,22 +9,76 @@ use tower_lsp::lsp_types::{
 };
 
 use crate::{
-    ModuleSource, OccurrenceKind, Symbol, analysis::DocumentAnalysis, build_project_analysis,
-    byte_range_to_lsp_range, collect_dependency_modules, collect_modules, collect_record_fields,
-    collect_std_modules, collect_symbol_occurrences, completion_item, contains_path,
-    dependency_name_for_module_path, diagnostic_to_lsp, find_top_level_definition_range,
+    ModuleSource, OccurrenceKind, Symbol,
+    analysis::DocumentAnalysis,
+    build_project_analysis, byte_range_to_lsp_range, collect_external_modules, collect_modules,
+    collect_record_fields, collect_symbol_occurrences, completion_item, contains_path,
+    diagnostic_to_lsp, external_package_name_for_module_path, find_top_level_definition_range,
     is_test_path, local_names_at_offset, local_type_decls, module_name_for_path,
-    package_name_from_manifest, push_completion_item, source_path_for_compile, state::ServerState,
+    package_name_from_manifest, push_completion_item, source_path_for_compile,
+    state::{DocumentState, ServerState, WorkspaceCacheEntry},
     top_level_docs, top_level_symbols, visible_exports,
 };
 
 pub(crate) struct Project {
     pub(crate) root: Option<PathBuf>,
-    pub(crate) std_modules: BTreeMap<String, ModuleSource>,
-    pub(crate) dep_modules: BTreeMap<String, ModuleSource>,
-    pub(crate) src_modules: BTreeMap<String, ModuleSource>,
-    pub(crate) test_modules: BTreeMap<String, ModuleSource>,
-    pub(crate) analysis: mondc::ProjectAnalysis,
+    pub(crate) external_modules: Arc<BTreeMap<String, ModuleSource>>,
+    pub(crate) src_modules: Arc<BTreeMap<String, ModuleSource>>,
+    pub(crate) test_modules: Arc<BTreeMap<String, ModuleSource>>,
+    pub(crate) analysis: Arc<mondc::ProjectAnalysis>,
+}
+
+struct WorkspaceSnapshot {
+    external_modules: BTreeMap<String, ModuleSource>,
+    src_modules: BTreeMap<String, ModuleSource>,
+    test_modules: BTreeMap<String, ModuleSource>,
+    package_name: Option<String>,
+}
+
+impl WorkspaceSnapshot {
+    fn collect(
+        root: Option<&Path>,
+        overlays: &HashMap<Url, DocumentState>,
+        focus_uri: &Url,
+    ) -> Self {
+        let external_modules = collect_external_modules(root);
+        let src_modules = collect_modules(root, "src", overlays);
+        let mut test_modules = collect_modules(root, "tests", overlays);
+
+        // Ensure an open unsaved test file still participates in project queries.
+        if let Ok(path) = focus_uri.to_file_path()
+            && !contains_path(&src_modules, &path)
+            && !contains_path(&test_modules, &path)
+            && let Some(doc) = overlays.get(focus_uri)
+            && is_test_path(root, &path)
+        {
+            let module = ModuleSource {
+                name: module_name_for_path(&path),
+                path: path.clone(),
+                source: doc.text.clone(),
+            };
+            test_modules.insert(module.name.clone(), module);
+        }
+
+        let package_name = package_name_from_manifest(root);
+
+        Self {
+            external_modules,
+            src_modules,
+            test_modules,
+            package_name,
+        }
+    }
+}
+
+fn reuse_cached_module_set(
+    cached: Option<&Arc<BTreeMap<String, ModuleSource>>>,
+    current: BTreeMap<String, ModuleSource>,
+) -> Arc<BTreeMap<String, ModuleSource>> {
+    match cached {
+        Some(modules) if modules.as_ref() == &current => modules.clone(),
+        _ => Arc::new(current),
+    }
 }
 
 impl Project {
@@ -33,48 +87,66 @@ impl Project {
         state: &Arc<Mutex<ServerState>>,
         focus_uri: &Url,
     ) -> std::result::Result<Self, String> {
-        let overlays = state.lock().unwrap().open_docs.clone();
-        let std_modules = collect_std_modules(root);
-        let dep_modules = collect_dependency_modules(root);
-        let src_modules = collect_modules(root, "src", &overlays);
-        let test_modules = collect_modules(root, "tests", &overlays);
-        let package_name = package_name_from_manifest(root);
-        let analysis = build_project_analysis(
-            &std_modules,
-            &dep_modules,
-            &src_modules,
-            package_name.as_deref(),
-        )?;
+        let root = root.map(Path::to_path_buf);
+        let (overlays, cached) = {
+            let state = state.lock().unwrap();
+            let overlays = state.open_docs.clone();
+            let cached = root
+                .as_ref()
+                .and_then(|root| state.workspace_cache.get(root).cloned());
+            (overlays, cached)
+        };
+        let snapshot = WorkspaceSnapshot::collect(root.as_deref(), &overlays, focus_uri);
+        let WorkspaceSnapshot {
+            external_modules: current_external_modules,
+            src_modules: current_src_modules,
+            test_modules: current_test_modules,
+            package_name,
+        } = snapshot;
 
-        // Ensure an open unsaved file outside src/tests still gets analyzed standalone.
-        if let Ok(path) = focus_uri.to_file_path()
-            && !contains_path(&src_modules, &path)
-            && !contains_path(&test_modules, &path)
-            && let Some(doc) = overlays.get(focus_uri)
-        {
-            let module = ModuleSource {
-                name: module_name_for_path(&path),
-                path: path.clone(),
-                source: doc.text.clone(),
-            };
-            let mut test_modules = test_modules.clone();
-            if is_test_path(root, &path) {
-                test_modules.insert(module.name.clone(), module);
-                return Ok(Self {
-                    root: root.map(Path::to_path_buf),
-                    std_modules,
-                    dep_modules,
-                    src_modules,
-                    test_modules,
-                    analysis,
-                });
+        let external_modules = reuse_cached_module_set(
+            cached.as_ref().map(|entry| &entry.external_modules),
+            current_external_modules,
+        );
+        let src_modules = reuse_cached_module_set(
+            cached.as_ref().map(|entry| &entry.src_modules),
+            current_src_modules,
+        );
+        let test_modules = reuse_cached_module_set(
+            cached.as_ref().map(|entry| &entry.test_modules),
+            current_test_modules,
+        );
+        let analysis = match cached.as_ref() {
+            Some(entry)
+                if entry.external_modules.as_ref() == external_modules.as_ref()
+                    && entry.src_modules.as_ref() == src_modules.as_ref()
+                    && entry.package_name == package_name =>
+            {
+                entry.analysis.clone()
             }
+            _ => Arc::new(build_project_analysis(
+                external_modules.as_ref(),
+                src_modules.as_ref(),
+                package_name.as_deref(),
+            )?),
+        };
+
+        if let Some(root) = root.as_ref() {
+            state.lock().unwrap().workspace_cache.insert(
+                root.clone(),
+                WorkspaceCacheEntry {
+                    external_modules: external_modules.clone(),
+                    src_modules: src_modules.clone(),
+                    test_modules: test_modules.clone(),
+                    package_name: package_name.clone(),
+                    analysis: analysis.clone(),
+                },
+            );
         }
 
         Ok(Self {
-            root: root.map(Path::to_path_buf),
-            std_modules,
-            dep_modules,
+            root,
+            external_modules,
             src_modules,
             test_modules,
             analysis,
@@ -87,16 +159,14 @@ impl Project {
             .get(&module_name)
             .cloned()
             .or_else(|| self.test_modules.get(&module_name).cloned())
-            .or_else(|| self.dep_modules.get(&module_name).cloned())
-            .or_else(|| self.std_modules.get(&module_name).cloned())
+            .or_else(|| self.external_modules.get(&module_name).cloned())
     }
 
     pub(crate) fn module_named(&self, module_name: &str) -> Option<&ModuleSource> {
         self.src_modules
             .get(module_name)
             .or_else(|| self.test_modules.get(module_name))
-            .or_else(|| self.dep_modules.get(module_name))
-            .or_else(|| self.std_modules.get(module_name))
+            .or_else(|| self.external_modules.get(module_name))
     }
 
     pub(crate) fn definition_location(
@@ -117,9 +187,8 @@ impl Project {
     }
 
     fn all_modules(&self) -> Vec<ModuleSource> {
-        self.std_modules
+        self.external_modules
             .values()
-            .chain(self.dep_modules.values())
             .chain(self.src_modules.values())
             .chain(self.test_modules.values())
             .cloned()
@@ -560,19 +629,11 @@ impl Project {
     fn importable_module_names(&self, root: &str) -> Vec<String> {
         let mut modules = Vec::new();
 
-        if root == "std" {
-            modules.extend(
-                self.std_modules
-                    .keys()
-                    .filter(|name| name.as_str() != "std")
-                    .cloned(),
-            );
-        }
-
         modules.extend(
-            self.dep_modules
+            self.external_modules
                 .values()
-                .filter(|module| dependency_name_for_module_path(&module.path) == Some(root))
+                .filter(|module| external_package_name_for_module_path(&module.path) == Some(root))
+                .filter(|module| module.name != root)
                 .map(|module| module.name.clone()),
         );
 

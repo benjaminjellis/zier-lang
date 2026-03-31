@@ -15,7 +15,7 @@ struct Ctx {
     constructors: HashMap<String, usize>,
     /// Imported function name → Erlang module (from `use` declarations)
     imports: HashMap<String, String>,
-    /// User-facing module name → Erlang module name (e.g. "io" → "mond_io")
+    /// User-facing module name → Erlang module name (e.g. "time" → "d_time_time")
     module_aliases: HashMap<String, String>,
     /// Record/field pair → 1-based element index (tag is at 1, fields start at 2)
     field_indices: HashMap<(String, String), usize>,

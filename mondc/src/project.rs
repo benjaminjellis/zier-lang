@@ -68,10 +68,10 @@ fn clone_type_decl_with_name(
 }
 
 pub fn build_project_analysis(
-    std_mods: &[(String, String, String)],
+    external_mods: &[(String, String, String)],
     src_module_sources: &[(String, String)],
 ) -> Result<ProjectAnalysis, String> {
-    build_project_analysis_with_modules(std_mods, src_module_sources)
+    build_project_analysis_with_modules(external_mods, src_module_sources)
 }
 
 pub fn build_project_analysis_with_modules(
@@ -581,7 +581,21 @@ pub fn reachable_module_sources(
         .collect())
 }
 
-pub fn std_modules_from_sources(
+pub fn external_modules_from_package_sources(
+    package_name: &str,
+    module_sources: &[(String, String)],
+) -> Result<Vec<(String, String, String)>, String> {
+    let ordered = ordered_module_sources(module_sources)?;
+    Ok(ordered
+        .into_iter()
+        .map(|(user_name, source)| {
+            let erlang_name = dependency_erlang_module_name(package_name, &user_name);
+            (user_name, erlang_name, source)
+        })
+        .collect())
+}
+
+pub fn external_modules_from_sources(
     module_sources: &[(String, String)],
 ) -> Result<Vec<(String, String, String)>, String> {
     let ordered = ordered_module_sources(module_sources)?;
@@ -617,13 +631,7 @@ pub fn load_dependency_modules_from_checkout(
         dep_sources.push((dep_name.to_string(), lib_src));
     }
 
-    std_modules_from_sources(&dep_sources)?
-        .into_iter()
-        .map(|(user_name, _, source)| {
-            let erlang_name = dependency_erlang_module_name(dep_name, &user_name);
-            Ok((user_name, erlang_name, source))
-        })
-        .collect()
+    external_modules_from_package_sources(dep_name, &dep_sources)
 }
 
 fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> Result<Vec<String>, String> {
@@ -830,13 +838,13 @@ mod tests {
     }
 
     #[test]
-    fn std_modules_from_sources_discovers_files_without_root_reexports() {
+    fn external_modules_from_sources_discovers_files_without_root_reexports() {
         let modules = vec![
             ("io".to_string(), "(let println {x} x)".to_string()),
             ("extra".to_string(), "(let helper {} 1)".to_string()),
             ("std".to_string(), "(let hello {} 1)".to_string()),
         ];
-        let discovered = std_modules_from_sources(&modules).expect("std modules");
+        let discovered = external_modules_from_sources(&modules).expect("external modules");
         let names: Vec<String> = discovered.into_iter().map(|(name, _, _)| name).collect();
         assert!(names.contains(&"io".to_string()));
         assert!(names.contains(&"extra".to_string()));
@@ -877,8 +885,8 @@ mod tests {
         exports.insert("io".to_string(), vec!["println".to_string()]);
 
         let mut module_aliases = HashMap::new();
-        module_aliases.insert("std".to_string(), "mond_std".to_string());
-        module_aliases.insert("io".to_string(), "mond_io".to_string());
+        module_aliases.insert("std".to_string(), "d_std_std".to_string());
+        module_aliases.insert("io".to_string(), "d_std_io".to_string());
 
         let resolved = resolve_imports_for_source(
             "(use std [hello])\n(use std/io)\n(let main {} (hello))",
@@ -893,7 +901,10 @@ mod tests {
             },
         );
 
-        assert_eq!(resolved.imports.get("hello"), Some(&"mond_std".to_string()));
+        assert_eq!(
+            resolved.imports.get("hello"),
+            Some(&"d_std_std".to_string())
+        );
         assert!(!resolved.imports.contains_key("println"));
     }
 

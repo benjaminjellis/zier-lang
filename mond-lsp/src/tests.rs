@@ -1,10 +1,14 @@
-use tower_lsp::lsp_types::{CompletionItemKind, Position, Range};
+use tower_lsp::lsp_types::{CompletionItemKind, Position, Range, Url};
 
-use crate::project::Project;
+use crate::{
+    project::Project,
+    state::{DocumentState, ServerState},
+};
 
 use super::*;
 use std::{
     fs,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +18,32 @@ fn unique_temp_root() -> PathBuf {
         .expect("time")
         .as_nanos();
     std::env::temp_dir().join(format!("mond-lsp-test-{}-{nanos}", std::process::id()))
+}
+
+fn write_project_file(root: &Path, relative: &str, source: &str) {
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent");
+    }
+    fs::write(path, source).expect("write project file");
+}
+
+fn test_project(
+    external_modules: BTreeMap<String, ModuleSource>,
+    src_modules: BTreeMap<String, ModuleSource>,
+    test_modules: BTreeMap<String, ModuleSource>,
+    package_name: Option<&str>,
+) -> Project {
+    Project {
+        root: None,
+        external_modules: Arc::new(external_modules.clone()),
+        src_modules: Arc::new(src_modules.clone()),
+        test_modules: Arc::new(test_modules),
+        analysis: Arc::new(
+            build_project_analysis(&external_modules, &src_modules, package_name)
+                .expect("project analysis"),
+        ),
+    }
 }
 
 #[test]
@@ -312,15 +342,7 @@ fn unqualified_completion_includes_local_functions_when_typecheck_fails() {
                 .to_string(),
         },
     )]);
-    let project = Project {
-        root: None,
-        std_modules: BTreeMap::new(),
-        dep_modules: BTreeMap::new(),
-        src_modules: src_modules.clone(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
-            .expect("project analysis"),
-    };
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
 
     let doc = project.src_modules.get("main").expect("main module");
     let analysis = project.analyze_document(doc).expect("document analysis");
@@ -349,15 +371,7 @@ fn unqualified_completion_includes_local_type_names() {
                 .to_string(),
         },
     )]);
-    let project = Project {
-        root: None,
-        std_modules: BTreeMap::new(),
-        dep_modules: BTreeMap::new(),
-        src_modules: src_modules.clone(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
-            .expect("project analysis"),
-    };
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
 
     let doc = project.src_modules.get("main").expect("main module");
     let analysis = project.analyze_document(doc).expect("document analysis");
@@ -386,15 +400,7 @@ fn unqualified_completion_uses_curried_arrow_type_formatting() {
                 .to_string(),
         },
     )]);
-    let project = Project {
-        root: None,
-        std_modules: BTreeMap::new(),
-        dep_modules: BTreeMap::new(),
-        src_modules: src_modules.clone(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
-            .expect("project analysis"),
-    };
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
 
     let doc = project.src_modules.get("main").expect("main module");
     let analysis = project.analyze_document(doc).expect("document analysis");
@@ -425,15 +431,7 @@ fn record_field_completion_suggests_fields_for_constructor() {
                 .to_string(),
         },
     )]);
-    let project = Project {
-        root: None,
-        std_modules: BTreeMap::new(),
-        dep_modules: BTreeMap::new(),
-        src_modules: src_modules.clone(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
-            .expect("project analysis"),
-    };
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
 
     let doc = project.src_modules.get("main").expect("main module");
     let analysis = project.analyze_document(doc).expect("document analysis");
@@ -465,15 +463,7 @@ fn record_field_completion_suggests_fields_for_with_update() {
                 .to_string(),
         },
     )]);
-    let project = Project {
-        root: None,
-        std_modules: BTreeMap::new(),
-        dep_modules: BTreeMap::new(),
-        src_modules: src_modules.clone(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
-            .expect("project analysis"),
-    };
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
 
     let doc = project.src_modules.get("main").expect("main module");
     let analysis = project.analyze_document(doc).expect("document analysis");
@@ -500,7 +490,7 @@ fn import_path_completion_items_include_std_submodules() {
             "std".to_string(),
             ModuleSource {
                 name: "std".to_string(),
-                path: PathBuf::from("std/lib.mond"),
+                path: PathBuf::from("target/deps/std/src/lib.mond"),
                 source: "(pub let hello {} 1)".to_string(),
             },
         ),
@@ -508,20 +498,12 @@ fn import_path_completion_items_include_std_submodules() {
             "process".to_string(),
             ModuleSource {
                 name: "process".to_string(),
-                path: PathBuf::from("std/process.mond"),
+                path: PathBuf::from("target/deps/std/src/process.mond"),
                 source: "(pub let exit {} 1)".to_string(),
             },
         ),
     ]);
-    let project = Project {
-        root: None,
-        std_modules: std_modules.clone(),
-        dep_modules: BTreeMap::new(),
-        src_modules: BTreeMap::new(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&std_modules, &BTreeMap::new(), &BTreeMap::new(), None)
-            .expect("project analysis"),
-    };
+    let project = test_project(std_modules.clone(), BTreeMap::new(), BTreeMap::new(), None);
 
     let labels = project
         .import_path_completion_items("std", "pr")
@@ -539,7 +521,7 @@ fn use_import_list_completion_items_include_std_process_exports() {
             "std".to_string(),
             ModuleSource {
                 name: "std".to_string(),
-                path: PathBuf::from("std/lib.mond"),
+                path: PathBuf::from("target/deps/std/src/lib.mond"),
                 source: "(pub let hello {} 1)".to_string(),
             },
         ),
@@ -547,7 +529,7 @@ fn use_import_list_completion_items_include_std_process_exports() {
             "process".to_string(),
             ModuleSource {
                 name: "process".to_string(),
-                path: PathBuf::from("std/process.mond"),
+                path: PathBuf::from("target/deps/std/src/process.mond"),
                 source: "(pub let spawn {task} task)\n\
                              (let hidden {} 1)\n\
                              (pub let sleep {ms} ms)\n\
@@ -557,15 +539,7 @@ fn use_import_list_completion_items_include_std_process_exports() {
             },
         ),
     ]);
-    let project = Project {
-        root: None,
-        std_modules: std_modules.clone(),
-        dep_modules: BTreeMap::new(),
-        src_modules: BTreeMap::new(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&std_modules, &BTreeMap::new(), &BTreeMap::new(), None)
-            .expect("project analysis"),
-    };
+    let project = test_project(std_modules.clone(), BTreeMap::new(), BTreeMap::new(), None);
 
     let labels = project
         .use_import_list_completion_items("process", "s")
@@ -583,7 +557,7 @@ fn use_import_list_completion_items_include_extern_types() {
             "std".to_string(),
             ModuleSource {
                 name: "std".to_string(),
-                path: PathBuf::from("std/lib.mond"),
+                path: PathBuf::from("target/deps/std/src/lib.mond"),
                 source: "(pub let hello {} 1)".to_string(),
             },
         ),
@@ -591,7 +565,7 @@ fn use_import_list_completion_items_include_extern_types() {
             "process".to_string(),
             ModuleSource {
                 name: "process".to_string(),
-                path: PathBuf::from("std/process.mond"),
+                path: PathBuf::from("target/deps/std/src/process.mond"),
                 source: "(pub let spawn {task} task)\n\
                              (pub type ExitReason [Normal])\n\
                              (pub extern type ['p] Selector)"
@@ -599,15 +573,7 @@ fn use_import_list_completion_items_include_extern_types() {
             },
         ),
     ]);
-    let project = Project {
-        root: None,
-        std_modules: std_modules.clone(),
-        dep_modules: BTreeMap::new(),
-        src_modules: BTreeMap::new(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&std_modules, &BTreeMap::new(), &BTreeMap::new(), None)
-            .expect("project analysis"),
-    };
+    let project = test_project(std_modules.clone(), BTreeMap::new(), BTreeMap::new(), None);
 
     let labels = project
         .use_import_list_completion_items("process", "Sel")
@@ -697,8 +663,8 @@ fn signature_target_finds_qualified_call_argument_index() {
 }
 
 #[test]
-fn std_modules_include_submodules_without_root_reexports() {
-    let std_modules = BTreeMap::from([
+fn external_modules_include_submodules_without_root_reexports() {
+    let external_modules = BTreeMap::from([
         (
             "std".to_string(),
             ModuleSource {
@@ -716,18 +682,19 @@ fn std_modules_include_submodules_without_root_reexports() {
             },
         ),
     ]);
-    let std_mods = std_modules
+    let external_mods = external_modules
         .iter()
         .map(|(module_name, module)| (module_name.clone(), module.source.clone()))
         .collect::<Vec<(String, String)>>();
-    let std_mods = mondc::std_modules_from_sources(&std_mods).expect("std modules");
-    assert!(std_mods.iter().any(|(name, _, _)| name == "std"));
-    assert!(std_mods.iter().any(|(name, _, _)| name == "io"));
+    let external_mods =
+        mondc::external_modules_from_sources(&external_mods).expect("external modules");
+    assert!(external_mods.iter().any(|(name, _, _)| name == "std"));
+    assert!(external_mods.iter().any(|(name, _, _)| name == "io"));
 }
 
 #[test]
 fn resolve_imports_supports_std_submodules_without_root_reexports() {
-    let std_modules = BTreeMap::from([
+    let external_modules = BTreeMap::from([
         (
             "std".to_string(),
             ModuleSource {
@@ -745,7 +712,7 @@ fn resolve_imports_supports_std_submodules_without_root_reexports() {
             },
         ),
     ]);
-    let analysis = build_project_analysis(&std_modules, &BTreeMap::new(), &BTreeMap::new(), None)
+    let analysis = build_project_analysis(&external_modules, &BTreeMap::new(), None)
         .expect("project analysis");
     let imports = mondc::resolve_imports_for_source(
         "(use std/io)\n(let main {} ())",
@@ -766,13 +733,8 @@ fn package_name_aliases_lib_module_for_import_resolution() {
             source: "(pub let now {} 1)".to_string(),
         },
     )]);
-    let analysis = build_project_analysis(
-        &BTreeMap::new(),
-        &BTreeMap::new(),
-        &src_modules,
-        Some("time"),
-    )
-    .expect("project analysis");
+    let analysis = build_project_analysis(&BTreeMap::new(), &src_modules, Some("time"))
+        .expect("project analysis");
     let imports = mondc::resolve_imports_for_source(
         "(use time)\n(let main {} (time/now))",
         &analysis.module_exports,
@@ -787,18 +749,18 @@ fn package_name_aliases_lib_module_for_import_resolution() {
 }
 
 #[test]
-fn collect_dependency_modules_and_analysis_include_cached_dependencies() {
+fn collect_external_modules_and_analysis_include_cached_dependencies() {
     let root = unique_temp_root();
     let dep_src = root.join("target").join("deps").join("time").join("src");
     fs::create_dir_all(&dep_src).expect("create dependency src");
     fs::write(dep_src.join("lib.mond"), "(pub let now {} 1)").expect("write lib");
     fs::write(dep_src.join("duration.mond"), "(pub let seconds {} 1)").expect("write submodule");
 
-    let dep_modules = collect_dependency_modules(Some(&root));
-    assert!(dep_modules.contains_key("time"));
-    assert!(dep_modules.contains_key("duration"));
+    let external_modules = collect_external_modules(Some(&root));
+    assert!(external_modules.contains_key("time"));
+    assert!(external_modules.contains_key("duration"));
 
-    let analysis = build_project_analysis(&BTreeMap::new(), &dep_modules, &BTreeMap::new(), None)
+    let analysis = build_project_analysis(&external_modules, &BTreeMap::new(), None)
         .expect("project analysis");
     assert!(analysis.module_exports.contains_key("time"));
     assert!(analysis.module_exports.contains_key("duration"));
@@ -854,15 +816,7 @@ fn project_diagnostics_include_non_focused_module() {
             },
         ),
     ]);
-    let project = Project {
-        root: None,
-        std_modules: BTreeMap::new(),
-        dep_modules: BTreeMap::new(),
-        src_modules: src_modules.clone(),
-        test_modules: BTreeMap::new(),
-        analysis: build_project_analysis(&BTreeMap::new(), &BTreeMap::new(), &src_modules, None)
-            .expect("project analysis"),
-    };
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
 
     let batches =
         project_diagnostic_batches(&project, project.src_modules.values().cloned().collect());
@@ -878,6 +832,153 @@ fn project_diagnostics_include_non_focused_module() {
             .any(|diag| diag.message.contains("unbound variable `unknown`")),
         "expected helper diagnostics, got {helper_diags:?}"
     );
+}
+
+#[test]
+fn project_load_reuses_cached_workspace_when_inputs_match() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let uri = Url::from_file_path(root.join("src/main.mond")).expect("main uri");
+
+    let first = Project::load(Some(&root), &state, &uri).expect("first load");
+    let second = Project::load(Some(&root), &state, &uri).expect("second load");
+
+    assert!(Arc::ptr_eq(&first.analysis, &second.analysis));
+    assert!(Arc::ptr_eq(&first.src_modules, &second.src_modules));
+    assert_eq!(
+        second
+            .document_for_path(&root.join("src/main.mond"))
+            .map(|doc| doc.source),
+        Some("(let main {} 1)\n".to_string())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_load_rebuilds_analysis_when_src_overlay_changes() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let main_path = root.join("src/main.mond");
+    let uri = Url::from_file_path(&main_path).expect("main uri");
+
+    let first = Project::load(Some(&root), &state, &uri).expect("first load");
+    state.lock().unwrap().open_docs.insert(
+        uri.clone(),
+        DocumentState {
+            version: 1,
+            text: "(let main {} 2)\n".to_string(),
+        },
+    );
+    let second = Project::load(Some(&root), &state, &uri).expect("second load");
+
+    assert!(!Arc::ptr_eq(&first.analysis, &second.analysis));
+    assert!(!Arc::ptr_eq(&first.src_modules, &second.src_modules));
+    assert_eq!(
+        second.document_for_path(&main_path).map(|doc| doc.source),
+        Some("(let main {} 2)\n".to_string())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_load_reuses_analysis_when_only_test_overlay_changes() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+    write_project_file(&root, "tests/main_test.mond", "(let smoke_test {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let test_path = root.join("tests/main_test.mond");
+    let uri = Url::from_file_path(&test_path).expect("test uri");
+
+    let first = Project::load(Some(&root), &state, &uri).expect("first load");
+    state.lock().unwrap().open_docs.insert(
+        uri.clone(),
+        DocumentState {
+            version: 1,
+            text: "(let smoke_test {} 2)\n".to_string(),
+        },
+    );
+    let second = Project::load(Some(&root), &state, &uri).expect("second load");
+
+    assert!(Arc::ptr_eq(&first.analysis, &second.analysis));
+    assert!(!Arc::ptr_eq(&first.test_modules, &second.test_modules));
+    assert_eq!(
+        second.document_for_path(&test_path).map(|doc| doc.source),
+        Some("(let smoke_test {} 2)\n".to_string())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_load_restores_disk_backed_source_after_overlay_close() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let main_path = root.join("src/main.mond");
+    let uri = Url::from_file_path(&main_path).expect("main uri");
+
+    state.lock().unwrap().open_docs.insert(
+        uri.clone(),
+        DocumentState {
+            version: 1,
+            text: "(let main {} 2)\n".to_string(),
+        },
+    );
+    let overlay_project = Project::load(Some(&root), &state, &uri).expect("overlay load");
+    state.lock().unwrap().open_docs.remove(&uri);
+    let disk_project = Project::load(Some(&root), &state, &uri).expect("disk load");
+
+    assert!(!Arc::ptr_eq(
+        &overlay_project.analysis,
+        &disk_project.analysis
+    ));
+    assert_eq!(
+        disk_project
+            .document_for_path(&main_path)
+            .map(|doc| doc.source),
+        Some("(let main {} 1)\n".to_string())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_load_ignores_unrelated_open_documents_for_cache_reuse() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let uri = Url::from_file_path(root.join("src/main.mond")).expect("main uri");
+
+    let first = Project::load(Some(&root), &state, &uri).expect("first load");
+    let unrelated_uri =
+        Url::from_file_path(root.join("scratch/notes.mond")).expect("unrelated uri");
+    state.lock().unwrap().open_docs.insert(
+        unrelated_uri,
+        DocumentState {
+            version: 1,
+            text: "(let note {} 1)\n".to_string(),
+        },
+    );
+    let second = Project::load(Some(&root), &state, &uri).expect("second load");
+
+    assert!(Arc::ptr_eq(&first.analysis, &second.analysis));
+    assert!(Arc::ptr_eq(&first.src_modules, &second.src_modules));
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
