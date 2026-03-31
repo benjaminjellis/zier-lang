@@ -79,6 +79,10 @@ pub struct MismatchTypeError {
     pub(super) span: Option<std::ops::Range<usize>>,
     /// Span of an earlier argument that first constrained the expected type, if known.
     pub(super) prior_span: Option<std::ops::Range<usize>>,
+    /// Span that introduced a type expectation (e.g. a constraining match pattern).
+    pub(super) expected_from_span: Option<std::ops::Range<usize>>,
+    /// Human-readable reason for why the expected type was inferred.
+    pub(super) expected_from_message: Option<String>,
     /// Actual type of the argument at the offending span (may be richer than `found`,
     /// which is a structural sub-component extracted by unification).
     pub(super) arg_ty: Option<Rc<Type>>,
@@ -235,6 +239,13 @@ impl TypeError {
                     notes.push(
                         "hint: `Unit` is not a function — if you meant to sequence multiple expressions, use `(do expr1 expr2 ...)`".into(),
                     );
+                } else if !matches!(mismatch.expected.as_ref(), Type::Fun(..))
+                    && matches!(mismatch.found.as_ref(), Type::Fun(..))
+                {
+                    notes.push(
+                        "hint: this is a function value; did you mean to call it with arguments?"
+                            .into(),
+                    );
                 } else if mismatch.expected == Type::float() && mismatch.found == Type::int() {
                     notes.push(
                         "hint: integer literals like `1` have type `Int`; write `1.0` for a `Float`".into(),
@@ -270,6 +281,13 @@ impl TypeError {
                         .push(Label::secondary(file_id, ps.clone()).with_message(format!(
                             "`{expected_here}` inferred from this argument"
                         )));
+                }
+                if let Some(ps) = &mismatch.expected_from_span {
+                    let msg = mismatch
+                        .expected_from_message
+                        .clone()
+                        .unwrap_or_else(|| format!("`{expected_here}` inferred from this"));
+                    labels.push(Label::secondary(file_id, ps.clone()).with_message(msg));
                 }
                 if let (Some(name), Some(cs)) = (&mismatch.callee_name, &mismatch.callee_span) {
                     labels.push(
@@ -922,6 +940,8 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
                 found: t2.clone(),
                 span: None,
                 prior_span: None,
+                expected_from_span: None,
+                expected_from_message: None,
                 arg_ty: None,
                 expected_arg_ty: None,
                 callee_name: None,

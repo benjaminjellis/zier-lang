@@ -397,6 +397,78 @@ fn call_mismatch_mentions_inferred_callee_type() {
 }
 
 #[test]
+fn match_on_function_value_has_helpful_hint_and_points_to_scrutinee() {
+    let src = r#"
+            (type ['a 'e] Result [(Ok ~ 'a) (Error ~ 'e)])
+            (let read_directory {path} (Ok [path]))
+            (let main {}
+              (let [files read_directory]
+                (match files
+                  (Ok xs) ~> xs
+                  (Error err) ~> [])))
+        "#;
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let mut lowerer = crate::lower::Lowerer::new();
+    let file_id = lowerer.add_file("test.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse failed");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut checker = TypeChecker::new();
+    let mut env = primitive_env();
+    let err = checker
+        .check_program(&mut env, &decls, file_id)
+        .expect_err("expected type error");
+    let (type_err, expr) = *err;
+    let diags = type_err.to_diagnostics(file_id, expr.span());
+
+    assert!(
+        diags[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("function value; did you mean to call it")),
+        "expected function-value hint in notes, got: {:?}",
+        diags[0].notes
+    );
+    let constructor_label = diags[0]
+        .labels
+        .iter()
+        .find(|label| {
+            label
+                .message
+                .contains("constructor pattern `Ok` constrains this to `Result")
+        })
+        .expect("missing constructor-pattern inference label");
+    let ok_pattern_start = src.find("(Ok xs)").expect("Ok pattern start");
+    let ok_pattern_end = ok_pattern_start + "(Ok xs)".len();
+    assert_eq!(
+        constructor_label.range,
+        ok_pattern_start..ok_pattern_end,
+        "constructor inference label should point to the constraining pattern"
+    );
+
+    let primary = diags[0]
+        .labels
+        .iter()
+        .find(|label| {
+            matches!(
+                label.style,
+                codespan_reporting::diagnostic::LabelStyle::Primary
+            )
+        })
+        .expect("missing primary label");
+    let match_start = src.find("(match files").expect("match target start");
+    let expected_start = match_start + "(match ".len();
+    let expected_end = expected_start + "files".len();
+    assert_eq!(
+        primary.range,
+        expected_start..expected_end,
+        "mismatch should highlight the match scrutinee expression"
+    );
+}
+
+#[test]
 fn infer_option_none() {
     let src = r#"
             (type ['a] Option [None (Some ~ 'a)])

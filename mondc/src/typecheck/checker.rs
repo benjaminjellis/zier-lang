@@ -714,6 +714,8 @@ impl TypeChecker {
                                     found: mismatch.found,
                                     span: Some(span.clone()),
                                     prior_span: None,
+                                    expected_from_span: mismatch.expected_from_span,
+                                    expected_from_message: mismatch.expected_from_message,
                                     arg_ty: None,
                                     expected_arg_ty: None,
                                     callee_name: callee_name.clone(),
@@ -763,6 +765,8 @@ impl TypeChecker {
                                     found: mismatch.found,
                                     span: Some(arg.span()),
                                     prior_span: prior,
+                                    expected_from_span: mismatch.expected_from_span,
+                                    expected_from_message: mismatch.expected_from_message,
                                     arg_ty: Some(t_arg_for_err),
                                     expected_arg_ty: expected_arg_for_err,
                                     callee_name: callee,
@@ -917,9 +921,13 @@ impl TypeChecker {
                 for (arm_index, arm) in arms.iter().enumerate() {
                     let pats = &arm.patterns;
                     let mut pat_env = apply_subst_env(&subst, env);
-                    for (pat, t_target) in pats.iter().zip(target_types.iter()) {
+                    for ((pat, t_target), target_expr) in
+                        pats.iter().zip(target_types.iter()).zip(targets.iter())
+                    {
                         let t_target_s = apply_subst(&subst, t_target);
-                        let (s_pat, new_env) = self.infer_pattern(&pat_env, pat, &t_target_s)?;
+                        let (s_pat, new_env) = self
+                            .infer_pattern(&pat_env, pat, &t_target_s)
+                            .map_err(|e| mismatch_with_span(e, target_expr.span()))?;
                         subst = compose_subst(&s_pat, &subst);
                         pat_env = new_env;
                     }
@@ -1459,6 +1467,8 @@ impl TypeChecker {
                                     found: mismatch.found,
                                     span: Some(span.clone()),
                                     prior_span: None,
+                                    expected_from_span: mismatch.expected_from_span,
+                                    expected_from_message: mismatch.expected_from_message,
                                     arg_ty: None,
                                     expected_arg_ty: None,
                                     callee_name: Some(callee_name.clone()),
@@ -1505,6 +1515,8 @@ impl TypeChecker {
                                     found: mismatch.found,
                                     span: Some(arg.span()),
                                     prior_span: prior,
+                                    expected_from_span: mismatch.expected_from_span,
+                                    expected_from_message: mismatch.expected_from_message,
                                     arg_ty: Some(t_arg_for_err),
                                     expected_arg_ty: expected_arg_for_err,
                                     callee_name: Some(callee_name.clone()),
@@ -1586,6 +1598,8 @@ impl TypeChecker {
                                 found: con_ty.clone(),
                                 span: None,
                                 prior_span: None,
+                                expected_from_span: None,
+                                expected_from_message: None,
                                 arg_ty: None,
                                 expected_arg_ty: None,
                                 callee_name: None,
@@ -1597,7 +1611,30 @@ impl TypeChecker {
                         });
                     }
                 }
-                let s_unify = unify(&apply_subst(&subst, &con_ty), expected)?;
+                let expected_by_pattern = apply_subst(&subst, &con_ty);
+                let s_unify = unify(&expected_by_pattern, expected).map_err(|e| match e {
+                    TypeError::Mismatch { mismatch } => TypeError::Mismatch {
+                        mismatch: MismatchTypeError {
+                            expected: mismatch.expected,
+                            found: mismatch.found,
+                            span: mismatch.span,
+                            prior_span: mismatch.prior_span,
+                            expected_from_span: Some(span.clone()),
+                            expected_from_message: Some(format!(
+                                "constructor pattern `{name}` constrains this to `{}`",
+                                type_display(&expected_by_pattern)
+                            )),
+                            arg_ty: mismatch.arg_ty,
+                            expected_arg_ty: mismatch.expected_arg_ty,
+                            callee_name: mismatch.callee_name,
+                            callee_span: mismatch.callee_span,
+                            callee_def: mismatch.callee_def,
+                            callee_ty: mismatch.callee_ty,
+                        }
+                        .into(),
+                    },
+                    other => other,
+                })?;
                 Ok((compose_subst(&s_unify, &subst), pat_env))
             }
             Pattern::EmptyList(_) => {
