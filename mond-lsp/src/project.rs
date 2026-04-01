@@ -1,7 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use tower_lsp::lsp_types::{
@@ -11,12 +13,15 @@ use tower_lsp::lsp_types::{
 use crate::{
     ModuleSource, OccurrenceKind, Symbol,
     analysis::DocumentAnalysis,
-    build_project_analysis, byte_range_to_lsp_range, collect_external_modules, collect_modules,
-    collect_record_fields, collect_symbol_occurrences, completion_item, contains_path,
-    diagnostic_to_lsp, external_package_name_for_module_path, find_top_level_definition_range,
-    is_test_path, local_names_at_offset, local_type_decls, module_name_for_path,
-    package_name_from_manifest, push_completion_item, source_path_for_compile,
-    state::{DocumentState, ServerState, WorkspaceCacheEntry},
+    build_project_analysis, byte_range_to_lsp_range, collect_record_fields,
+    collect_symbol_occurrences, completion_item, diagnostic_to_lsp,
+    external_package_name_for_module_path, find_top_level_definition_range, local_names_at_offset,
+    local_type_decls, module_name_for_path, package_name_from_manifest, push_completion_item,
+    source_path_for_compile,
+    state::{
+        AnalysisCacheKey, CachedDocumentState, DocumentState, IndexedModuleFile, ServerState,
+        WorkspaceState,
+    },
     top_level_docs, top_level_symbols, visible_exports,
 };
 
@@ -26,130 +31,587 @@ pub(crate) struct Project {
     pub(crate) src_modules: Arc<BTreeMap<String, ModuleSource>>,
     pub(crate) test_modules: Arc<BTreeMap<String, ModuleSource>>,
     pub(crate) analysis: Arc<mondc::ProjectAnalysis>,
+    pub(crate) workspace_generation: u64,
+    document_revisions: Arc<HashMap<PathBuf, u64>>,
+    workspace: Option<Arc<Mutex<WorkspaceState>>>,
 }
 
-struct WorkspaceSnapshot {
-    external_modules: BTreeMap<String, ModuleSource>,
-    src_modules: BTreeMap<String, ModuleSource>,
-    test_modules: BTreeMap<String, ModuleSource>,
-    package_name: Option<String>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleSetKind {
+    Src,
+    Test,
+    External,
 }
 
-impl WorkspaceSnapshot {
-    fn collect(
-        root: Option<&Path>,
-        overlays: &HashMap<Url, DocumentState>,
-        focus_uri: &Url,
-    ) -> Self {
-        let external_modules = collect_external_modules(root);
-        let src_modules = collect_modules(root, "src", overlays);
-        let mut test_modules = collect_modules(root, "tests", overlays);
+fn file_modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+}
 
-        // Ensure an open unsaved test file still participates in project queries.
-        if let Ok(path) = focus_uri.to_file_path()
-            && !contains_path(&src_modules, &path)
-            && !contains_path(&test_modules, &path)
-            && let Some(doc) = overlays.get(focus_uri)
-            && is_test_path(root, &path)
-        {
-            let module = ModuleSource {
-                name: module_name_for_path(&path),
-                path: path.clone(),
-                source: doc.text.clone(),
+fn is_mond_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("mond")
+}
+
+fn external_module_name_for_path(path: &Path) -> String {
+    let module_name = module_name_for_path(path);
+    if module_name == "lib" {
+        external_package_name_for_module_path(path)
+            .unwrap_or("lib")
+            .to_string()
+    } else {
+        module_name
+    }
+}
+
+fn module_source_for_path(kind: ModuleSetKind, path: &Path, source: String) -> ModuleSource {
+    let name = match kind {
+        ModuleSetKind::External => external_module_name_for_path(path),
+        ModuleSetKind::Src | ModuleSetKind::Test => module_name_for_path(path),
+    };
+    ModuleSource {
+        name,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn collect_mond_paths_from_dir(dir: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_mond_paths_from_dir(&path, paths);
+        } else if is_mond_file(&path) {
+            paths.push(path);
+        }
+    }
+}
+
+fn disk_module_paths(root: &Path, kind: ModuleSetKind) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    match kind {
+        ModuleSetKind::Src => collect_mond_paths_from_dir(&root.join("src"), &mut paths),
+        ModuleSetKind::Test => collect_mond_paths_from_dir(&root.join("tests"), &mut paths),
+        ModuleSetKind::External => {
+            let deps_root = root.join("target").join("deps");
+            let Ok(entries) = fs::read_dir(&deps_root) else {
+                return paths;
             };
-            test_modules.insert(module.name.clone(), module);
+            for entry in entries.flatten() {
+                let dep_dir = entry.path();
+                if dep_dir.is_dir() {
+                    collect_mond_paths_from_dir(&dep_dir.join("src"), &mut paths);
+                }
+            }
         }
+    }
+    paths
+}
 
-        let package_name = package_name_from_manifest(root);
+fn path_kind(root: &Path, path: &Path) -> Option<ModuleSetKind> {
+    if path.starts_with(root.join("src")) && is_mond_file(path) {
+        return Some(ModuleSetKind::Src);
+    }
+    if path.starts_with(root.join("tests")) && is_mond_file(path) {
+        return Some(ModuleSetKind::Test);
+    }
+    if path.starts_with(root.join("target").join("deps")) && is_mond_file(path) {
+        return Some(ModuleSetKind::External);
+    }
+    None
+}
 
-        Self {
-            external_modules,
-            src_modules,
-            test_modules,
-            package_name,
-        }
+fn module_set_refs(
+    workspace: &WorkspaceState,
+    kind: ModuleSetKind,
+) -> (
+    &Arc<BTreeMap<String, ModuleSource>>,
+    &HashMap<PathBuf, IndexedModuleFile>,
+) {
+    match kind {
+        ModuleSetKind::Src => (&workspace.src_modules, &workspace.src_files),
+        ModuleSetKind::Test => (&workspace.test_modules, &workspace.test_files),
+        ModuleSetKind::External => (&workspace.external_modules, &workspace.external_files),
     }
 }
 
-fn reuse_cached_module_set(
-    cached: Option<&Arc<BTreeMap<String, ModuleSource>>>,
-    current: BTreeMap<String, ModuleSource>,
-) -> Arc<BTreeMap<String, ModuleSource>> {
-    match cached {
-        Some(modules) if modules.as_ref() == &current => modules.clone(),
-        _ => Arc::new(current),
+fn module_set_mut(
+    workspace: &mut WorkspaceState,
+    kind: ModuleSetKind,
+) -> (
+    &mut Arc<BTreeMap<String, ModuleSource>>,
+    &mut HashMap<PathBuf, IndexedModuleFile>,
+) {
+    match kind {
+        ModuleSetKind::Src => (&mut workspace.src_modules, &mut workspace.src_files),
+        ModuleSetKind::Test => (&mut workspace.test_modules, &mut workspace.test_files),
+        ModuleSetKind::External => (
+            &mut workspace.external_modules,
+            &mut workspace.external_files,
+        ),
     }
+}
+
+fn tracked_module_source<'a>(
+    modules: &'a Arc<BTreeMap<String, ModuleSource>>,
+    files: &HashMap<PathBuf, IndexedModuleFile>,
+    path: &Path,
+) -> Option<&'a ModuleSource> {
+    files
+        .get(path)
+        .and_then(|file| modules.get(&file.module_name))
+        .filter(|module| module.path == path)
+}
+
+fn next_revision(workspace: &mut WorkspaceState) -> u64 {
+    let revision = workspace.next_revision;
+    workspace.next_revision += 1;
+    revision
+}
+
+fn upsert_module(
+    workspace: &mut WorkspaceState,
+    kind: ModuleSetKind,
+    path: &Path,
+    source: String,
+    modified: Option<SystemTime>,
+) -> bool {
+    let module = module_source_for_path(kind, path, source);
+    let (previous_name, previous_source) = {
+        let (modules, files) = module_set_refs(workspace, kind);
+        let previous_name = files.get(path).map(|file| file.module_name.clone());
+        let previous_source =
+            tracked_module_source(modules, files, path).map(|module| module.source.clone());
+        (previous_name, previous_source)
+    };
+    let changed = previous_source.as_deref() != Some(module.source.as_str())
+        || previous_name.as_deref() != Some(module.name.as_str());
+
+    let (modules, files) = module_set_mut(workspace, kind);
+    if let Some(previous_name) = previous_name
+        && previous_name != module.name
+    {
+        Arc::make_mut(modules).remove(&previous_name);
+    }
+    Arc::make_mut(modules).insert(module.name.clone(), module.clone());
+    files.insert(
+        path.to_path_buf(),
+        IndexedModuleFile {
+            module_name: module.name.clone(),
+            modified,
+        },
+    );
+
+    if changed {
+        let revision = next_revision(workspace);
+        Arc::make_mut(&mut workspace.document_revisions).insert(path.to_path_buf(), revision);
+    }
+    changed
+}
+
+fn update_file_metadata(
+    workspace: &mut WorkspaceState,
+    kind: ModuleSetKind,
+    path: &Path,
+    modified: Option<SystemTime>,
+) {
+    let module_name = {
+        let (modules, files) = module_set_refs(workspace, kind);
+        files
+            .get(path)
+            .map(|file| file.module_name.clone())
+            .or_else(|| {
+                tracked_module_source(modules, files, path).map(|module| module.name.clone())
+            })
+            .unwrap_or_else(|| match kind {
+                ModuleSetKind::External => external_module_name_for_path(path),
+                ModuleSetKind::Src | ModuleSetKind::Test => module_name_for_path(path),
+            })
+    };
+    let (_, files) = module_set_mut(workspace, kind);
+    files.insert(
+        path.to_path_buf(),
+        IndexedModuleFile {
+            module_name,
+            modified,
+        },
+    );
+}
+
+fn remove_module(workspace: &mut WorkspaceState, kind: ModuleSetKind, path: &Path) -> bool {
+    let previous_name = {
+        let (_, files) = module_set_refs(workspace, kind);
+        files.get(path).map(|file| file.module_name.clone())
+    };
+    let Some(previous_name) = previous_name else {
+        Arc::make_mut(&mut workspace.document_revisions).remove(path);
+        return false;
+    };
+    let (modules, files) = module_set_mut(workspace, kind);
+    files.remove(path);
+    Arc::make_mut(modules).remove(&previous_name);
+    Arc::make_mut(&mut workspace.document_revisions).remove(path);
+    true
+}
+
+fn refresh_manifest(workspace: &mut WorkspaceState, root: &Path) -> bool {
+    let manifest_path = root.join("bahn.toml");
+    let package_name = package_name_from_manifest(Some(root));
+    let changed = workspace.package_name != package_name;
+    workspace.package_name = package_name;
+    workspace.manifest_modified = file_modified(&manifest_path);
+    changed
+}
+
+fn refresh_disk_modules(workspace: &mut WorkspaceState, root: &Path, kind: ModuleSetKind) -> bool {
+    let overlay_paths = workspace.overlay_paths.clone();
+    let disk_paths = disk_module_paths(root, kind);
+    let mut changed = false;
+    let mut seen = HashSet::new();
+
+    for path in disk_paths {
+        seen.insert(path.clone());
+        let modified = file_modified(&path);
+        if overlay_paths.contains(&path) {
+            update_file_metadata(workspace, kind, &path, modified);
+            continue;
+        }
+
+        let unchanged = {
+            let (modules, files) = module_set_refs(workspace, kind);
+            files
+                .get(&path)
+                .is_some_and(|file| file.modified == modified)
+                && tracked_module_source(modules, files, &path).is_some()
+        };
+        if unchanged {
+            continue;
+        }
+
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        changed |= upsert_module(workspace, kind, &path, source, modified);
+    }
+
+    let existing_paths = {
+        let (_, files) = module_set_refs(workspace, kind);
+        files.keys().cloned().collect::<Vec<_>>()
+    };
+    for path in existing_paths {
+        if seen.contains(&path) {
+            continue;
+        }
+        if overlay_paths.contains(&path) {
+            update_file_metadata(workspace, kind, &path, None);
+            continue;
+        }
+        changed |= remove_module(workspace, kind, &path);
+    }
+
+    changed
+}
+
+fn restore_disk_module_or_remove(workspace: &mut WorkspaceState, root: &Path, path: &Path) -> bool {
+    let Some(kind) = path_kind(root, path) else {
+        return false;
+    };
+    if path.exists() {
+        let Ok(source) = fs::read_to_string(path) else {
+            return false;
+        };
+        return upsert_module(workspace, kind, path, source, file_modified(path));
+    }
+    remove_module(workspace, kind, path)
+}
+
+fn reconcile_open_overlays(
+    workspace: &mut WorkspaceState,
+    root: &Path,
+    overlays: &HashMap<Url, DocumentState>,
+) -> bool {
+    let mut changed = false;
+    let mut current_overlay_paths = HashSet::new();
+
+    for (uri, doc) in overlays {
+        let Ok(path) = uri.to_file_path() else {
+            continue;
+        };
+        let Some(kind) = path_kind(root, &path) else {
+            continue;
+        };
+        if kind == ModuleSetKind::External {
+            continue;
+        }
+        current_overlay_paths.insert(path.clone());
+        changed |= upsert_module(
+            workspace,
+            kind,
+            &path,
+            doc.text.clone(),
+            file_modified(&path),
+        );
+    }
+
+    let previous_overlay_paths = workspace.overlay_paths.iter().cloned().collect::<Vec<_>>();
+    for path in previous_overlay_paths {
+        if !current_overlay_paths.contains(&path) {
+            changed |= restore_disk_module_or_remove(workspace, root, &path);
+        }
+    }
+
+    workspace.overlay_paths = current_overlay_paths;
+    changed
+}
+
+fn rebuild_analysis_if_needed(
+    workspace: &mut WorkspaceState,
+    previous_external: &Arc<BTreeMap<String, ModuleSource>>,
+    previous_src: &Arc<BTreeMap<String, ModuleSource>>,
+    previous_package_name: &Option<String>,
+    force: bool,
+) -> std::result::Result<(), String> {
+    let analysis_inputs_changed = force
+        || previous_external.as_ref() != workspace.external_modules.as_ref()
+        || previous_src.as_ref() != workspace.src_modules.as_ref()
+        || previous_package_name != &workspace.package_name;
+    if analysis_inputs_changed || workspace.analysis.is_none() {
+        workspace.analysis = Some(Arc::new(build_project_analysis(
+            workspace.external_modules.as_ref(),
+            workspace.src_modules.as_ref(),
+            workspace.package_name.as_deref(),
+        )?));
+        workspace.analysis_generation += 1;
+    }
+    Ok(())
+}
+
+fn invalidate_document_cache(workspace: &mut WorkspaceState) {
+    workspace.workspace_generation += 1;
+    workspace.document_cache.clear();
+}
+
+pub(crate) fn reconcile_workspace_overlays(
+    root: Option<&Path>,
+    state: &Arc<Mutex<ServerState>>,
+) -> std::result::Result<(), String> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let (workspace, overlays) = {
+        let state = state.lock().unwrap();
+        let Some(workspace) = state.workspaces.get(root).cloned() else {
+            return Ok(());
+        };
+        (workspace, state.open_docs.clone())
+    };
+
+    let mut workspace = workspace.lock().unwrap();
+    let previous_external = workspace.external_modules.clone();
+    let previous_src = workspace.src_modules.clone();
+    let previous_package_name = workspace.package_name.clone();
+    let changed = reconcile_open_overlays(&mut workspace, root, &overlays);
+    rebuild_analysis_if_needed(
+        &mut workspace,
+        &previous_external,
+        &previous_src,
+        &previous_package_name,
+        false,
+    )?;
+    if changed {
+        invalidate_document_cache(&mut workspace);
+    }
+    Ok(())
+}
+
+pub(crate) fn refresh_workspace_path(
+    root: Option<&Path>,
+    state: &Arc<Mutex<ServerState>>,
+    path: &Path,
+) -> std::result::Result<(), String> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let workspace = {
+        let state = state.lock().unwrap();
+        let Some(workspace) = state.workspaces.get(root).cloned() else {
+            return Ok(());
+        };
+        workspace
+    };
+
+    let mut workspace = workspace.lock().unwrap();
+    let previous_external = workspace.external_modules.clone();
+    let previous_src = workspace.src_modules.clone();
+    let previous_package_name = workspace.package_name.clone();
+
+    let mut changed = false;
+    if path == root.join("bahn.toml") {
+        changed = refresh_manifest(&mut workspace, root);
+    } else if let Some(kind) = path_kind(root, path) {
+        if kind != ModuleSetKind::External && workspace.overlay_paths.contains(path) {
+            update_file_metadata(&mut workspace, kind, path, file_modified(path));
+        } else if path.exists() {
+            let Ok(source) = fs::read_to_string(path) else {
+                return Ok(());
+            };
+            changed = upsert_module(&mut workspace, kind, path, source, file_modified(path));
+        } else if workspace.overlay_paths.contains(path) && kind != ModuleSetKind::External {
+            update_file_metadata(&mut workspace, kind, path, None);
+        } else {
+            changed = remove_module(&mut workspace, kind, path);
+        }
+    }
+
+    rebuild_analysis_if_needed(
+        &mut workspace,
+        &previous_external,
+        &previous_src,
+        &previous_package_name,
+        false,
+    )?;
+    if changed {
+        invalidate_document_cache(&mut workspace);
+    }
+    Ok(())
 }
 
 impl Project {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        external_modules: BTreeMap<String, ModuleSource>,
+        src_modules: BTreeMap<String, ModuleSource>,
+        test_modules: BTreeMap<String, ModuleSource>,
+        package_name: Option<&str>,
+    ) -> Self {
+        Self {
+            root: None,
+            external_modules: Arc::new(external_modules.clone()),
+            src_modules: Arc::new(src_modules.clone()),
+            test_modules: Arc::new(test_modules),
+            analysis: Arc::new(
+                build_project_analysis(&external_modules, &src_modules, package_name)
+                    .expect("project analysis"),
+            ),
+            workspace_generation: 0,
+            document_revisions: Arc::new(HashMap::new()),
+            workspace: None,
+        }
+    }
+
     pub(crate) fn load(
         root: Option<&Path>,
         state: &Arc<Mutex<ServerState>>,
         focus_uri: &Url,
     ) -> std::result::Result<Self, String> {
         let root = root.map(Path::to_path_buf);
-        let (overlays, cached) = {
-            let state = state.lock().unwrap();
-            let overlays = state.open_docs.clone();
-            let cached = root
-                .as_ref()
-                .and_then(|root| state.workspace_cache.get(root).cloned());
-            (overlays, cached)
-        };
-        let snapshot = WorkspaceSnapshot::collect(root.as_deref(), &overlays, focus_uri);
-        let WorkspaceSnapshot {
-            external_modules: current_external_modules,
-            src_modules: current_src_modules,
-            test_modules: current_test_modules,
-            package_name,
-        } = snapshot;
-
-        let external_modules = reuse_cached_module_set(
-            cached.as_ref().map(|entry| &entry.external_modules),
-            current_external_modules,
-        );
-        let src_modules = reuse_cached_module_set(
-            cached.as_ref().map(|entry| &entry.src_modules),
-            current_src_modules,
-        );
-        let test_modules = reuse_cached_module_set(
-            cached.as_ref().map(|entry| &entry.test_modules),
-            current_test_modules,
-        );
-        let analysis = match cached.as_ref() {
-            Some(entry)
-                if entry.external_modules.as_ref() == external_modules.as_ref()
-                    && entry.src_modules.as_ref() == src_modules.as_ref()
-                    && entry.package_name == package_name =>
+        let Some(root) = root else {
+            let overlays = state.lock().unwrap().open_docs.clone();
+            let mut src_modules = BTreeMap::new();
+            let test_modules = BTreeMap::new();
+            if let Ok(path) = focus_uri.to_file_path()
+                && let Some(doc) = overlays.get(focus_uri)
             {
-                entry.analysis.clone()
+                let module = ModuleSource {
+                    name: module_name_for_path(&path),
+                    path: path.clone(),
+                    source: doc.text.clone(),
+                };
+                src_modules.insert(module.name.clone(), module);
             }
-            _ => Arc::new(build_project_analysis(
-                external_modules.as_ref(),
-                src_modules.as_ref(),
-                package_name.as_deref(),
-            )?),
+            let analysis = Arc::new(build_project_analysis(
+                &BTreeMap::new(),
+                &src_modules,
+                None,
+            )?);
+            return Ok(Self {
+                root: None,
+                external_modules: Arc::new(BTreeMap::new()),
+                src_modules: Arc::new(src_modules),
+                test_modules: Arc::new(test_modules),
+                analysis,
+                workspace_generation: 0,
+                document_revisions: Arc::new(HashMap::new()),
+                workspace: None,
+            });
         };
 
-        if let Some(root) = root.as_ref() {
-            state.lock().unwrap().workspace_cache.insert(
-                root.clone(),
-                WorkspaceCacheEntry {
-                    external_modules: external_modules.clone(),
-                    src_modules: src_modules.clone(),
-                    test_modules: test_modules.clone(),
-                    package_name: package_name.clone(),
-                    analysis: analysis.clone(),
-                },
-            );
+        let (workspace, overlays, watched_files_registered) = {
+            let mut state = state.lock().unwrap();
+            let workspace = state
+                .workspaces
+                .entry(root.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(WorkspaceState::default())))
+                .clone();
+            (
+                workspace,
+                state.open_docs.clone(),
+                state.watched_files_registered,
+            )
+        };
+
+        {
+            let mut workspace_state = workspace.lock().unwrap();
+            let previous_external = workspace_state.external_modules.clone();
+            let previous_src = workspace_state.src_modules.clone();
+            let previous_package_name = workspace_state.package_name.clone();
+
+            if !workspace_state.seeded {
+                refresh_manifest(&mut workspace_state, &root);
+                refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::External);
+                refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Src);
+                refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Test);
+                reconcile_open_overlays(&mut workspace_state, &root, &overlays);
+                rebuild_analysis_if_needed(
+                    &mut workspace_state,
+                    &previous_external,
+                    &previous_src,
+                    &previous_package_name,
+                    true,
+                )?;
+                invalidate_document_cache(&mut workspace_state);
+                workspace_state.seeded = true;
+            } else {
+                let mut changed = reconcile_open_overlays(&mut workspace_state, &root, &overlays);
+                if !watched_files_registered {
+                    changed |= refresh_manifest(&mut workspace_state, &root);
+                    changed |=
+                        refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::External);
+                    changed |=
+                        refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Src);
+                    changed |=
+                        refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Test);
+                    changed |= reconcile_open_overlays(&mut workspace_state, &root, &overlays);
+                }
+                rebuild_analysis_if_needed(
+                    &mut workspace_state,
+                    &previous_external,
+                    &previous_src,
+                    &previous_package_name,
+                    false,
+                )?;
+                if changed {
+                    invalidate_document_cache(&mut workspace_state);
+                }
+            }
         }
 
+        let workspace_state = workspace.lock().unwrap();
         Ok(Self {
-            root,
-            external_modules,
-            src_modules,
-            test_modules,
-            analysis,
+            root: Some(root),
+            external_modules: workspace_state.external_modules.clone(),
+            src_modules: workspace_state.src_modules.clone(),
+            test_modules: workspace_state.test_modules.clone(),
+            analysis: workspace_state
+                .analysis
+                .clone()
+                .expect("workspace analysis is seeded"),
+            workspace_generation: workspace_state.workspace_generation,
+            document_revisions: workspace_state.document_revisions.clone(),
+            workspace: Some(workspace.clone()),
         })
     }
 
@@ -706,18 +1168,17 @@ impl Project {
         self.analyze_document_with_options(doc, true, true)
     }
 
-    pub(crate) fn analyze_document_with_options(
+    fn compute_document_analysis(
         &self,
         doc: &ModuleSource,
         include_bindings: bool,
         include_expr_types: bool,
-    ) -> std::result::Result<DocumentAnalysis, String> {
+        imports: Option<mondc::ResolvedImports>,
+    ) -> DocumentAnalysis {
         let visible_exports = visible_exports(&self.analysis, &self.test_modules, &doc.name);
-        let imports = mondc::resolve_imports_for_source(
-            doc.source.as_str(),
-            &visible_exports,
-            &self.analysis,
-        );
+        let imports = imports.unwrap_or_else(|| {
+            mondc::resolve_imports_for_source(doc.source.as_str(), &visible_exports, &self.analysis)
+        });
         let bindings = if include_bindings {
             mondc::infer_module_bindings(
                 &doc.name,
@@ -744,14 +1205,153 @@ impl Project {
         } else {
             Vec::new()
         };
-        Ok(DocumentAnalysis {
+        DocumentAnalysis {
             bindings,
             expr_types,
             imports,
-        })
+        }
+    }
+
+    fn cacheable_document_revision(&self, path: &Path) -> Option<u64> {
+        self.document_revisions.get(path).copied()
+    }
+
+    pub(crate) fn analyze_document_with_options(
+        &self,
+        doc: &ModuleSource,
+        include_bindings: bool,
+        include_expr_types: bool,
+    ) -> std::result::Result<DocumentAnalysis, String> {
+        let cache_key = AnalysisCacheKey {
+            include_bindings,
+            include_expr_types,
+        };
+        let Some(revision) = self.cacheable_document_revision(&doc.path) else {
+            return Ok(self.compute_document_analysis(
+                doc,
+                include_bindings,
+                include_expr_types,
+                None,
+            ));
+        };
+        let Some(workspace) = self.workspace.as_ref() else {
+            return Ok(self.compute_document_analysis(
+                doc,
+                include_bindings,
+                include_expr_types,
+                None,
+            ));
+        };
+
+        let cached_imports = {
+            let workspace = workspace.lock().unwrap();
+            if let Some(entry) = workspace.document_cache.get(&doc.path)
+                && entry.source_revision == revision
+                && entry.workspace_generation == self.workspace_generation
+            {
+                if let Some(analysis) = entry.analyses.get(&cache_key) {
+                    return Ok(analysis.as_ref().clone());
+                }
+                entry
+                    .analyses
+                    .values()
+                    .next()
+                    .map(|analysis| analysis.imports.clone())
+            } else {
+                None
+            }
+        };
+
+        let analysis = self.compute_document_analysis(
+            doc,
+            include_bindings,
+            include_expr_types,
+            cached_imports,
+        );
+
+        let mut workspace = workspace.lock().unwrap();
+        if workspace.document_revisions.get(&doc.path).copied() == Some(revision)
+            && workspace.workspace_generation == self.workspace_generation
+        {
+            let entry = workspace
+                .document_cache
+                .entry(doc.path.clone())
+                .or_insert_with(|| CachedDocumentState {
+                    source_revision: revision,
+                    workspace_generation: self.workspace_generation,
+                    analyses: HashMap::new(),
+                    diagnostics: None,
+                });
+            if entry.source_revision != revision
+                || entry.workspace_generation != self.workspace_generation
+            {
+                *entry = CachedDocumentState {
+                    source_revision: revision,
+                    workspace_generation: self.workspace_generation,
+                    analyses: HashMap::new(),
+                    diagnostics: None,
+                };
+            }
+            entry.analyses.insert(cache_key, Arc::new(analysis.clone()));
+        }
+
+        Ok(analysis)
     }
 
     pub(crate) fn diagnostics_for_document(
+        &self,
+        doc: &ModuleSource,
+    ) -> std::result::Result<Vec<tower_lsp::lsp_types::Diagnostic>, String> {
+        let Some(revision) = self.cacheable_document_revision(&doc.path) else {
+            return self.compute_document_diagnostics(doc);
+        };
+        let Some(workspace) = self.workspace.as_ref() else {
+            return self.compute_document_diagnostics(doc);
+        };
+
+        {
+            let workspace = workspace.lock().unwrap();
+            if let Some(entry) = workspace.document_cache.get(&doc.path)
+                && entry.source_revision == revision
+                && entry.workspace_generation == self.workspace_generation
+                && let Some(diagnostics) = entry.diagnostics.as_ref()
+            {
+                return Ok(diagnostics.as_ref().clone());
+            }
+        }
+
+        let diagnostics = self.compute_document_diagnostics(doc)?;
+
+        let mut workspace = workspace.lock().unwrap();
+        if workspace.document_revisions.get(&doc.path).copied() == Some(revision)
+            && workspace.workspace_generation == self.workspace_generation
+        {
+            let entry = workspace
+                .document_cache
+                .entry(doc.path.clone())
+                .or_insert_with(|| CachedDocumentState {
+                    source_revision: revision,
+                    workspace_generation: self.workspace_generation,
+                    analyses: HashMap::new(),
+                    diagnostics: None,
+                });
+            if entry.source_revision != revision
+                || entry.workspace_generation != self.workspace_generation
+            {
+                *entry = CachedDocumentState {
+                    source_revision: revision,
+                    workspace_generation: self.workspace_generation,
+                    analyses: HashMap::new(),
+                    diagnostics: None,
+                };
+            }
+            entry.diagnostics = Some(Arc::new(diagnostics.clone()));
+        }
+
+        Ok(diagnostics)
+    }
+
+    fn compute_document_diagnostics(
         &self,
         doc: &ModuleSource,
     ) -> std::result::Result<Vec<tower_lsp::lsp_types::Diagnostic>, String> {

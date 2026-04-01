@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -9,16 +10,17 @@ use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+        DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
         DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
         DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-        GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-        InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
-        MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel,
-        ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult,
-        ServerCapabilities, SignatureHelp, SignatureHelpParams, SignatureInformation,
-        SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-        TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit,
-        WorkspaceSymbolParams,
+        FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+        HoverContents, HoverParams, InitializeParams, InitializeResult, InitializedParams,
+        Location, MarkedString, MarkupContent, MarkupKind, MessageType, OneOf,
+        ParameterInformation, ParameterLabel, ReferenceParams, Registration, RenameParams,
+        SemanticTokensParams, SemanticTokensResult, ServerCapabilities, SignatureHelp,
+        SignatureHelpParams, SignatureInformation, SymbolInformation, TextDocumentSyncCapability,
+        TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
+        WorkspaceEdit, WorkspaceSymbolParams,
     },
 };
 
@@ -29,13 +31,45 @@ use crate::{
     completion_context, find_hover_target, find_project_root, full_document_range,
     full_text_change, function_arity, local_symbol_at, lsp_documentation, lsp_error_diagnostic,
     position_to_offset,
-    project::Project,
+    project::{Project, reconcile_workspace_overlays, refresh_workspace_path},
     record_field_context, scheme_for_symbol,
     semantic_tokens::{compute_semantic_tokens_full, semantic_tokens_capabilities},
     signature_target_at,
     state::{DocumentState, ServerState},
     symbol_at, symbol_documentation_for_symbol, top_level_symbols,
 };
+
+const WATCHED_FILES_REGISTRATION_ID: &str = "mond-lsp-watched-files";
+
+fn watched_files_registration() -> Registration {
+    let options = DidChangeWatchedFilesRegistrationOptions {
+        watchers: vec![
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/bahn.toml".to_string()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/src/**/*.mond".to_string()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/tests/**/*.mond".to_string()),
+                kind: None,
+            },
+            FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/target/deps/*/src/**/*.mond".to_string()),
+                kind: None,
+            },
+        ],
+    };
+    Registration {
+        id: WATCHED_FILES_REGISTRATION_ID.to_string(),
+        method: "workspace/didChangeWatchedFiles".to_string(),
+        register_options: Some(
+            serde_json::to_value(options).expect("serialize watched file registration options"),
+        ),
+    }
+}
 
 #[derive(Clone)]
 pub struct Backend {
@@ -213,7 +247,18 @@ fn render_hover_signature(
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let watched_files_dynamic_registration = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files)
+            .and_then(|capabilities| capabilities.dynamic_registration)
+            .unwrap_or(false);
+        self.state
+            .lock()
+            .unwrap()
+            .watched_files_dynamic_registration = watched_files_dynamic_registration;
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -249,6 +294,29 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        let should_register = {
+            let state = self.state.lock().unwrap();
+            state.watched_files_dynamic_registration && !state.watched_files_registered
+        };
+        if should_register {
+            match self
+                .client
+                .register_capability(vec![watched_files_registration()])
+                .await
+            {
+                Ok(()) => {
+                    self.state.lock().unwrap().watched_files_registered = true;
+                }
+                Err(err) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("failed to register watched files: {err}"),
+                        )
+                        .await;
+                }
+            }
+        }
         self.client
             .log_message(MessageType::INFO, "mond-lsp initialized")
             .await;
@@ -282,45 +350,80 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let version = params.text_document.version;
+        let uri = params.text_document.uri.clone();
         {
             let mut state = self.state.lock().unwrap();
             state.open_docs.insert(
-                params.text_document.uri.clone(),
+                uri.clone(),
                 DocumentState {
                     version,
                     text: params.text_document.text,
                 },
             );
         }
-        self.schedule_document_diagnostics(params.text_document.uri, version);
+        if let Ok(path) = uri.to_file_path() {
+            let root = find_project_root(&path);
+            let _ = reconcile_workspace_overlays(root.as_deref(), &self.state);
+        }
+        self.schedule_document_diagnostics(uri, version);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let text = full_text_change(params.content_changes);
         let version = params.text_document.version;
+        let uri = params.text_document.uri.clone();
         {
             let mut state = self.state.lock().unwrap();
-            if let Some(doc) = state.open_docs.get_mut(&params.text_document.uri) {
+            if let Some(doc) = state.open_docs.get_mut(&uri) {
                 doc.version = version;
                 doc.text = text;
             }
         }
-        self.schedule_document_diagnostics(params.text_document.uri, version);
+        if let Ok(path) = uri.to_file_path() {
+            let root = find_project_root(&path);
+            let _ = reconcile_workspace_overlays(root.as_deref(), &self.state);
+        }
+        self.schedule_document_diagnostics(uri, version);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        if let Ok(path) = params.text_document.uri.to_file_path() {
+            let root = if path.file_name().and_then(|name| name.to_str()) == Some("bahn.toml") {
+                path.parent().map(PathBuf::from)
+            } else {
+                find_project_root(&path)
+            };
+            let _ = refresh_workspace_path(root.as_deref(), &self.state, &path);
+        }
         self.publish_project_diagnostics(params.text_document.uri)
             .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
         {
             let mut state = self.state.lock().unwrap();
-            state.open_docs.remove(&params.text_document.uri);
+            state.open_docs.remove(&uri);
         }
-        self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
-            .await;
+        if let Ok(path) = uri.to_file_path() {
+            let root = find_project_root(&path);
+            let _ = reconcile_workspace_overlays(root.as_deref(), &self.state);
+        }
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for change in params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            let root = if path.file_name().and_then(|name| name.to_str()) == Some("bahn.toml") {
+                path.parent().map(PathBuf::from)
+            } else {
+                find_project_root(&path)
+            };
+            let _ = refresh_workspace_path(root.as_deref(), &self.state, &path);
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {

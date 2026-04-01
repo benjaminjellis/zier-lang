@@ -553,6 +553,7 @@ dependencies = [
  "codespan-reporting",
  "mond-format",
  "mondc",
+ "serde_json",
  "tokio",
  "toml",
  "tower-lsp",

@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::{
     MarkupKind, Position, Range, TextDocumentContentChangeEvent,
 };
 
-use crate::{project::Project, state::DocumentState};
+use crate::project::Project;
 
 use super::*;
 
@@ -109,6 +109,7 @@ pub(crate) fn project_diagnostic_batches_for_uri(
     Ok(Some(project_diagnostic_batches(&project, project_modules)))
 }
 
+#[derive(Clone)]
 pub(crate) struct DocumentAnalysis {
     pub(crate) bindings: mondc::typecheck::TypeEnv,
     pub(crate) expr_types: Vec<(std::ops::Range<usize>, String)>,
@@ -147,36 +148,7 @@ pub(super) fn visible_exports(
     exports
 }
 
-pub(super) fn collect_modules(
-    root: Option<&Path>,
-    subdir: &str,
-    overlays: &HashMap<Url, DocumentState>,
-) -> BTreeMap<String, ModuleSource> {
-    let mut modules = BTreeMap::new();
-    if let Some(root) = root {
-        let dir = root.join(subdir);
-        collect_mond_files_from_dir(&dir, &mut modules);
-    }
-    for (uri, doc) in overlays {
-        let Ok(path) = uri.to_file_path() else {
-            continue;
-        };
-        let Some(root) = root else {
-            continue;
-        };
-        if !path.starts_with(root.join(subdir)) {
-            continue;
-        }
-        let module = ModuleSource {
-            name: module_name_for_path(&path),
-            path: path.clone(),
-            source: doc.text.clone(),
-        };
-        modules.insert(module.name.clone(), module);
-    }
-    modules
-}
-
+#[cfg(test)]
 pub(super) fn collect_mond_files_from_dir(
     dir: &Path,
     modules: &mut BTreeMap<String, ModuleSource>,
@@ -217,6 +189,7 @@ pub(super) fn package_name_from_manifest(root: Option<&Path>) -> Option<String> 
         .map(str::to_string)
 }
 
+#[cfg(test)]
 pub(super) fn collect_external_modules(root: Option<&Path>) -> BTreeMap<String, ModuleSource> {
     let Some(root) = root else {
         return BTreeMap::new();
@@ -341,14 +314,6 @@ pub(super) fn find_project_root(path: &Path) -> Option<PathBuf> {
         }
         current = current.parent()?;
     }
-}
-
-pub(super) fn is_test_path(root: Option<&Path>, path: &Path) -> bool {
-    root.is_some_and(|root| path.starts_with(root.join("tests")))
-}
-
-pub(super) fn contains_path(modules: &BTreeMap<String, ModuleSource>, path: &Path) -> bool {
-    modules.values().any(|module| module.path == path)
 }
 
 pub(super) fn module_name_for_path(path: &Path) -> String {

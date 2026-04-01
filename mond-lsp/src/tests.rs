@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::{CompletionItemKind, Position, Range, Url};
 
 use crate::{
-    project::Project,
+    project::{Project, reconcile_workspace_overlays, refresh_workspace_path},
     state::{DocumentState, ServerState},
 };
 
@@ -28,22 +28,26 @@ fn write_project_file(root: &Path, relative: &str, source: &str) {
     fs::write(path, source).expect("write project file");
 }
 
+fn workspace_for_root(
+    state: &Arc<Mutex<ServerState>>,
+    root: &Path,
+) -> Arc<Mutex<crate::state::WorkspaceState>> {
+    state
+        .lock()
+        .unwrap()
+        .workspaces
+        .get(root)
+        .cloned()
+        .expect("workspace state")
+}
+
 fn test_project(
     external_modules: BTreeMap<String, ModuleSource>,
     src_modules: BTreeMap<String, ModuleSource>,
     test_modules: BTreeMap<String, ModuleSource>,
     package_name: Option<&str>,
 ) -> Project {
-    Project {
-        root: None,
-        external_modules: Arc::new(external_modules.clone()),
-        src_modules: Arc::new(src_modules.clone()),
-        test_modules: Arc::new(test_modules),
-        analysis: Arc::new(
-            build_project_analysis(&external_modules, &src_modules, package_name)
-                .expect("project analysis"),
-        ),
-    }
+    Project::new_for_test(external_modules, src_modules, test_modules, package_name)
 }
 
 #[test]
@@ -977,6 +981,163 @@ fn project_load_ignores_unrelated_open_documents_for_cache_reuse() {
 
     assert!(Arc::ptr_eq(&first.analysis, &second.analysis));
     assert!(Arc::ptr_eq(&first.src_modules, &second.src_modules));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_load_refreshes_disk_backed_source_without_watchers() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let uri = Url::from_file_path(root.join("src/main.mond")).expect("main uri");
+
+    let first = Project::load(Some(&root), &state, &uri).expect("first load");
+    write_project_file(&root, "src/main.mond", "(let main {} 2)\n");
+    let second = Project::load(Some(&root), &state, &uri).expect("second load");
+
+    assert!(!Arc::ptr_eq(&first.analysis, &second.analysis));
+    assert_eq!(
+        second
+            .document_for_path(&root.join("src/main.mond"))
+            .map(|doc| doc.source),
+        Some("(let main {} 2)\n".to_string())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reconcile_workspace_overlays_updates_seeded_workspace() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let path = root.join("src/main.mond");
+    let uri = Url::from_file_path(&path).expect("main uri");
+
+    let _ = Project::load(Some(&root), &state, &uri).expect("seed workspace");
+    let initial_analysis_generation = workspace_for_root(&state, &root)
+        .lock()
+        .unwrap()
+        .analysis_generation;
+    state.lock().unwrap().open_docs.insert(
+        uri.clone(),
+        DocumentState {
+            version: 1,
+            text: "(let main {} 2)\n".to_string(),
+        },
+    );
+    reconcile_workspace_overlays(Some(&root), &state).expect("apply overlay");
+
+    let workspace = workspace_for_root(&state, &root);
+    let workspace = workspace.lock().unwrap();
+    assert_eq!(
+        workspace
+            .src_modules
+            .get("main")
+            .map(|module| module.source.clone()),
+        Some("(let main {} 2)\n".to_string())
+    );
+    assert!(workspace.analysis_generation > initial_analysis_generation);
+
+    drop(workspace);
+    state.lock().unwrap().open_docs.remove(&uri);
+    reconcile_workspace_overlays(Some(&root), &state).expect("restore disk");
+
+    let workspace = workspace_for_root(&state, &root);
+    let workspace = workspace.lock().unwrap();
+    assert_eq!(
+        workspace
+            .src_modules
+            .get("main")
+            .map(|module| module.source.clone()),
+        Some("(let main {} 1)\n".to_string())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn refresh_workspace_path_updates_external_modules() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} helper/value)\n");
+    write_project_file(
+        &root,
+        "target/deps/helper/src/lib.mond",
+        "(pub let value {} 1)\n",
+    );
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let uri = Url::from_file_path(root.join("src/main.mond")).expect("main uri");
+    let _ = Project::load(Some(&root), &state, &uri).expect("seed workspace");
+
+    let extra_path = root.join("target/deps/helper/src/extra.mond");
+    write_project_file(
+        &root,
+        "target/deps/helper/src/extra.mond",
+        "(pub let bonus {} 2)\n",
+    );
+    refresh_workspace_path(Some(&root), &state, &extra_path).expect("refresh external path");
+
+    let project = Project::load(Some(&root), &state, &uri).expect("reload project");
+    assert!(project.external_modules.contains_key("extra"));
+
+    fs::remove_file(&extra_path).expect("remove external module");
+    refresh_workspace_path(Some(&root), &state, &extra_path).expect("remove external path");
+    let project = Project::load(Some(&root), &state, &uri).expect("reload after delete");
+    assert!(!project.external_modules.contains_key("extra"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn document_analysis_and_diagnostics_are_cached_in_workspace_state() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let path = root.join("src/main.mond");
+    let uri = Url::from_file_path(&path).expect("main uri");
+    let project = Project::load(Some(&root), &state, &uri).expect("load project");
+    let doc = project.document_for_path(&path).expect("main doc");
+
+    let analysis_a = project
+        .analyze_document_with_options(&doc, false, false)
+        .expect("imports-only analysis");
+    let analysis_b = project
+        .analyze_document_with_options(&doc, true, true)
+        .expect("full analysis");
+    let diagnostics = project
+        .diagnostics_for_document(&doc)
+        .expect("document diagnostics");
+
+    let workspace = workspace_for_root(&state, &root);
+    let workspace = workspace.lock().unwrap();
+    let entry = workspace
+        .document_cache
+        .get(&path)
+        .expect("cached document entry");
+    assert_eq!(entry.analyses.len(), 2);
+    assert!(entry.diagnostics.is_some());
+    assert_eq!(entry.source_revision, workspace.document_revisions[&path]);
+    assert_eq!(entry.workspace_generation, project.workspace_generation);
+    assert_eq!(analysis_a.bindings.len(), 0);
+    assert!(analysis_b.bindings.contains_key("main"));
+    assert_eq!(
+        diagnostics,
+        entry
+            .diagnostics
+            .as_ref()
+            .expect("cached diagnostics")
+            .as_ref()
+            .clone()
+    );
 
     let _ = fs::remove_dir_all(root);
 }
