@@ -953,6 +953,64 @@ pub(super) fn symbol_at(
         .map(|occ| occ.symbol))
 }
 
+pub(super) fn use_module_at_offset(
+    source_path: &Path,
+    source: &str,
+    offset: usize,
+) -> std::result::Result<Option<String>, String> {
+    let (sexprs, _) = parse_module(source_path, source)?;
+    for sexpr in &sexprs {
+        let mondc::sexpr::SExpr::Round(items, _) = sexpr else {
+            continue;
+        };
+        let path_item = match items.as_slice() {
+            [mondc::sexpr::SExpr::Atom(tok), path] if tok.kind == mondc::lexer::TokenKind::Use => {
+                path
+            }
+            [
+                mondc::sexpr::SExpr::Atom(pub_tok),
+                mondc::sexpr::SExpr::Atom(use_tok),
+                path,
+            ] if pub_tok.kind == mondc::lexer::TokenKind::Pub
+                && use_tok.kind == mondc::lexer::TokenKind::Use =>
+            {
+                path
+            }
+            [mondc::sexpr::SExpr::Atom(tok), path, _]
+                if tok.kind == mondc::lexer::TokenKind::Use =>
+            {
+                path
+            }
+            [
+                mondc::sexpr::SExpr::Atom(pub_tok),
+                mondc::sexpr::SExpr::Atom(use_tok),
+                path,
+                _,
+            ] if pub_tok.kind == mondc::lexer::TokenKind::Pub
+                && use_tok.kind == mondc::lexer::TokenKind::Use =>
+            {
+                path
+            }
+            _ => continue,
+        };
+
+        let mondc::sexpr::SExpr::Atom(tok) = path_item else {
+            continue;
+        };
+        if !span_contains(&tok.span, offset) {
+            continue;
+        }
+
+        let module_name = match &tok.kind {
+            mondc::lexer::TokenKind::QualifiedIdent((_, module)) => module.clone(),
+            mondc::lexer::TokenKind::Ident => source[tok.span.clone()].to_string(),
+            _ => continue,
+        };
+        return Ok(Some(module_name));
+    }
+    Ok(None)
+}
+
 pub(super) fn scheme_for_symbol(
     project: &Project,
     doc: &ModuleSource,

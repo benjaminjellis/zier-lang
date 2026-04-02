@@ -24,7 +24,7 @@ pub(crate) struct HelperErlFile {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LoadedDependencies {
-    pub(crate) modules: Vec<(String, String, String)>,
+    pub(crate) modules: Vec<mondc::DependencyModuleSource>,
     pub(crate) helper_erls: Vec<HelperErlFile>,
 }
 
@@ -512,12 +512,14 @@ pub(crate) fn load_dependencies(
         let dep_name = &package.name;
         let checkout_dir = &package.checkout_dir;
         let dep_loaded = load_dependency_from_checkout(dep_name, checkout_dir)?;
-        for (module_name, _, _) in &dep_loaded.modules {
-            if let Some(existing_dep) = module_owner.insert(module_name.clone(), dep_name.clone())
+        for module in &dep_loaded.modules {
+            if let Some(existing_dep) =
+                module_owner.insert(module.module_name.clone(), dep_name.clone())
                 && existing_dep != *dep_name
             {
                 return Err(eyre::eyre!(
-                    "dependency module name collision: module `{module_name}` is provided by both `{existing_dep}` and `{dep_name}`"
+                    "dependency module name collision: module `{}` is provided by both `{existing_dep}` and `{dep_name}`",
+                    module.module_name
                 ));
             }
         }
@@ -722,13 +724,42 @@ fn run_git_output(cwd: Option<&Path>, args: &[&str], context: &str) -> eyre::Res
     Ok(stdout)
 }
 
+fn validate_dependency_module_imports(
+    modules: &[mondc::DependencyModuleSource],
+) -> eyre::Result<()> {
+    for module in modules {
+        for (namespace, mod_name, _) in mondc::used_modules(&module.source) {
+            let root_alias_import =
+                (namespace.is_empty() && mod_name == "lib") || namespace == "lib";
+            if !root_alias_import {
+                continue;
+            }
+
+            let replacement = if namespace.is_empty() {
+                format!("(use {})", module.package_name)
+            } else {
+                format!("(use {}/{mod_name})", module.package_name)
+            };
+
+            return Err(eyre::eyre!(
+                "dependency `{}` uses unsupported `lib` root import in `deps/{}/{}`; replace it with `{replacement}`",
+                module.package_name,
+                module.package_name,
+                module.source_relpath
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn load_dependency_from_checkout(
     dep_name: &str,
     checkout_dir: &Path,
 ) -> eyre::Result<LoadedDependencies> {
     let src_dir = checkout_dir.join(SOURCE_DIR);
-    let modules = mondc::load_dependency_modules_from_checkout(dep_name, checkout_dir)
+    let modules = mondc::load_dependency_module_sources_from_checkout(dep_name, checkout_dir)
         .map_err(|err| eyre::eyre!(err))?;
+    validate_dependency_module_imports(&modules)?;
 
     let mut helper_erls: Vec<HelperErlFile> = Vec::new();
     for entry in WalkDir::new(&src_dir)
@@ -788,6 +819,53 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+
+    #[test]
+    fn validate_dependency_module_imports_rejects_use_lib_root_import() {
+        let modules = vec![mondc::DependencyModuleSource {
+            package_name: "http".to_string(),
+            module_name: "request".to_string(),
+            erlang_name: "d_http_request".to_string(),
+            source: "(use lib [scheme_to_string])\n(pub let parse {} 1)".to_string(),
+            source_relpath: "src/request.mond".to_string(),
+        }];
+
+        let err =
+            validate_dependency_module_imports(&modules).expect_err("expected lib import error");
+        let message = err.to_string();
+        assert!(message.contains("unsupported `lib` root import"));
+        assert!(message.contains("deps/http/src/request.mond"));
+        assert!(message.contains("(use http)"));
+    }
+
+    #[test]
+    fn validate_dependency_module_imports_rejects_use_lib_namespace_import() {
+        let modules = vec![mondc::DependencyModuleSource {
+            package_name: "http".to_string(),
+            module_name: "request".to_string(),
+            erlang_name: "d_http_request".to_string(),
+            source: "(use lib/request)\n(pub let parse {} 1)".to_string(),
+            source_relpath: "src/request.mond".to_string(),
+        }];
+
+        let err =
+            validate_dependency_module_imports(&modules).expect_err("expected lib namespace error");
+        let message = err.to_string();
+        assert!(message.contains("(use http/request)"));
+    }
+
+    #[test]
+    fn validate_dependency_module_imports_allows_package_imports() {
+        let modules = vec![mondc::DependencyModuleSource {
+            package_name: "http".to_string(),
+            module_name: "request".to_string(),
+            erlang_name: "d_http_request".to_string(),
+            source: "(use http)\n(use http/request)\n(pub let parse {} 1)".to_string(),
+            source_relpath: "src/request.mond".to_string(),
+        }];
+
+        validate_dependency_module_imports(&modules).expect("package imports should be allowed");
     }
 
     #[test]
@@ -882,7 +960,7 @@ mond_version = "0.1.0"
         let names: std::collections::HashSet<String> = loaded
             .modules
             .iter()
-            .map(|(name, _, _)| name.clone())
+            .map(|module| module.module_name.clone())
             .collect();
         assert!(names.contains("std"));
         assert!(names.contains("io"));
@@ -890,13 +968,18 @@ mond_version = "0.1.0"
             loaded
                 .modules
                 .iter()
-                .any(|(name, erl, _)| name == "std" && erl == "d_std_std")
+                .any(|module| module.module_name == "std" && module.erlang_name == "d_std_std")
+        );
+        assert!(
+            loaded.modules.iter().any(
+                |module| module.module_name == "std" && module.source_relpath == "src/lib.mond"
+            )
         );
         assert!(
             loaded
                 .modules
                 .iter()
-                .any(|(name, erl, _)| name == "io" && erl == "d_std_io")
+                .any(|module| module.module_name == "io" && module.erlang_name == "d_std_io")
         );
         assert!(
             loaded
@@ -977,14 +1060,11 @@ mond_version = "0.1.0"
             loaded
                 .modules
                 .iter()
-                .any(|(name, erl, _)| name == "time" && erl == "d_time_time")
+                .any(|module| module.module_name == "time" && module.erlang_name == "d_time_time")
         );
-        assert!(
-            loaded
-                .modules
-                .iter()
-                .any(|(name, erl, _)| name == "format" && erl == "d_time_format")
-        );
+        assert!(loaded.modules.iter().any(|module| {
+            module.module_name == "format" && module.erlang_name == "d_time_format"
+        }));
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1054,7 +1134,10 @@ mond_version = "0.1.0"
 
         let initial = load_dependencies(&project_dir, &manifest).expect("initial load");
         assert!(
-            initial.modules.iter().any(|(name, _, _)| name == "std"),
+            initial
+                .modules
+                .iter()
+                .any(|module| module.module_name == "std"),
             "expected initial clone to load std"
         );
 
@@ -1062,7 +1145,10 @@ mond_version = "0.1.0"
 
         let cached = load_dependencies(&project_dir, &manifest).expect("cached load");
         assert!(
-            cached.modules.iter().any(|(name, _, _)| name == "std"),
+            cached
+                .modules
+                .iter()
+                .any(|module| module.module_name == "std"),
             "expected cached checkout to be used without fetching"
         );
 
@@ -1140,7 +1226,10 @@ mond_version = "0.1.0"
 
         let initial = load_dependencies(&project_dir, &manifest).expect("initial load");
         assert!(
-            initial.modules.iter().any(|(name, _, _)| name == "std"),
+            initial
+                .modules
+                .iter()
+                .any(|module| module.module_name == "std"),
             "expected initial clone to load std"
         );
         let initial_lock_src =
@@ -1211,7 +1300,10 @@ mond_version = "0.1.0"
         let reloaded = load_dependencies(&project_dir, &manifest)
             .expect("reload after switching manifest to newly created tag");
         assert!(
-            reloaded.modules.iter().any(|(name, _, _)| name == "std"),
+            reloaded
+                .modules
+                .iter()
+                .any(|module| module.module_name == "std"),
             "expected dependency reload after automatic fetch"
         );
         let updated_lock_src =
@@ -1307,7 +1399,10 @@ mond_version = "0.1.0"
 
         let loaded = load_dependencies(&project_dir, &manifest).expect("load rev dependency");
         assert!(
-            loaded.modules.iter().any(|(name, _, _)| name == "std"),
+            loaded
+                .modules
+                .iter()
+                .any(|module| module.module_name == "std"),
             "expected rev dependency to load"
         );
 
@@ -1605,7 +1700,7 @@ std = {{ git = "file://{}", tag = "0.0.1" }}
         let names: std::collections::HashSet<String> = loaded
             .modules
             .iter()
-            .map(|(name, _, _)| name.clone())
+            .map(|module| module.module_name.clone())
             .collect();
         assert!(
             names.contains("time"),

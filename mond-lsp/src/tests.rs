@@ -176,6 +176,26 @@ fn symbol_at_resolves_top_level_definition_site() {
 }
 
 #[test]
+fn use_module_at_offset_resolves_root_use_path_module_name() {
+    let src = "(use http [Header scheme_to_string])\n(let main {} 1)";
+    let offset = src.find("http").expect("module token") + 1;
+    let module = use_module_at_offset(Path::new("src/main.mond"), src, offset)
+        .expect("module lookup")
+        .expect("module name");
+    assert_eq!(module, "http");
+}
+
+#[test]
+fn use_module_at_offset_resolves_qualified_use_path_module_name() {
+    let src = "(use std/io)\n(let main {} 1)";
+    let offset = src.find("std/io").expect("module token") + 1;
+    let module = use_module_at_offset(Path::new("src/main.mond"), src, offset)
+        .expect("module lookup")
+        .expect("module name");
+    assert_eq!(module, "io");
+}
+
+#[test]
 fn symbol_at_resolves_imported_variant_constructor_pattern() {
     let root = unique_temp_root();
     write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
@@ -241,6 +261,84 @@ fn symbol_at_resolves_imported_variant_constructor_pattern() {
             result_src,
             result_src.find("Ok").unwrap(),
             result_src.find("Ok").unwrap() + "Ok".len()
+        )
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn definition_location_resolves_package_alias_imports_to_lib_module() {
+    let root = unique_temp_root();
+    let lib_src = "(pub let scheme_to_string {scheme} \"http\")\n";
+    let request_src =
+        "(use http [scheme_to_string])\n(let to_uri {request} (scheme_to_string request))\n";
+    let lib_path = root.join("src/lib.mond");
+    let request_path = root.join("src/request.mond");
+
+    let project = test_project(
+        BTreeMap::new(),
+        BTreeMap::from([
+            (
+                "lib".to_string(),
+                ModuleSource {
+                    name: "lib".to_string(),
+                    path: lib_path.clone(),
+                    source: lib_src.to_string(),
+                },
+            ),
+            (
+                "request".to_string(),
+                ModuleSource {
+                    name: "request".to_string(),
+                    path: request_path.clone(),
+                    source: request_src.to_string(),
+                },
+            ),
+        ]),
+        BTreeMap::new(),
+        Some("http"),
+    );
+
+    let doc = project
+        .document_for_path(&request_path)
+        .expect("request doc");
+    let analysis = project
+        .analyze_document_with_options(&doc, false, false)
+        .expect("request analysis");
+    let module_offset = request_src.find("http").expect("module offset") + 1;
+    let module_name = use_module_at_offset(&doc.path, &doc.source, module_offset)
+        .expect("module lookup")
+        .expect("module name");
+    assert_eq!(module_name, "http");
+    let module_source = project
+        .module_named(&module_name)
+        .expect("module source for package alias");
+    assert_eq!(module_source.path, lib_path);
+    let offset = request_src
+        .rfind("scheme_to_string")
+        .expect("callsite offset");
+    let symbol = symbol_at(&doc.path, &doc.source, &doc.name, &analysis.imports, offset)
+        .expect("symbol lookup")
+        .expect("imported symbol");
+    assert_eq!(symbol.module, "http");
+    assert_eq!(symbol.function, "scheme_to_string");
+
+    let location = project
+        .definition_location(&symbol.module, &symbol.function)
+        .expect("definition lookup")
+        .expect("definition location");
+    let expected_start = lib_src.find("scheme_to_string").expect("definition start");
+    assert_eq!(
+        location.uri,
+        Url::from_file_path(&lib_path).expect("lib uri")
+    );
+    assert_eq!(
+        location.range,
+        byte_range_to_lsp_range(
+            lib_src,
+            expected_start,
+            expected_start + "scheme_to_string".len()
         )
     );
 

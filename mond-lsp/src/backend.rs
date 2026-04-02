@@ -36,7 +36,7 @@ use crate::{
     semantic_tokens::{compute_semantic_tokens_full, semantic_tokens_capabilities},
     signature_target_at,
     state::{DocumentState, ServerState},
-    symbol_at, symbol_documentation_for_symbol, top_level_symbols,
+    symbol_at, symbol_documentation_for_symbol, top_level_symbols, use_module_at_offset,
 };
 
 const WATCHED_FILES_REGISTRATION_ID: &str = "mond-lsp-watched-files";
@@ -637,6 +637,17 @@ impl LanguageServer for Backend {
                 .map_err(|_| tower_lsp::jsonrpc::Error::invalid_params("invalid document path"))?;
             let range =
                 byte_range_to_lsp_range(&doc.source, local.def_range.start, local.def_range.end);
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
+                uri, range,
+            ))));
+        }
+        if let Some(module_name) = use_module_at_offset(&doc.path, &doc.source, offset)
+            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
+            && let Some(module) = project.module_named(&module_name)
+        {
+            let uri = Url::from_file_path(&module.path)
+                .map_err(|_| tower_lsp::jsonrpc::Error::invalid_params("invalid module path"))?;
+            let range = byte_range_to_lsp_range(&module.source, 0, 0);
             return Ok(Some(GotoDefinitionResponse::Scalar(Location::new(
                 uri, range,
             ))));

@@ -263,11 +263,16 @@ pub(crate) fn write_erl_output(
 }
 
 pub(crate) fn dependency_module_exports(
-    dependency_mods: &[(String, String, String)],
+    dependency_mods: &[mondc::DependencyModuleSource],
 ) -> HashMap<String, Vec<String>> {
     dependency_mods
         .iter()
-        .map(|(user_name, _, source)| (user_name.clone(), mondc::exported_names(source)))
+        .map(|module| {
+            (
+                module.module_name.clone(),
+                mondc::exported_names(module.source.as_str()),
+            )
+        })
         .collect()
 }
 
@@ -323,11 +328,13 @@ mod tests {
 
     #[test]
     fn dependency_module_exports_scans_exported_names() {
-        let dependency_mods = vec![(
-            "io".to_string(),
-            "mond_io".to_string(),
-            "(pub let println {x} x)".to_string(),
-        )];
+        let dependency_mods = vec![mondc::DependencyModuleSource {
+            package_name: "std".to_string(),
+            module_name: "io".to_string(),
+            erlang_name: "mond_io".to_string(),
+            source: "(pub let println {x} x)".to_string(),
+            source_relpath: "src/io.mond".to_string(),
+        }];
         let exports = dependency_module_exports(&dependency_mods);
         assert_eq!(exports.get("io"), Some(&vec!["println".to_string()]));
     }

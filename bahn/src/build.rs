@@ -78,7 +78,7 @@ fn register_erl_output_name(
 fn ensure_no_erl_output_collisions(
     ordered_module_sources: &[(String, String)],
     module_aliases: &HashMap<String, String>,
-    dependency_mods: &[(String, String, String)],
+    dependency_mods: &[mondc::DependencyModuleSource],
     used_dependency_names: &HashSet<String>,
     dependency_helper_erls: &[deps::HelperErlFile],
     local_helper_erls: &[deps::HelperErlFile],
@@ -93,14 +93,17 @@ fn ensure_no_erl_output_collisions(
         register_erl_output_name(&mut seen, erlang_name, format!("src/{module_name}.mond"))?;
     }
 
-    for (user_name, erlang_name, _) in dependency_mods {
-        if !used_dependency_names.contains(user_name) {
+    for module in dependency_mods {
+        if !used_dependency_names.contains(module.module_name.as_str()) {
             continue;
         }
         register_erl_output_name(
             &mut seen,
-            erlang_name,
-            format!("dependency module `{user_name}`"),
+            &module.erlang_name,
+            format!(
+                "dependency module `deps/{}/{}`",
+                module.package_name, module.source_relpath
+            ),
         )?;
     }
 
@@ -125,7 +128,7 @@ fn ensure_no_erl_output_collisions(
 
 fn ensure_no_local_dependency_module_conflicts(
     module_sources: &[(String, String)],
-    dependency_mods: &[(String, String, String)],
+    dependency_mods: &[mondc::DependencyModuleSource],
 ) -> eyre::Result<()> {
     let local_module_names: HashSet<String> = module_sources
         .iter()
@@ -133,7 +136,7 @@ fn ensure_no_local_dependency_module_conflicts(
         .collect();
     let mut conflicts: Vec<String> = dependency_mods
         .iter()
-        .map(|(module_name, _, _)| module_name.clone())
+        .map(|module| module.module_name.clone())
         .filter(|module_name| local_module_names.contains(module_name))
         .collect();
     conflicts.sort();
@@ -189,8 +192,21 @@ pub(crate) struct ErlSources {
     pub module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>>,
     pub module_extern_types: HashMap<String, Vec<String>>,
     pub all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv>,
-    pub dependency_mods: Vec<(String, String, String)>,
+    pub dependency_mods: Vec<mondc::DependencyModuleSource>,
     pub module_aliases: HashMap<String, String>,
+}
+
+pub(crate) fn dependency_external_modules(
+    dependency_mods: &[mondc::DependencyModuleSource],
+) -> Vec<(String, String, String)> {
+    dependency_mods
+        .iter()
+        .map(mondc::DependencyModuleSource::as_external_module)
+        .collect()
+}
+
+pub(crate) fn dependency_source_label(module: &mondc::DependencyModuleSource) -> String {
+    format!("deps/{}/{}", module.package_name, module.source_relpath)
 }
 
 fn entry_module_names(project_type: &ProjectType) -> Vec<String> {
@@ -218,35 +234,33 @@ fn reachable_src_modules(
 }
 
 pub(crate) fn reachable_dependency_modules(
-    dependency_mods: &[(String, String, String)],
+    dependency_mods: &[mondc::DependencyModuleSource],
     roots: &HashSet<String>,
-) -> eyre::Result<Vec<(String, String, String)>> {
+) -> eyre::Result<Vec<mondc::DependencyModuleSource>> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
 
     let dep_sources: Vec<(String, String)> = dependency_mods
         .iter()
-        .map(|(user_name, _, source)| (user_name.clone(), source.clone()))
+        .map(|module| (module.module_name.clone(), module.source.clone()))
         .collect();
     let root_list: Vec<String> = roots.iter().cloned().collect();
     let reachable = mondc::reachable_module_sources(&dep_sources, &root_list)
         .map_err(|err| eyre::eyre!(err))?;
-    let erlang_names: HashMap<String, String> = dependency_mods
+    let modules_by_name: HashMap<String, mondc::DependencyModuleSource> = dependency_mods
         .iter()
-        .map(|(user_name, erlang_name, _)| (user_name.clone(), erlang_name.clone()))
+        .map(|module| (module.module_name.clone(), module.clone()))
         .collect();
 
-    Ok(reachable
+    reachable
         .into_iter()
-        .map(|(user_name, source)| {
-            let erlang_name = erlang_names
-                .get(&user_name)
-                .cloned()
-                .unwrap_or_else(|| format!("mond_{user_name}"));
-            (user_name, erlang_name, source)
+        .map(|(module_name, _)| {
+            modules_by_name.get(&module_name).cloned().ok_or_else(|| {
+                eyre::eyre!("internal error: missing dependency module `{module_name}`")
+            })
         })
-        .collect())
+        .collect::<eyre::Result<Vec<_>>>()
 }
 
 /// Compile all Mond source files and write `.erl` output into `erl_dir`.
@@ -346,10 +360,11 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
     ensure_no_local_dependency_module_conflicts(&module_sources, &dependency_mods)?;
     let ordered_module_sources =
         mondc::ordered_module_sources(&module_sources).map_err(|err| eyre::eyre!(err))?;
+    let dependency_external_mods = dependency_external_modules(&dependency_mods);
 
     // Phase 1b: seed module_exports with dependency modules provided in manifest deps.
     let mut analysis = mondc::build_project_analysis_with_modules_and_package(
-        &dependency_mods,
+        &dependency_external_mods,
         &module_sources,
         Some(&manifest.package.name),
     )
@@ -371,7 +386,7 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
         .collect();
     let known_dependency_names: HashSet<String> = dependency_mods
         .iter()
-        .map(|(user_name, _, _)| user_name.clone())
+        .map(|module| module.module_name.clone())
         .collect();
     let direct_dependency_roots: HashSet<String> = selected_module_sources
         .iter()
@@ -386,7 +401,7 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
         reachable_dependency_modules(&dependency_mods, &direct_dependency_roots)?;
     let used_dependency_names: HashSet<String> = selected_dependency_mods
         .iter()
-        .map(|(user_name, _, _)| user_name.clone())
+        .map(|module| module.module_name.clone())
         .collect();
     ensure_no_erl_output_collisions(
         &selected_module_sources,
@@ -434,14 +449,15 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
     validate_bin_entrypoint(&project_type, &selected_module_sources)?;
 
     let dependency_analysis = Arc::new(
-        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?,
+        mondc::build_project_analysis(&dependency_external_mods, &[])
+            .map_err(|err| eyre::eyre!(err))?,
     );
     let dependency_compile_units: Vec<compile_flow::CompileUnit<'_>> = selected_dependency_mods
         .iter()
-        .map(|(_, erlang_name, source)| compile_flow::CompileUnit {
-            output_module_name: erlang_name.as_str(),
-            source,
-            source_label: format!("{erlang_name}.mond"),
+        .map(|module| compile_flow::CompileUnit {
+            output_module_name: module.erlang_name.as_str(),
+            source: &module.source,
+            source_label: dependency_source_label(module),
         })
         .collect();
     let (dependency_outputs, dependency_had_error) = compile_flow::compile_units(
@@ -927,29 +943,54 @@ mod tests {
     #[test]
     fn reachable_dependency_modules_include_transitive_dependencies() {
         let dependency_mods = vec![
-            (
-                "list".to_string(),
-                "mond_list".to_string(),
-                "(pub let map {f xs} xs)".to_string(),
-            ),
-            (
-                "io".to_string(),
-                "mond_io".to_string(),
-                "(use list)\n(pub let println {x} (list/map x))".to_string(),
-            ),
-            (
-                "unused".to_string(),
-                "mond_unused".to_string(),
-                "(pub let noop {} ())".to_string(),
-            ),
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "list".to_string(),
+                erlang_name: "mond_list".to_string(),
+                source: "(pub let map {f xs} xs)".to_string(),
+                source_relpath: "src/list.mond".to_string(),
+            },
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "io".to_string(),
+                erlang_name: "mond_io".to_string(),
+                source: "(use list)\n(pub let println {x} (list/map x))".to_string(),
+                source_relpath: "src/io.mond".to_string(),
+            },
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "unused".to_string(),
+                erlang_name: "mond_unused".to_string(),
+                source: "(pub let noop {} ())".to_string(),
+                source_relpath: "src/unused.mond".to_string(),
+            },
         ];
 
         let selected =
             reachable_dependency_modules(&dependency_mods, &HashSet::from(["io".to_string()]))
                 .expect("reachable dependency modules");
-        let names: Vec<String> = selected.into_iter().map(|(name, _, _)| name).collect();
+        let names: Vec<String> = selected
+            .into_iter()
+            .map(|module| module.module_name)
+            .collect();
 
         assert_eq!(names, vec!["list", "io"]);
+    }
+
+    #[test]
+    fn dependency_source_label_uses_dependency_relative_path() {
+        let module = mondc::DependencyModuleSource {
+            package_name: "http".to_string(),
+            module_name: "request".to_string(),
+            erlang_name: "d_http_request".to_string(),
+            source: "(pub let get {} 1)".to_string(),
+            source_relpath: "src/client/request.mond".to_string(),
+        };
+
+        assert_eq!(
+            dependency_source_label(&module),
+            "deps/http/src/client/request.mond"
+        );
     }
 
     #[test]
@@ -994,16 +1035,20 @@ mod tests {
             ("main".to_string(), "(let main {} 1)".to_string()),
         ];
         let dependency_mods = vec![
-            (
-                "io".to_string(),
-                "d_std_io".to_string(),
-                "(pub let println {x} x)".to_string(),
-            ),
-            (
-                "list".to_string(),
-                "d_std_list".to_string(),
-                "(pub let map {f xs} xs)".to_string(),
-            ),
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "io".to_string(),
+                erlang_name: "d_std_io".to_string(),
+                source: "(pub let println {x} x)".to_string(),
+                source_relpath: "src/io.mond".to_string(),
+            },
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "list".to_string(),
+                erlang_name: "d_std_list".to_string(),
+                source: "(pub let map {f xs} xs)".to_string(),
+                source_relpath: "src/list.mond".to_string(),
+            },
         ];
         let err = ensure_no_local_dependency_module_conflicts(&local_modules, &dependency_mods)
             .expect_err("expected conflict");

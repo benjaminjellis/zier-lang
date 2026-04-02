@@ -669,10 +669,24 @@ impl Project {
     }
 
     pub(crate) fn module_named(&self, module_name: &str) -> Option<&ModuleSource> {
-        self.src_modules
+        let direct = self
+            .src_modules
             .get(module_name)
             .or_else(|| self.test_modules.get(module_name))
-            .or_else(|| self.external_modules.get(module_name))
+            .or_else(|| self.external_modules.get(module_name));
+        if direct.is_some() {
+            return direct;
+        }
+
+        let alias_target = self.analysis.module_aliases.get(module_name)?;
+        if alias_target == module_name {
+            return None;
+        }
+
+        self.src_modules
+            .get(alias_target)
+            .or_else(|| self.test_modules.get(alias_target))
+            .or_else(|| self.external_modules.get(alias_target))
     }
 
     pub(crate) fn definition_location(

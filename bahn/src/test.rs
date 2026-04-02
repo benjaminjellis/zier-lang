@@ -4,7 +4,10 @@ use eyre::Context;
 
 use crate::{
     TARGET_DIR, TEST_BUILD_DIR, TEST_DIR,
-    build::{ErlSources, generate_erl_sources_with_roots, reachable_dependency_modules},
+    build::{
+        ErlSources, dependency_external_modules, dependency_source_label,
+        generate_erl_sources_with_roots, reachable_dependency_modules,
+    },
     compile_flow, manifest, ui,
     utils::find_mond_files,
 };
@@ -193,7 +196,9 @@ pub(crate) async fn test(project_dir: &Path) -> eyre::Result<()> {
         std::collections::HashSet::new();
     for (_, source) in &test_module_sources {
         for (_, mod_name, _) in mondc::used_modules(source) {
-            if dependency_mods.iter().any(|(u, _, _)| u == &mod_name)
+            if dependency_mods
+                .iter()
+                .any(|module| module.module_name == mod_name)
                 && !src_module_names.contains(&mod_name)
             {
                 needed_dependencies.insert(mod_name);
@@ -203,16 +208,18 @@ pub(crate) async fn test(project_dir: &Path) -> eyre::Result<()> {
     let selected_test_dependency_mods =
         reachable_dependency_modules(&dependency_mods, &needed_dependencies)?;
 
+    let dependency_external_mods = dependency_external_modules(&dependency_mods);
     let dependency_analysis = Arc::new(
-        mondc::build_project_analysis(&dependency_mods, &[]).map_err(|err| eyre::eyre!(err))?,
+        mondc::build_project_analysis(&dependency_external_mods, &[])
+            .map_err(|err| eyre::eyre!(err))?,
     );
     let dependency_compile_units: Vec<compile_flow::CompileUnit<'_>> =
         selected_test_dependency_mods
             .iter()
-            .map(|(_, erlang_name, source)| compile_flow::CompileUnit {
-                output_module_name: erlang_name.as_str(),
-                source,
-                source_label: format!("{erlang_name}.mond"),
+            .map(|module| compile_flow::CompileUnit {
+                output_module_name: module.erlang_name.as_str(),
+                source: &module.source,
+                source_label: dependency_source_label(module),
             })
             .collect();
     let (dependency_outputs, dependency_had_error) = compile_flow::compile_units(
@@ -222,11 +229,11 @@ pub(crate) async fn test(project_dir: &Path) -> eyre::Result<()> {
         mondc::CompileTarget::Dev,
     )
     .await;
-    for ((user_name, erlang_name, _), output) in selected_test_dependency_mods
+    for (module, output) in selected_test_dependency_mods
         .iter()
         .zip(dependency_outputs.into_iter())
     {
-        debug_assert_eq!(output.output_module_name, *erlang_name);
+        debug_assert_eq!(output.output_module_name, module.erlang_name);
         let Some(erl_source) = output.erl_source() else {
             continue;
         };
@@ -236,7 +243,8 @@ pub(crate) async fn test(project_dir: &Path) -> eyre::Result<()> {
                 continue; // already compiled by generate_erl_sources
             }
             return Err(eyre::eyre!(
-                "Erlang module name collision: dependency module `{user_name}` would overwrite {}",
+                "Erlang module name collision: dependency module `{}` would overwrite {}",
+                module.module_name,
                 erl_path.display()
             ));
         }

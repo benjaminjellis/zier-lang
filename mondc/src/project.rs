@@ -28,6 +28,29 @@ pub struct ResolvedImports {
     pub module_aliases: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyModuleSource {
+    pub package_name: String,
+    pub module_name: String,
+    pub erlang_name: String,
+    pub source: String,
+    pub source_relpath: String,
+}
+
+impl DependencyModuleSource {
+    pub fn into_external_module(self) -> (String, String, String) {
+        (self.module_name, self.erlang_name, self.source)
+    }
+
+    pub fn as_external_module(&self) -> (String, String, String) {
+        (
+            self.module_name.clone(),
+            self.erlang_name.clone(),
+            self.source.clone(),
+        )
+    }
+}
+
 fn type_decl_name(type_decl: &crate::ast::TypeDecl) -> &str {
     match type_decl {
         crate::ast::TypeDecl::Record { name, .. } => name,
@@ -738,6 +761,18 @@ pub fn load_dependency_modules_from_checkout(
     dep_name: &str,
     checkout_dir: &Path,
 ) -> Result<Vec<(String, String, String)>, String> {
+    Ok(
+        load_dependency_module_sources_from_checkout(dep_name, checkout_dir)?
+            .into_iter()
+            .map(DependencyModuleSource::into_external_module)
+            .collect(),
+    )
+}
+
+pub fn load_dependency_module_sources_from_checkout(
+    dep_name: &str,
+    checkout_dir: &Path,
+) -> Result<Vec<DependencyModuleSource>, String> {
     let src_dir = checkout_dir.join("src");
     if !src_dir.exists() {
         return Err(format!(
@@ -746,14 +781,36 @@ pub fn load_dependency_modules_from_checkout(
         ));
     }
 
-    let mut dep_sources: Vec<(String, String)> = Vec::new();
-    let mut lib_source: Option<String> = None;
-    collect_named_module_sources(&src_dir, &mut dep_sources, &mut lib_source)?;
-    if let Some(lib_src) = lib_source {
-        dep_sources.push((dep_name.to_string(), lib_src));
+    let mut dep_sources: Vec<(String, String, String)> = Vec::new();
+    let mut lib_source: Option<(String, String)> = None;
+    collect_named_module_sources(&src_dir, checkout_dir, &mut dep_sources, &mut lib_source)?;
+    if let Some((lib_src, lib_relpath)) = lib_source {
+        dep_sources.push((dep_name.to_string(), lib_src, lib_relpath));
     }
 
-    external_modules_from_package_sources(dep_name, &dep_sources)
+    let dep_sources_for_order: Vec<(String, String)> = dep_sources
+        .iter()
+        .map(|(module_name, source, _)| (module_name.clone(), source.clone()))
+        .collect();
+    let ordered = ordered_module_sources(&dep_sources_for_order)?;
+    let relpath_by_module: HashMap<String, String> = dep_sources
+        .into_iter()
+        .map(|(module_name, _, relpath)| (module_name, relpath))
+        .collect();
+
+    Ok(ordered
+        .into_iter()
+        .map(|(module_name, source)| DependencyModuleSource {
+            package_name: dep_name.to_string(),
+            erlang_name: dependency_erlang_module_name(dep_name, &module_name),
+            source_relpath: relpath_by_module
+                .get(&module_name)
+                .cloned()
+                .unwrap_or_else(|| format!("src/{module_name}.mond")),
+            module_name,
+            source,
+        })
+        .collect())
 }
 
 fn topo_sort_modules(graph: &BTreeMap<String, Vec<String>>) -> Result<Vec<String>, String> {
@@ -820,8 +877,9 @@ fn sanitize_erlang_prefix(name: &str) -> String {
 
 fn collect_named_module_sources(
     dir: &Path,
-    dep_sources: &mut Vec<(String, String)>,
-    lib_source: &mut Option<String>,
+    checkout_root: &Path,
+    dep_sources: &mut Vec<(String, String, String)>,
+    lib_source: &mut Option<(String, String)>,
 ) -> Result<(), String> {
     let entries =
         fs::read_dir(dir).map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
@@ -829,7 +887,7 @@ fn collect_named_module_sources(
         let entry = entry.map_err(|err| format!("failed to read {}: {err}", dir.display()))?;
         let path = entry.path();
         if path.is_dir() {
-            collect_named_module_sources(&path, dep_sources, lib_source)?;
+            collect_named_module_sources(&path, checkout_root, dep_sources, lib_source)?;
             continue;
         }
         if path.extension().and_then(|s| s.to_str()) != Some("mond") {
@@ -842,10 +900,15 @@ fn collect_named_module_sources(
             .to_string();
         let source = fs::read_to_string(&path)
             .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+        let source_relpath = path
+            .strip_prefix(checkout_root)
+            .unwrap_or(path.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
         if module_name == "lib" {
-            *lib_source = Some(source);
+            *lib_source = Some((source, source_relpath));
         } else {
-            dep_sources.push((module_name, source));
+            dep_sources.push((module_name, source, source_relpath));
         }
     }
     Ok(())
@@ -996,6 +1059,34 @@ mod tests {
                 .any(|(name, erl, _)| name == "duration" && erl == "d_time_duration"),
             "expected submodule alias, got {modules:?}"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_dependency_module_sources_from_checkout_keeps_relative_paths() {
+        let root = unique_temp_root();
+        let nested_dir = root.join("src").join("http");
+        fs::create_dir_all(&nested_dir).expect("create nested src");
+        fs::write(root.join("src").join("lib.mond"), "(pub let now {} 1)").expect("write lib");
+        fs::write(nested_dir.join("request.mond"), "(pub let get {} 1)").expect("write request");
+
+        let modules = load_dependency_module_sources_from_checkout("time", &root)
+            .expect("load dependency modules with relative paths");
+
+        let root_module = modules
+            .iter()
+            .find(|module| module.module_name == "time")
+            .expect("root module");
+        assert_eq!(root_module.source_relpath, "src/lib.mond");
+        assert_eq!(root_module.erlang_name, "d_time_time");
+
+        let request_module = modules
+            .iter()
+            .find(|module| module.module_name == "request")
+            .expect("request module");
+        assert_eq!(request_module.source_relpath, "src/http/request.mond");
+        assert_eq!(request_module.erlang_name, "d_time_request");
 
         let _ = fs::remove_dir_all(root);
     }
