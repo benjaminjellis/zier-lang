@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -134,7 +134,7 @@ fn read_lockfile(project_dir: &Path) -> eyre::Result<Option<MondLock>> {
         .with_context(|| format!("failed to read {LOCKFILE_NAME} at {}", lock_path.display()))?;
     let lock: MondLock = toml::from_slice(&lock_src).map_err(|err| {
         eyre::eyre!(
-            "failed to parse {LOCKFILE_NAME}: {err}\n{LOCKFILE_NAME} format changed; delete {LOCKFILE_NAME} or run `bahn deps --update` to regenerate it"
+            "failed to parse {LOCKFILE_NAME}: {err}\n{LOCKFILE_NAME} format changed; delete {LOCKFILE_NAME} and rebuild to regenerate it"
         )
     })?;
     if lock.version != LOCKFILE_FORMAT_VERSION {
@@ -526,18 +526,6 @@ pub(crate) fn load_dependencies(
     }
 
     Ok(loaded)
-}
-
-pub(crate) fn update_dependencies(project_dir: &Path) -> eyre::Result<Vec<String>> {
-    let manifest = manifest::read_manifest(project_dir.to_path_buf())?;
-    let resolved = resolve_dependencies(project_dir, &manifest, true)?;
-    Ok(resolved
-        .packages
-        .values()
-        .map(|package| package.name.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect())
 }
 
 fn checkout_dependency(
@@ -1121,6 +1109,12 @@ mond_version = "0.1.0"
                 ])
                 .current_dir(&std_repo),
         );
+        let initial_rev = run_git_output(
+            Some(&std_repo),
+            &["rev-parse", "HEAD"],
+            "resolve initial rev",
+        )
+        .expect("initial rev");
         run_ok(
             Command::new("git")
                 .args(["tag", "0.0.1"])
@@ -1149,6 +1143,28 @@ mond_version = "0.1.0"
             initial.modules.iter().any(|(name, _, _)| name == "std"),
             "expected initial clone to load std"
         );
+        let initial_lock_src =
+            std::fs::read_to_string(project_dir.join(crate::LOCKFILE_NAME)).expect("read lock");
+        let initial_lock: MondLock = toml::from_str(&initial_lock_src).expect("parse lock");
+        let initial_root = initial_lock
+            .root
+            .iter()
+            .find(|root| root.alias == "std")
+            .expect("std root in lock");
+        assert!(matches!(
+            &initial_root.reference,
+            manifest::GitReference::Tag(tag) if tag == "0.0.1"
+        ));
+        let initial_package = initial_lock
+            .package
+            .iter()
+            .find(|package| package.name == "std")
+            .expect("std package in initial lock");
+        assert_eq!(initial_package.resolved_rev, initial_rev);
+        assert!(matches!(
+            &initial_package.reference,
+            manifest::GitReference::Tag(tag) if tag == "0.0.1"
+        ));
 
         std::fs::write(
             std_src_dir.join("lib.mond"),
@@ -1173,6 +1189,12 @@ mond_version = "0.1.0"
                 ])
                 .current_dir(&std_repo),
         );
+        let updated_rev = run_git_output(
+            Some(&std_repo),
+            &["rev-parse", "HEAD"],
+            "resolve updated rev",
+        )
+        .expect("updated rev");
         run_ok(
             Command::new("git")
                 .args(["tag", "0.0.2"])
@@ -1192,6 +1214,29 @@ mond_version = "0.1.0"
             reloaded.modules.iter().any(|(name, _, _)| name == "std"),
             "expected dependency reload after automatic fetch"
         );
+        let updated_lock_src =
+            std::fs::read_to_string(project_dir.join(crate::LOCKFILE_NAME)).expect("read lock");
+        let updated_lock: MondLock = toml::from_str(&updated_lock_src).expect("parse lock");
+        let updated_root = updated_lock
+            .root
+            .iter()
+            .find(|root| root.alias == "std")
+            .expect("std root in updated lock");
+        assert!(matches!(
+            &updated_root.reference,
+            manifest::GitReference::Tag(tag) if tag == "0.0.2"
+        ));
+        let updated_package = updated_lock
+            .package
+            .iter()
+            .find(|package| package.name == "std")
+            .expect("std package in updated lock");
+        assert_eq!(updated_package.resolved_rev, updated_rev);
+        assert_ne!(updated_package.resolved_rev, initial_rev);
+        assert!(matches!(
+            &updated_package.reference,
+            manifest::GitReference::Tag(tag) if tag == "0.0.2"
+        ));
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -1752,130 +1797,6 @@ util = {{ git = "file://{}", tag = "{util_tag}" }}
                 .contains("dependency `util` has conflicting requirements"),
             "unexpected error: {err}"
         );
-
-        std::fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn update_dependencies_includes_transitive_dependencies_and_updates_lockfile() {
-        let root = unique_temp_root();
-        std::fs::create_dir_all(&root).expect("create root");
-
-        let std_repo = root.join("std-src");
-        let std_src_dir = std_repo.join("src");
-        std::fs::create_dir_all(&std_src_dir).expect("create std src");
-        std::fs::write(
-            std_repo.join(crate::MANIFEST_NAME),
-            r#"[package]
-name = "std"
-version = "0.0.1"
-mond_version = "0.1.0"
-
-[dependencies]
-"#,
-        )
-        .expect("write std manifest");
-        std::fs::write(std_src_dir.join("lib.mond"), "(pub let hello {} \"hello\")")
-            .expect("write std lib");
-        run_ok(Command::new("git").arg("init").current_dir(&std_repo));
-        run_ok(
-            Command::new("git")
-                .args(["add", "."])
-                .current_dir(&std_repo),
-        );
-        run_ok(
-            Command::new("git")
-                .args([
-                    "-c",
-                    "user.email=test@example.com",
-                    "-c",
-                    "user.name=test",
-                    "commit",
-                    "-m",
-                    "initial",
-                ])
-                .current_dir(&std_repo),
-        );
-        run_ok(
-            Command::new("git")
-                .args(["tag", "0.0.1"])
-                .current_dir(&std_repo),
-        );
-
-        let time_repo = root.join("time-src");
-        let time_src_dir = time_repo.join("src");
-        std::fs::create_dir_all(&time_src_dir).expect("create time src");
-        std::fs::write(
-            time_repo.join(crate::MANIFEST_NAME),
-            format!(
-                r#"[package]
-name = "time"
-version = "0.0.1"
-mond_version = "0.1.0"
-
-[dependencies]
-std = {{ git = "file://{}", tag = "0.0.1" }}
-"#,
-                std_repo.display()
-            ),
-        )
-        .expect("write time manifest");
-        std::fs::write(time_src_dir.join("lib.mond"), "(pub let now {} 1)").expect("write lib");
-        run_ok(Command::new("git").arg("init").current_dir(&time_repo));
-        run_ok(
-            Command::new("git")
-                .args(["add", "."])
-                .current_dir(&time_repo),
-        );
-        run_ok(
-            Command::new("git")
-                .args([
-                    "-c",
-                    "user.email=test@example.com",
-                    "-c",
-                    "user.name=test",
-                    "commit",
-                    "-m",
-                    "initial",
-                ])
-                .current_dir(&time_repo),
-        );
-        run_ok(
-            Command::new("git")
-                .args(["tag", "0.0.1"])
-                .current_dir(&time_repo),
-        );
-
-        let project_dir = root.join("app");
-        std::fs::create_dir_all(&project_dir).expect("create project");
-        let manifest = manifest::BahnManifest {
-            package: manifest::Package {
-                name: "app".to_string(),
-                version: Version::new(0, 1, 0),
-                min_mond_version: None,
-            },
-            dependencies: std::collections::HashMap::from([(
-                "time".to_string(),
-                manifest::DependencySpec {
-                    git: format!("file://{}", time_repo.display()),
-                    reference: manifest::GitReference::Tag("0.0.1".to_string()),
-                },
-            )]),
-        };
-        manifest::write_manifest(&manifest, &project_dir.join(crate::MANIFEST_NAME))
-            .expect("write project manifest");
-
-        let updated = update_dependencies(&project_dir).expect("update dependencies");
-        assert_eq!(updated, vec!["std".to_string(), "time".to_string()]);
-
-        let lock_src =
-            std::fs::read_to_string(project_dir.join(crate::LOCKFILE_NAME)).expect("read lock");
-        let lock: MondLock = toml::from_str(&lock_src).expect("parse lock");
-        let mut lock_names: Vec<String> = lock.package.iter().map(|p| p.name.clone()).collect();
-        lock_names.sort();
-        assert_eq!(lock_names, vec!["std".to_string(), "time".to_string()]);
-        assert_eq!(lock.root.len(), 1);
-        assert_eq!(lock.root[0].alias, "time");
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }
