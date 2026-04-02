@@ -51,11 +51,6 @@ enum Commands {
     Run,
     /// Test the current project
     Test,
-    /// Mange the current project's dependencies
-    Deps {
-        #[arg(long)]
-        update: bool,
-    },
     /// Run the LSP
     Lsp,
     /// Format the current project or provided path
@@ -111,21 +106,6 @@ fn main() -> eyre::Result<()> {
         Commands::Test => {
             let _target_lock = utils::acquire_project_target_lock(root)?;
             utils::run_async(test::test(root))?;
-        }
-        Commands::Deps { update } => {
-            if update {
-                let _target_lock = utils::acquire_project_target_lock(root)?;
-                let updated = deps::update_dependencies(root)?;
-                if updated.is_empty() {
-                    ui::success("no dependencies to update");
-                } else {
-                    ui::success(&format!("updated {}", updated.join(", ")));
-                }
-            } else {
-                ui::info(
-                    "dependency cache is offline by default; run `bahn deps --update` to refresh",
-                );
-            }
         }
         Commands::Lsp => {
             utils::run_async(async {

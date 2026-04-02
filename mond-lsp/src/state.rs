@@ -51,6 +51,7 @@ pub(crate) struct WorkspaceState {
     pub(crate) external_files: HashMap<PathBuf, IndexedModuleFile>,
     pub(crate) overlay_paths: HashSet<PathBuf>,
     pub(crate) manifest_modified: Option<SystemTime>,
+    pub(crate) last_unwatched_full_refresh: Option<SystemTime>,
     pub(crate) seeded: bool,
 }
 
@@ -72,6 +73,7 @@ impl Default for WorkspaceState {
             external_files: HashMap::new(),
             overlay_paths: HashSet::new(),
             manifest_modified: None,
+            last_unwatched_full_refresh: None,
             seeded: false,
         }
     }

@@ -783,9 +783,6 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        let analysis = project
-            .analyze_document(&doc)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
         let Some(offset) = position_to_offset(&doc.source, params.text_document_position.position)
         else {
             return Ok(None);
@@ -807,15 +804,25 @@ impl LanguageServer for Backend {
             CompletionContext::RecordField {
                 record_name,
                 prefix,
-            } => project.record_field_completion_items(
-                &doc,
-                &analysis,
-                record_name.as_deref(),
-                &prefix,
-            ),
-            CompletionContext::Unqualified { prefix } => project
-                .unqualified_completion_items(&doc, &analysis, offset, &prefix)
-                .map_err(tower_lsp::jsonrpc::Error::invalid_params)?,
+            } => {
+                let analysis = project
+                    .analyze_document(&doc)
+                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+                project.record_field_completion_items(
+                    &doc,
+                    &analysis,
+                    record_name.as_deref(),
+                    &prefix,
+                )
+            }
+            CompletionContext::Unqualified { prefix } => {
+                let analysis = project
+                    .analyze_document(&doc)
+                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+                project
+                    .unqualified_completion_items(&doc, &analysis, offset, &prefix)
+                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
+            }
         };
 
         Ok(Some(CompletionResponse::Array(items)))

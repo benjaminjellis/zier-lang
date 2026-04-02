@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use tower_lsp::lsp_types::{
@@ -42,6 +42,8 @@ enum ModuleSetKind {
     Test,
     External,
 }
+
+const UNWATCHED_FULL_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
 fn file_modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path)
@@ -315,6 +317,49 @@ fn refresh_disk_modules(workspace: &mut WorkspaceState, root: &Path, kind: Modul
     changed
 }
 
+fn refresh_disk_module_path(workspace: &mut WorkspaceState, root: &Path, path: &Path) -> bool {
+    let Some(kind) = path_kind(root, path) else {
+        return false;
+    };
+    if kind != ModuleSetKind::External && workspace.overlay_paths.contains(path) {
+        update_file_metadata(workspace, kind, path, file_modified(path));
+        return false;
+    }
+    if path.exists() {
+        let modified = file_modified(path);
+        let unchanged = {
+            let (modules, files) = module_set_refs(workspace, kind);
+            files
+                .get(path)
+                .is_some_and(|file| file.modified == modified)
+                && tracked_module_source(modules, files, path).is_some()
+        };
+        if unchanged {
+            return false;
+        }
+        let Ok(source) = fs::read_to_string(path) else {
+            return false;
+        };
+        return upsert_module(workspace, kind, path, source, modified);
+    }
+    if workspace.overlay_paths.contains(path) && kind != ModuleSetKind::External {
+        update_file_metadata(workspace, kind, path, None);
+        return false;
+    }
+    remove_module(workspace, kind, path)
+}
+
+fn should_full_refresh_without_watchers(workspace: &WorkspaceState) -> bool {
+    let now = SystemTime::now();
+    match workspace
+        .last_unwatched_full_refresh
+        .and_then(|last| now.duration_since(last).ok())
+    {
+        Some(elapsed) => elapsed >= UNWATCHED_FULL_REFRESH_INTERVAL,
+        None => true,
+    }
+}
+
 fn restore_disk_module_or_remove(workspace: &mut WorkspaceState, root: &Path, path: &Path) -> bool {
     let Some(kind) = path_kind(root, path) else {
         return false;
@@ -448,23 +493,11 @@ pub(crate) fn refresh_workspace_path(
     let previous_src = workspace.src_modules.clone();
     let previous_package_name = workspace.package_name.clone();
 
-    let mut changed = false;
-    if path == root.join("bahn.toml") {
-        changed = refresh_manifest(&mut workspace, root);
-    } else if let Some(kind) = path_kind(root, path) {
-        if kind != ModuleSetKind::External && workspace.overlay_paths.contains(path) {
-            update_file_metadata(&mut workspace, kind, path, file_modified(path));
-        } else if path.exists() {
-            let Ok(source) = fs::read_to_string(path) else {
-                return Ok(());
-            };
-            changed = upsert_module(&mut workspace, kind, path, source, file_modified(path));
-        } else if workspace.overlay_paths.contains(path) && kind != ModuleSetKind::External {
-            update_file_metadata(&mut workspace, kind, path, None);
-        } else {
-            changed = remove_module(&mut workspace, kind, path);
-        }
-    }
+    let changed = if path == root.join("bahn.toml") {
+        refresh_manifest(&mut workspace, root)
+    } else {
+        refresh_disk_module_path(&mut workspace, root, path)
+    };
 
     rebuild_analysis_if_needed(
         &mut workspace,
@@ -558,6 +591,7 @@ impl Project {
             let previous_external = workspace_state.external_modules.clone();
             let previous_src = workspace_state.src_modules.clone();
             let previous_package_name = workspace_state.package_name.clone();
+            let focus_path = focus_uri.to_file_path().ok();
 
             if !workspace_state.seeded {
                 refresh_manifest(&mut workspace_state, &root);
@@ -565,6 +599,7 @@ impl Project {
                 refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Src);
                 refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Test);
                 reconcile_open_overlays(&mut workspace_state, &root, &overlays);
+                workspace_state.last_unwatched_full_refresh = Some(SystemTime::now());
                 rebuild_analysis_if_needed(
                     &mut workspace_state,
                     &previous_external,
@@ -578,13 +613,22 @@ impl Project {
                 let mut changed = reconcile_open_overlays(&mut workspace_state, &root, &overlays);
                 if !watched_files_registered {
                     changed |= refresh_manifest(&mut workspace_state, &root);
-                    changed |=
-                        refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::External);
-                    changed |=
-                        refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Src);
-                    changed |=
-                        refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Test);
-                    changed |= reconcile_open_overlays(&mut workspace_state, &root, &overlays);
+                    if let Some(path) = focus_path.as_deref() {
+                        changed |= refresh_disk_module_path(&mut workspace_state, &root, path);
+                    }
+                    if should_full_refresh_without_watchers(&workspace_state) {
+                        changed |= refresh_disk_modules(
+                            &mut workspace_state,
+                            &root,
+                            ModuleSetKind::External,
+                        );
+                        changed |=
+                            refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Src);
+                        changed |=
+                            refresh_disk_modules(&mut workspace_state, &root, ModuleSetKind::Test);
+                        changed |= reconcile_open_overlays(&mut workspace_state, &root, &overlays);
+                        workspace_state.last_unwatched_full_refresh = Some(SystemTime::now());
+                    }
                 }
                 rebuild_analysis_if_needed(
                     &mut workspace_state,
