@@ -339,7 +339,7 @@ fn validate_type_declarations(
                 params.as_slice(),
                 constructors
                     .iter()
-                    .filter_map(|(_, usage)| usage.as_ref())
+                    .flat_map(|(_, usages)| usages.iter())
                     .collect::<Vec<_>>(),
                 span.clone(),
             ),
@@ -558,8 +558,8 @@ fn build_imported_type_runtime_info(
                 name, constructors, ..
             } => {
                 let qualified_module = name.split_once('/').map(|(module, _)| module.to_string());
-                for (ctor_name, payload) in constructors {
-                    let arity = if payload.is_some() { 1 } else { 0 };
+                for (ctor_name, payloads) in constructors {
+                    let arity = payloads.len();
                     imported_constructors.insert(ctor_name.clone(), arity);
                     if let Some(module) = &qualified_module {
                         imported_constructors.insert(format!("{module}/{ctor_name}"), arity);

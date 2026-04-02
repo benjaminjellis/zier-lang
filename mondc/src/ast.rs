@@ -85,8 +85,8 @@ pub enum TypeDecl {
     Variant {
         is_pub: bool,
         name: String,
-        params: Vec<String>,                            // ["'a", "'e"]
-        constructors: Vec<(String, Option<TypeUsage>)>, // (name, payload type)
+        params: Vec<String>,                         // ["'a", "'e"]
+        constructors: Vec<(String, Vec<TypeUsage>)>, // (name, payload types)
         span: Range<usize>,
     },
 }

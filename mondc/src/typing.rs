@@ -47,8 +47,8 @@ fn collect_decl_aliases(type_decl: &ast::TypeDecl, aliases: &mut HashMap<String,
             }
         }
         ast::TypeDecl::Variant { constructors, .. } => {
-            for (_, payload) in constructors {
-                if let Some(payload_ty) = payload {
+            for (_, payloads) in constructors {
+                for payload_ty in payloads {
                     collect_usage_aliases(payload_ty, aliases);
                 }
             }

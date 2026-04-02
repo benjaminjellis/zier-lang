@@ -101,8 +101,8 @@ pub fn lower_module(name: &str, decls: &[ast::Declaration], input: LowerModuleIn
                 constructors: ctors,
                 ..
             }) => {
-                for (ctor_name, payload) in ctors {
-                    constructors.insert(ctor_name.clone(), if payload.is_some() { 1 } else { 0 });
+                for (ctor_name, payloads) in ctors {
+                    constructors.insert(ctor_name.clone(), payloads.len());
                 }
             }
             ast::Declaration::Type(ast::TypeDecl::Record { name, fields, .. }) => {
@@ -637,18 +637,30 @@ fn lower_named_type_schema(
             ir::Expr::List(
                 constructors
                     .iter()
-                    .map(|(ctor_name, payload)| match payload {
-                        Some(payload_ty) => ir::Expr::Tuple(vec![
+                    .map(|(ctor_name, payloads)| {
+                        if payloads.is_empty() {
+                            return ir::Expr::Tuple(vec![
+                                ir::Expr::Atom("atom".into()),
+                                ir::Expr::Atom(constructor_tag(ctor_name)),
+                                ir::Expr::Str(display_name(ctor_name)),
+                            ]);
+                        }
+
+                        ir::Expr::Tuple(vec![
                             ir::Expr::Atom("tuple".into()),
                             ir::Expr::Atom(constructor_tag(ctor_name)),
                             ir::Expr::Str(display_name(ctor_name)),
-                            lower_debug_schema_from_usage(payload_ty, &bindings, ctx, seen),
-                        ]),
-                        None => ir::Expr::Tuple(vec![
-                            ir::Expr::Atom("atom".into()),
-                            ir::Expr::Atom(constructor_tag(ctor_name)),
-                            ir::Expr::Str(display_name(ctor_name)),
-                        ]),
+                            ir::Expr::List(
+                                payloads
+                                    .iter()
+                                    .map(|payload_ty| {
+                                        lower_debug_schema_from_usage(
+                                            payload_ty, &bindings, ctx, seen,
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        ])
                     })
                     .collect(),
             ),
@@ -735,9 +747,12 @@ const DEBUG_DEV_SUPPORT: &str = r##"
     end;
 'mond$debug_render_dev'(Tuple, {variant, Constructors}, Depth) when is_tuple(Tuple) ->
     case 'mond$debug_find_variant_tuple'(Tuple, Constructors) of
-        {ok, DisplayName, PayloadSchema} ->
-            PayloadRendered = 'mond$debug_render_dev'(element(2, Tuple), PayloadSchema, Depth - 1),
-            [$(, DisplayName, $\s, PayloadRendered, $)];
+        {ok, DisplayName, PayloadSchemas} ->
+            Values = tl(tuple_to_list(Tuple)),
+            case 'mond$debug_render_variant_payloads'(Values, PayloadSchemas, Depth - 1) of
+                {ok, PayloadRendered} -> [$(, DisplayName, $\s, PayloadRendered, $)];
+                error -> 'mond$debug_render_release'(Tuple, Depth)
+            end;
         error ->
             'mond$debug_render_release'(Tuple, Depth)
     end;
@@ -783,11 +798,27 @@ const DEBUG_DEV_SUPPORT: &str = r##"
 
 'mond$debug_find_variant_tuple'(_Tuple, []) ->
     error;
-'mond$debug_find_variant_tuple'(Tuple, [{tuple, Tag, DisplayName, PayloadSchema} | _])
-  when tuple_size(Tuple) =:= 2, element(1, Tuple) =:= Tag ->
-    {ok, DisplayName, PayloadSchema};
+'mond$debug_find_variant_tuple'(Tuple, [{tuple, Tag, DisplayName, PayloadSchemas} | _])
+  when is_list(PayloadSchemas),
+       tuple_size(Tuple) =:= length(PayloadSchemas) + 1,
+       element(1, Tuple) =:= Tag ->
+    {ok, DisplayName, PayloadSchemas};
 'mond$debug_find_variant_tuple'(Tuple, [_ | Rest]) ->
     'mond$debug_find_variant_tuple'(Tuple, Rest).
+
+'mond$debug_render_variant_payloads'(Values, Schemas, Depth) ->
+    case 'mond$debug_render_variant_payload_items'(Values, Schemas, Depth, []) of
+        {ok, Parts} -> {ok, 'mond$debug_join_with_space'(Parts)};
+        error -> error
+    end.
+
+'mond$debug_render_variant_payload_items'([], [], _Depth, Acc) ->
+    {ok, lists:reverse(Acc)};
+'mond$debug_render_variant_payload_items'([Value | ValueRest], [Schema | SchemaRest], Depth, Acc) ->
+    Rendered = 'mond$debug_render_dev'(Value, Schema, Depth),
+    'mond$debug_render_variant_payload_items'(ValueRest, SchemaRest, Depth, [Rendered | Acc]);
+'mond$debug_render_variant_payload_items'(_Values, _Schemas, _Depth, _Acc) ->
+    error.
 "##;
 
 const DEBUG_RELEASE_SUPPORT: &str = r##"
@@ -2095,6 +2126,35 @@ mod tests {
         assert!(
             erl.contains("f -> 0"),
             "expected sixth alternative case arm:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn multi_payload_constructor_application_lowers_to_tagged_tuple() {
+        let src = r#"
+(type IpAddress
+  [(IpV4 ~ Int Int Int Int)
+   (IpV6 ~ Int Int Int Int Int Int Int Int)])
+(let main {} (IpV4 1 2 3 4))
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("{ipv4, 1, 2, 3, 4}") || erl.contains("{ipv4,1,2,3,4}"),
+            "expected constructor call to lower to tagged tuple with four payload values:\n{erl}"
+        );
+    }
+
+    #[test]
+    fn multi_payload_constructor_value_position_lowers_to_curried_function() {
+        let src = r#"
+(type PairValue [(PairValue ~ Int Int)])
+(let make {} PairValue)
+"#;
+        let erl = crate::compile("test", src).unwrap();
+        assert!(
+            erl.contains("fun(X0__) -> fun(X1__) -> {pairvalue, X0__, X1__} end end")
+                || erl.contains("fun(X0__)->fun(X1__)->{pairvalue,X0__,X1__}end end"),
+            "expected constructor value position to lower to curried constructor lambda:\n{erl}"
         );
     }
 

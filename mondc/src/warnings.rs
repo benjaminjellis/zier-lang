@@ -1090,8 +1090,8 @@ fn used_qualified_modules(decls: &[ast::Declaration]) -> HashSet<String> {
                 }
             }
             ast::Declaration::Type(ast::TypeDecl::Variant { constructors, .. }) => {
-                for (_, payload) in constructors {
-                    if let Some(ty) = payload {
+                for (_, payloads) in constructors {
+                    for ty in payloads {
                         collect_type_usage_qualified_modules(ty, &mut used);
                     }
                 }
@@ -1150,8 +1150,8 @@ fn collect_decl_type_usage_names(decl: &ast::TypeDecl, out: &mut HashSet<String>
             }
         }
         ast::TypeDecl::Variant { constructors, .. } => {
-            for (_, payload) in constructors {
-                if let Some(ty) = payload {
+            for (_, payloads) in constructors {
+                for ty in payloads {
                     collect_type_usage_names(ty, out);
                 }
             }
@@ -1195,7 +1195,7 @@ pub(crate) fn unused_type_param_spans(
                 span,
                 constructors
                     .iter()
-                    .filter_map(|(_, payload)| payload.as_ref())
+                    .flat_map(|(_, payloads)| payloads.iter())
                     .collect(),
             ),
             _ => continue,

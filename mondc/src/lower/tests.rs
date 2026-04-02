@@ -576,10 +576,10 @@ fn test_variant_type_multiple_constructors() {
         assert_eq!(constructors.len(), 2);
         let (ok_name, ok_payload) = &constructors[0];
         assert_eq!(ok_name, "Ok");
-        assert!(ok_payload.is_some());
+        assert_eq!(ok_payload.len(), 1);
         let (err_name, err_payload) = &constructors[1];
         assert_eq!(err_name, "Error");
-        assert!(err_payload.is_some());
+        assert_eq!(err_payload.len(), 1);
     } else {
         panic!("expected Variant type declaration");
     }
@@ -604,13 +604,47 @@ fn test_variant_type_square_bracket_body() {
         assert_eq!(name, "ExitReason");
         assert_eq!(params, &vec!["'a".to_string()]);
         assert_eq!(constructors.len(), 3);
-        assert_eq!(constructors[0], ("Normal".into(), None));
-        assert_eq!(constructors[1], ("Killed".into(), None));
+        assert_eq!(constructors[0], ("Normal".into(), vec![]));
+        assert_eq!(constructors[1], ("Killed".into(), vec![]));
         assert_eq!(constructors[2].0, "Abnormal");
         assert!(matches!(
-            &constructors[2].1,
-            Some(TypeUsage::Generic(name, _)) if name == "'a"
+            constructors[2].1.as_slice(),
+            [TypeUsage::Generic(name, _)] if name == "'a"
         ));
+    } else {
+        panic!("expected Variant type declaration");
+    }
+}
+
+#[test]
+fn test_variant_type_constructor_multi_payload() {
+    let src =
+        "(type IpAddress [(IpV4 ~ Int Int Int Int) (IpV6 ~ Int Int Int Int Int Int Int Int)])";
+    let (mut lowerer, file_id, sexprs) = setup(src);
+    let exprs = lowerer.lower_file(file_id, &sexprs);
+    assert_eq!(exprs.len(), 1);
+    assert!(lowerer.diagnostics.is_empty(), "{:?}", lowerer.diagnostics);
+    if let Declaration::Type(TypeDecl::Variant {
+        name, constructors, ..
+    }) = &exprs[0]
+    {
+        assert_eq!(name, "IpAddress");
+        assert_eq!(constructors[0].0, "IpV4");
+        assert_eq!(constructors[0].1.len(), 4);
+        assert!(
+            constructors[0]
+                .1
+                .iter()
+                .all(|usage| matches!(usage, TypeUsage::Named(name, _) if name == "Int"))
+        );
+        assert_eq!(constructors[1].0, "IpV6");
+        assert_eq!(constructors[1].1.len(), 8);
+        assert!(
+            constructors[1]
+                .1
+                .iter()
+                .all(|usage| matches!(usage, TypeUsage::Named(name, _) if name == "Int"))
+        );
     } else {
         panic!("expected Variant type declaration");
     }
@@ -1594,6 +1628,19 @@ fn test_variant_constructor_missing_tilde_rejected() {
     let exprs = lowerer.lower_file(file_id, &sexprs);
     assert!(exprs.is_empty(), "expected lowering to fail");
     assert!(!lowerer.diagnostics.is_empty());
+}
+
+#[test]
+fn test_variant_constructor_missing_payload_after_tilde_rejected() {
+    let src = "(type ['a] Option [None (Some ~)])";
+    let (mut lowerer, file_id, sexprs) = setup(src);
+    let exprs = lowerer.lower_file(file_id, &sexprs);
+    assert!(exprs.is_empty(), "expected lowering to fail");
+    assert!(!lowerer.diagnostics.is_empty());
+    assert_eq!(
+        lowerer.diagnostics[0].message,
+        "invalid constructor — expected (Name ~ Type...)"
+    );
 }
 
 #[test]

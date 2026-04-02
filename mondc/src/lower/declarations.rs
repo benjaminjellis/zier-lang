@@ -163,14 +163,14 @@ impl Lowerer {
                 match item {
                     // Case: (Some ~ 'a) or (Error ~ 'e) or (Wrap ~ Map 'k 'v)
                     SExpr::Round(inner, inner_span) => {
-                        // Expect: (ConstructorName ~ Type [TypeArgs...])
+                        // Expect: (ConstructorName ~ PayloadType...)
                         let (name_token, tilde_token) = match (inner.first(), inner.get(1)) {
                             (Some(n), Some(t)) if inner.len() >= 3 => (n, t),
                             _ => {
                                 self.error(
                                     Diagnostic::error()
                                         .with_message(
-                                            "invalid constructor — expected (Name ~ Type)",
+                                            "invalid constructor — expected (Name ~ Type...)",
                                         )
                                         .with_labels(vec![Label::primary(
                                             file_id,
@@ -214,8 +214,16 @@ impl Lowerer {
                             return None;
                         }
 
-                        let type_usage =
-                            self.lower_type_usage_atoms(file_id, &inner[2..], inner_span.clone())?;
+                        let payload_types = inner[2..]
+                            .iter()
+                            .map(|payload_item| {
+                                self.lower_type_usage_atoms(
+                                    file_id,
+                                    std::slice::from_ref(payload_item),
+                                    payload_item.span(),
+                                )
+                            })
+                            .collect::<Option<Vec<_>>>()?;
                         if let Some(first_span) =
                             seen_ctors.insert(c_name.clone(), name_token.span())
                         {
@@ -234,7 +242,7 @@ impl Lowerer {
                             );
                             return None;
                         }
-                        constructors.push((c_name, Some(type_usage)));
+                        constructors.push((c_name, payload_types));
                     }
                     // Case: None — nullary constructor (no payload)
                     SExpr::Atom(t) => {
@@ -247,7 +255,7 @@ impl Lowerer {
                                     .with_message("invalid variant constructor")
                                     .with_labels(vec![Label::primary(file_id, t.span.clone())
                                         .with_message(
-                                            "expected a capitalised constructor name (e.g. None) or (Name ~ Type)",
+                                            "expected a capitalised constructor name (e.g. None) or (Name ~ Type...)",
                                         )]),
                             );
                             return None;
@@ -269,7 +277,7 @@ impl Lowerer {
                             );
                             return None;
                         }
-                        constructors.push((c_name, None));
+                        constructors.push((c_name, vec![]));
                     }
                     other => {
                         self.error(
@@ -277,7 +285,7 @@ impl Lowerer {
                                 .with_message("unexpected item in variant body")
                                 .with_labels(vec![
                                     Label::primary(file_id, other.span()).with_message(
-                                        "expected a constructor: Name or (Name ~ Type)",
+                                        "expected a constructor: Name or (Name ~ Type...)",
                                     ),
                                 ]),
                         );

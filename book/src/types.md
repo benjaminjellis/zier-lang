@@ -22,6 +22,19 @@ Sum types have two components:
 
 The constructors can be nullary (like `None`) or encompass data (like `Some`). The `~` is used to provide a type that `Some` encompasses. This can be a concrete type like `Int` or, as above, it could be a polymorphic type like `'a`. By convention variant / sum type constructors use `PascalCase` identifiers.
 
+Constructors can also take multiple positional payload values:
+
+```mond
+(type IpAddress
+  [(IpV4 ~ Int Int Int Int)
+   (IpV6 ~ Int Int Int Int Int Int Int Int)])
+
+(let octet_sum {ip}
+  (match ip
+    (IpV4 a b c d) ~> (+ (+ a b) (+ c d))
+    (IpV6 _ _ _ _ _ _ _ _) ~> 0))
+```
+
 ## Product / Record Types
 ```mond
 (type Point

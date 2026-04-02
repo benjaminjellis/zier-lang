@@ -511,6 +511,62 @@ fn infer_match_option() {
 }
 
 #[test]
+fn infer_multi_payload_variant_constructor() {
+    let src = r#"
+            (type IpAddress
+              [(IpV4 ~ Int Int Int Int)
+               (IpV6 ~ Int Int Int Int Int Int Int Int)])
+            (let loopback {} (IpV4 127 0 0 1))
+        "#;
+    let ty = check(src).unwrap();
+    assert_eq!(ty, Type::con("IpAddress", vec![]));
+}
+
+#[test]
+fn infer_match_multi_payload_variant_constructor() {
+    let src = r#"
+            (type IpAddress
+              [(IpV4 ~ Int Int Int Int)
+               (IpV6 ~ Int Int Int Int Int Int Int Int)])
+            (let octet_sum {ip}
+              (match ip
+                (IpV4 a b c d) ~> (+ (+ a b) (+ c d))
+                (IpV6 _ _ _ _ _ _ _ _) ~> 0))
+            (let main {} (octet_sum (IpV4 1 2 3 4)))
+        "#;
+    let ty = check(src).unwrap();
+    assert_eq!(ty, Type::int());
+}
+
+#[test]
+fn reject_multi_payload_variant_constructor_wrong_arity() {
+    let src = r#"
+            (type IpAddress
+              [(IpV4 ~ Int Int Int Int)
+               (IpV6 ~ Int Int Int Int Int Int Int Int)])
+            (let main {}
+              (match (IpV4 127 0 0)
+                (IpV4 _ _ _ _) ~> 1
+                (IpV6 _ _ _ _ _ _ _ _) ~> 0))
+        "#;
+    assert!(check(src).is_err(), "expected arity mismatch error");
+}
+
+#[test]
+fn reject_multi_payload_variant_constructor_wrong_arg_type() {
+    let src = r#"
+            (type IpAddress
+              [(IpV4 ~ Int Int Int Int)
+               (IpV6 ~ Int Int Int Int Int Int Int Int)])
+            (let main {} (IpV4 127 0 True 1))
+        "#;
+    assert!(
+        check(src).is_err(),
+        "expected constructor argument type error"
+    );
+}
+
+#[test]
 fn infer_record_construction() {
     let src = r#"
             (type Point [(:x ~ Int) (:y ~ Int)])

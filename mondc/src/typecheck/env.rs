@@ -247,16 +247,11 @@ pub fn constructor_schemes_with_aliases(
                 scheme_vars.iter().map(|&v| Rc::new(Type::Var(v))).collect();
             let result_ty = Type::con(name, result_ty_args);
 
-            for (con_name, payload) in constructors {
-                let ty = match payload {
-                    // Nullary constructor: None -> Option<'a>
-                    None => result_ty.clone(),
-                    // Constructor with payload: Some ~ 'a  ->  'a -> Option<'a>
-                    Some(usage) => {
-                        let payload_ty = type_usage_to_type(usage, &param_map, aliases);
-                        Type::fun(payload_ty, result_ty.clone())
-                    }
-                };
+            for (con_name, payloads) in constructors {
+                let ty = payloads.iter().rev().fold(result_ty.clone(), |acc, usage| {
+                    let payload_ty = type_usage_to_type(usage, &param_map, aliases);
+                    Type::fun(payload_ty, acc)
+                });
                 env.insert(
                     con_name.clone(),
                     Scheme {
