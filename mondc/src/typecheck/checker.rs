@@ -37,6 +37,16 @@ fn lookup_record_accessor<'a>(
         .or_else(|| env.get(&format!(":{field_name}")))
 }
 
+fn top_level_fun_arity(ty: &Rc<Type>) -> usize {
+    let mut arity = 0;
+    let mut current = ty.as_ref();
+    while let Type::Fun(_, ret) = current {
+        arity += 1;
+        current = ret.as_ref();
+    }
+    arity
+}
+
 fn is_desugared_letq_match(arms: &[MatchArm]) -> bool {
     if arms.len() != 2 {
         return false;
@@ -1588,6 +1598,15 @@ impl TypeChecker {
                     .get(name)
                     .ok_or_else(|| TypeError::UnboundVariable(name.clone(), span.clone()))?;
                 let mut con_ty = self.instantiate(scheme);
+                let expected_arity = top_level_fun_arity(&con_ty);
+                if arg_pats.len() != expected_arity {
+                    return Err(TypeError::ConstructorPatternArity {
+                        constructor: name.clone(),
+                        expected: expected_arity,
+                        found: arg_pats.len(),
+                        span: span.clone(),
+                    });
+                }
                 let mut subst = HashMap::new();
                 let mut pat_env = env.clone();
 

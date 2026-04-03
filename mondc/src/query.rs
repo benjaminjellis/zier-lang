@@ -9,7 +9,9 @@ fn parse_decls(source_path: &str, source: &str) -> Option<Vec<ast::Declaration>>
     let Ok(sexprs) = sexpr::SExprParser::new(tokens, file_id).parse() else {
         return None;
     };
-    Some(lowerer.lower_file(file_id, &sexprs))
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
+    Some(decls)
 }
 
 struct TypeInferenceResult {
@@ -24,17 +26,22 @@ fn infer_module_types(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
     imported_schemes: &typecheck::TypeEnv,
 ) -> Option<TypeInferenceResult> {
     let mut sess = session::CompilerSession::new(session::SessionOptions {
         emit_diagnostics: false,
         emit_warnings: false,
     });
-    let lowered = hir::lower_source_to_hir(&format!("{module_name}.mond"), source);
+    let mut lowered = hir::lower_source_to_hir(&format!("{module_name}.mond"), source);
     if !lowered.diagnostics.is_empty() {
         return None;
     }
+    ast::normalize_variant_payload_type_applications(
+        &mut lowered.decls,
+        imported_type_decls,
+        imported_extern_types,
+    );
 
     let imported_private_records: HashMap<String, Vec<String>> = HashMap::new();
     let (mut checker, mut env) = typing::prepare_typechecker(
@@ -174,14 +181,20 @@ pub fn private_record_type_names(source: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn exported_extern_types(source: &str) -> Vec<String> {
+pub fn exported_extern_types(source: &str) -> Vec<ast::ExternTypeInfo> {
     parse_decls("scan.mond", source)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|d| match d {
             ast::Declaration::ExternType {
-                is_pub: true, name, ..
-            } => Some(name),
+                is_pub: true,
+                name,
+                params,
+                ..
+            } => Some(ast::ExternTypeInfo {
+                name,
+                arity: params.len(),
+            }),
             _ => None,
         })
         .collect()
@@ -193,7 +206,7 @@ pub fn infer_module_bindings(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
     let Some(inferred) = infer_module_types(
@@ -231,7 +244,7 @@ pub fn infer_module_expr_types(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
     imported_schemes: &typecheck::TypeEnv,
 ) -> Vec<(std::ops::Range<usize>, String)> {
     let Some(inferred) = infer_module_types(
@@ -260,7 +273,7 @@ pub fn infer_module_exports(
     imports: HashMap<String, String>,
     module_exports: &HashMap<String, Vec<String>>,
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
     imported_schemes: &typecheck::TypeEnv,
 ) -> typecheck::TypeEnv {
     let Some(inferred) = infer_module_types(

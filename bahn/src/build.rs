@@ -190,7 +190,7 @@ pub(crate) struct ErlSources {
     // Compilation state exposed for `bahn test`
     pub module_exports: HashMap<String, Vec<String>>,
     pub module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>>,
-    pub module_extern_types: HashMap<String, Vec<String>>,
+    pub module_extern_types: HashMap<String, Vec<mondc::ast::ExternTypeInfo>>,
     pub all_module_schemes: HashMap<String, mondc::typecheck::TypeEnv>,
     pub dependency_mods: Vec<mondc::DependencyModuleSource>,
     pub module_aliases: HashMap<String, String>,
@@ -336,7 +336,7 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
     // Phase 1: scan each module's source to collect its exported function names and type decls
     let mut module_exports: HashMap<String, Vec<String>> = HashMap::new();
     let mut module_type_decls: HashMap<String, Vec<mondc::ast::TypeDecl>> = HashMap::new();
-    let mut module_extern_types: HashMap<String, Vec<String>> = HashMap::new();
+    let mut module_extern_types: HashMap<String, Vec<mondc::ast::ExternTypeInfo>> = HashMap::new();
     let mut module_sources: Vec<(String, String)> = Vec::new(); // (module_name, source)
 
     for mond_path in &mond_files {

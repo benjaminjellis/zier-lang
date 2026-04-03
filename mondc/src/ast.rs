@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 /// Which names a `use` declaration brings into unqualified scope.
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +89,12 @@ pub enum TypeDecl {
         constructors: Vec<(String, Vec<TypeUsage>)>, // (name, payload types)
         span: Range<usize>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternTypeInfo {
+    pub name: String,
+    pub arity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +253,115 @@ impl TypeUsage {
             | TypeUsage::Generic(_, span)
             | TypeUsage::App(_, _, span)
             | TypeUsage::Fun(_, _, span) => span.clone(),
+        }
+    }
+}
+
+fn seed_primitive_type_arities(arities: &mut HashMap<String, usize>) {
+    arities.insert("Int".to_string(), 0);
+    arities.insert("Float".to_string(), 0);
+    arities.insert("Bool".to_string(), 0);
+    arities.insert("String".to_string(), 0);
+    arities.insert("Unit".to_string(), 0);
+    arities.insert("List".to_string(), 1);
+}
+
+fn seed_type_decl_arities(type_decls: &[TypeDecl], arities: &mut HashMap<String, usize>) {
+    for type_decl in type_decls {
+        match type_decl {
+            TypeDecl::Record { name, params, .. } | TypeDecl::Variant { name, params, .. } => {
+                arities.insert(name.clone(), params.len());
+            }
+        }
+    }
+}
+
+fn seed_extern_type_arities(extern_types: &[ExternTypeInfo], arities: &mut HashMap<String, usize>) {
+    for extern_type in extern_types {
+        arities.insert(extern_type.name.clone(), extern_type.arity);
+    }
+}
+
+fn seed_decl_arities(decls: &[Declaration], arities: &mut HashMap<String, usize>) {
+    for decl in decls {
+        match decl {
+            Declaration::Type(TypeDecl::Record { name, params, .. })
+            | Declaration::Type(TypeDecl::Variant { name, params, .. })
+            | Declaration::ExternType { name, params, .. } => {
+                arities.insert(name.clone(), params.len());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn consume_variant_payload_type(
+    payloads: &[TypeUsage],
+    start: usize,
+    arities: &HashMap<String, usize>,
+) -> (TypeUsage, usize) {
+    let payload = payloads[start].clone();
+    let TypeUsage::Named(name, span) = &payload else {
+        return (payload, start + 1);
+    };
+    let Some(expected_arity) = arities.get(name).copied() else {
+        return (payload, start + 1);
+    };
+    if expected_arity == 0 {
+        return (payload, start + 1);
+    }
+
+    let mut args = Vec::new();
+    let mut next = start + 1;
+    for _ in 0..expected_arity {
+        if next >= payloads.len() {
+            break;
+        }
+        let (arg, arg_next) = consume_variant_payload_type(payloads, next, arities);
+        args.push(arg);
+        next = arg_next;
+    }
+
+    if args.is_empty() {
+        return (payload, start + 1);
+    }
+
+    let end = args.last().map(|arg| arg.span().end).unwrap_or(span.end);
+    (TypeUsage::App(name.clone(), args, span.start..end), next)
+}
+
+fn regroup_variant_constructor_payloads(
+    payloads: &[TypeUsage],
+    arities: &HashMap<String, usize>,
+) -> Vec<TypeUsage> {
+    let mut regrouped = Vec::new();
+    let mut cursor = 0;
+    while cursor < payloads.len() {
+        let (payload, next) = consume_variant_payload_type(payloads, cursor, arities);
+        regrouped.push(payload);
+        cursor = next;
+    }
+    regrouped
+}
+
+pub(crate) fn normalize_variant_payload_type_applications(
+    decls: &mut [Declaration],
+    imported_type_decls: &[TypeDecl],
+    imported_extern_types: &[ExternTypeInfo],
+) {
+    let mut arities = HashMap::new();
+    seed_primitive_type_arities(&mut arities);
+    seed_type_decl_arities(imported_type_decls, &mut arities);
+    seed_extern_type_arities(imported_extern_types, &mut arities);
+    seed_decl_arities(decls, &mut arities);
+
+    for decl in decls {
+        let Declaration::Type(TypeDecl::Variant { constructors, .. }) = decl else {
+            continue;
+        };
+        for (_, payloads) in constructors {
+            let regrouped = regroup_variant_constructor_payloads(payloads, &arities);
+            *payloads = regrouped;
         }
     }
 }

@@ -10,7 +10,7 @@ pub struct ProjectAnalysis {
     pub module_type_decls: HashMap<String, Vec<crate::ast::TypeDecl>>,
     pub module_all_type_decls: HashMap<String, Vec<crate::ast::TypeDecl>>,
     pub module_private_record_types: HashMap<String, Vec<String>>,
-    pub module_extern_types: HashMap<String, Vec<String>>,
+    pub module_extern_types: HashMap<String, Vec<crate::ast::ExternTypeInfo>>,
     pub all_module_schemes: HashMap<String, crate::typecheck::TypeEnv>,
     pub module_aliases: HashMap<String, String>,
 }
@@ -22,7 +22,7 @@ pub struct ResolvedImports {
     pub imported_schemes: crate::typecheck::TypeEnv,
     pub imported_type_decls: Vec<crate::ast::TypeDecl>,
     pub debug_type_decls: Vec<crate::ast::TypeDecl>,
-    pub imported_extern_types: Vec<String>,
+    pub imported_extern_types: Vec<crate::ast::ExternTypeInfo>,
     pub imported_field_indices: HashMap<(String, String), usize>,
     pub imported_private_records: HashMap<String, Vec<String>>,
     pub module_aliases: HashMap<String, String>,
@@ -301,7 +301,7 @@ fn apply_package_root_alias_to_metadata(
     module_type_decls: &mut HashMap<String, Vec<crate::ast::TypeDecl>>,
     module_all_type_decls: &mut HashMap<String, Vec<crate::ast::TypeDecl>>,
     module_private_record_types: &mut HashMap<String, Vec<String>>,
-    module_extern_types: &mut HashMap<String, Vec<String>>,
+    module_extern_types: &mut HashMap<String, Vec<crate::ast::ExternTypeInfo>>,
     module_aliases: &mut HashMap<String, String>,
     package_name: Option<&str>,
 ) -> Result<(), String> {
@@ -604,31 +604,35 @@ pub fn resolve_imports_for_source(
 
         if let Some(extern_types) = project.module_extern_types.get(&mod_name) {
             // Always add qualified extern type aliases (module/TypeName) for modules in scope.
-            for type_name in extern_types {
-                if imported_qualified_extern_type_keys.insert((mod_name.clone(), type_name.clone()))
+            for extern_type in extern_types {
+                if imported_qualified_extern_type_keys
+                    .insert((mod_name.clone(), extern_type.name.clone()))
                 {
-                    imported_extern_types.push(format!("{mod_name}/{type_name}"));
+                    imported_extern_types.push(crate::ast::ExternTypeInfo {
+                        name: format!("{mod_name}/{}", extern_type.name),
+                        arity: extern_type.arity,
+                    });
                 }
             }
 
             match &unqualified {
                 crate::ast::UnqualifiedImports::None => {}
                 crate::ast::UnqualifiedImports::Wildcard => {
-                    for type_name in extern_types {
-                        let key = (mod_name.clone(), type_name.clone());
+                    for extern_type in extern_types {
+                        let key = (mod_name.clone(), extern_type.name.clone());
                         if imported_extern_type_keys.insert(key) {
-                            imported_extern_types.push(type_name.clone());
+                            imported_extern_types.push(extern_type.clone());
                         }
                     }
                 }
                 crate::ast::UnqualifiedImports::Specific(names) => {
-                    for type_name in extern_types {
-                        if !names.iter().any(|name| name == type_name) {
+                    for extern_type in extern_types {
+                        if !names.iter().any(|name| name == &extern_type.name) {
                             continue;
                         }
-                        let key = (mod_name.clone(), type_name.clone());
+                        let key = (mod_name.clone(), extern_type.name.clone());
                         if imported_extern_type_keys.insert(key) {
-                            imported_extern_types.push(type_name.clone());
+                            imported_extern_types.push(extern_type.clone());
                         }
                     }
                 }

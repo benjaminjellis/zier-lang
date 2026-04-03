@@ -904,7 +904,8 @@ impl Project {
         }
 
         if let Some(extern_types) = self.analysis.module_extern_types.get(module) {
-            for name in extern_types {
+            for extern_type in extern_types {
+                let name = &extern_type.name;
                 if !name.starts_with(prefix) {
                     continue;
                 }
