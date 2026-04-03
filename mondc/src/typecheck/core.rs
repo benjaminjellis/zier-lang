@@ -169,6 +169,12 @@ pub enum TypeError {
         missing: Vec<String>,
         span: std::ops::Range<usize>,
     },
+    ConstructorPatternArity {
+        constructor: String,
+        expected: usize,
+        found: usize,
+        span: std::ops::Range<usize>,
+    },
     UnboundVariable(String, std::ops::Range<usize>),
 }
 
@@ -565,6 +571,37 @@ impl TypeError {
                         missing.join(", ")
                     )]),
             ],
+            TypeError::ConstructorPatternArity {
+                constructor,
+                expected,
+                found,
+                span: pattern_span,
+            } => {
+                let payload_word = |count: usize| {
+                    if count == 1 { "payload" } else { "payloads" }
+                };
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!(
+                            "constructor pattern `{constructor}` expects {} {}, found {}",
+                            expected,
+                            payload_word(*expected),
+                            found
+                        ))
+                        .with_labels(vec![
+                            Label::primary(file_id, pattern_span.clone()).with_message(format!(
+                                "this pattern provides {} {}",
+                                found,
+                                payload_word(*found)
+                            )),
+                        ])
+                        .with_notes(vec![format!(
+                            "`{constructor}` must be matched with exactly {} {} here",
+                            expected,
+                            payload_word(*expected)
+                        )]),
+                ]
+            }
             TypeError::UnboundVariable(name, precise_span) => vec![
                 Diagnostic::error()
                     .with_message(format!("unbound variable `{name}`"))

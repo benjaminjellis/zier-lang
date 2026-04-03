@@ -90,15 +90,15 @@ fn collect_scheme_aliases(scheme: &typecheck::Scheme, aliases: &mut HashMap<Stri
 
 pub(crate) fn build_qualified_type_aliases(
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
     imported_schemes: &typecheck::TypeEnv,
 ) -> HashMap<String, String> {
     let mut aliases = HashMap::new();
     for type_decl in imported_type_decls {
         collect_decl_aliases(type_decl, &mut aliases);
     }
-    for name in imported_extern_types {
-        add_qualified_type_alias(name, &mut aliases);
+    for extern_type in imported_extern_types {
+        add_qualified_type_alias(&extern_type.name, &mut aliases);
     }
     for scheme in imported_schemes.values() {
         collect_scheme_aliases(scheme, &mut aliases);
@@ -108,7 +108,7 @@ pub(crate) fn build_qualified_type_aliases(
 
 pub(crate) fn prepare_typechecker(
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
     imported_private_records: &HashMap<String, Vec<String>>,
     imported_schemes: &typecheck::TypeEnv,
 ) -> (typecheck::TypeChecker, typecheck::TypeEnv) {

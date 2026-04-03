@@ -651,6 +651,56 @@ fn test_variant_type_constructor_multi_payload() {
 }
 
 #[test]
+fn test_variant_payload_regroups_unparenthesized_type_application() {
+    let src = "(type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])\n\
+               (type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm)])";
+    let (mut lowerer, file_id, sexprs) = setup(src);
+    let mut exprs = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut exprs, &[], &[]);
+
+    if let Declaration::Type(TypeDecl::Variant { constructors, .. }) = &exprs[1] {
+        assert!(matches!(
+            constructors[0].1.as_slice(),
+            [TypeUsage::App(name, args, _)]
+                if name == "ContinuePayload"
+                    && matches!(
+                        args.as_slice(),
+                        [TypeUsage::Generic(first, _), TypeUsage::Generic(second, _)]
+                            if first == "'s" && second == "'m"
+                    )
+        ));
+    } else {
+        panic!("expected variant type declaration");
+    }
+}
+
+#[test]
+fn test_variant_payload_regroups_applied_type_before_following_payload() {
+    let src = "(type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])\n\
+               (type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm Int)])";
+    let (mut lowerer, file_id, sexprs) = setup(src);
+    let mut exprs = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut exprs, &[], &[]);
+
+    if let Declaration::Type(TypeDecl::Variant { constructors, .. }) = &exprs[1] {
+        assert_eq!(constructors[0].1.len(), 2);
+        assert!(matches!(
+            &constructors[0].1[0],
+            TypeUsage::App(name, args, _)
+                if name == "ContinuePayload"
+                    && matches!(
+                        args.as_slice(),
+                        [TypeUsage::Generic(first, _), TypeUsage::Generic(second, _)]
+                            if first == "'s" && second == "'m"
+                    )
+        ));
+        assert!(matches!(&constructors[0].1[1], TypeUsage::Named(name, _) if name == "Int"));
+    } else {
+        panic!("expected variant type declaration");
+    }
+}
+
+#[test]
 fn test_match_constructor_patterns() {
     let (mut lowerer, file_id, sexprs) = setup("(match x (Some y) ~> y None ~> 0)");
     let expr = lowerer

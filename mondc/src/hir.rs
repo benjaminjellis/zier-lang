@@ -27,7 +27,8 @@ pub fn lower_source_to_hir(source_path: &str, source: &str) -> HirModule {
         }
     };
 
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
     HirModule {
         file_id,
         files: lowerer.files,

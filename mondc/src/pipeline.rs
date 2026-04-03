@@ -33,7 +33,7 @@ pub struct ResolvedModuleInput<'a> {
     pub module_aliases: HashMap<String, String>,
     pub imported_type_decls: Vec<ast::TypeDecl>,
     pub debug_type_decls: Vec<ast::TypeDecl>,
-    pub imported_extern_types: Vec<String>,
+    pub imported_extern_types: Vec<ast::ExternTypeInfo>,
     pub imported_field_indices: HashMap<(String, String), usize>,
     pub imported_private_records: HashMap<String, Vec<String>>,
     pub imported_schemes: typecheck::TypeEnv,

@@ -50,6 +50,7 @@ fn collect_type_usage_names(usage: &ast::TypeUsage, out: &mut HashSet<String>) {
 fn known_type_arities(
     decls: &[ast::Declaration],
     imported_type_decls: &[ast::TypeDecl],
+    imported_extern_types: &[ast::ExternTypeInfo],
 ) -> HashMap<String, usize> {
     let mut arities = HashMap::new();
     for name in PRIMITIVE_TYPE_NAMES {
@@ -65,6 +66,9 @@ fn known_type_arities(
                 arities.insert(name.clone(), params.len());
             }
         }
+    }
+    for extern_type in imported_extern_types {
+        arities.insert(extern_type.name.clone(), extern_type.arity);
     }
     for decl in decls {
         match decl {
@@ -122,7 +126,7 @@ fn collect_type_usage_arity_errors(
 fn known_type_names(
     decls: &[ast::Declaration],
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
 ) -> HashSet<String> {
     let mut known: HashSet<String> = PRIMITIVE_TYPE_NAMES
         .iter()
@@ -138,7 +142,11 @@ fn known_type_names(
             }
         }
     }
-    known.extend(imported_extern_types.iter().cloned());
+    known.extend(
+        imported_extern_types
+            .iter()
+            .map(|extern_type| extern_type.name.clone()),
+    );
     for decl in decls {
         match decl {
             ast::Declaration::Type(ast::TypeDecl::Record { name, .. }) => {
@@ -200,7 +208,7 @@ struct TypecheckStageInput<'a> {
     imports: &'a HashMap<String, String>,
     module_exports: &'a HashMap<String, Vec<String>>,
     imported_type_decls: &'a [ast::TypeDecl],
-    imported_extern_types: &'a [String],
+    imported_extern_types: &'a [ast::ExternTypeInfo],
     imported_private_records: &'a HashMap<String, Vec<String>>,
     imported_schemes: &'a typecheck::TypeEnv,
 }
@@ -225,7 +233,7 @@ pub struct CompileWithImportsInput<'a> {
     pub module_aliases: HashMap<String, String>,
     pub imported_type_decls: &'a [ast::TypeDecl],
     pub debug_type_decls: &'a [ast::TypeDecl],
-    pub imported_extern_types: &'a [String],
+    pub imported_extern_types: &'a [ast::ExternTypeInfo],
     pub imported_field_indices: &'a HashMap<(String, String), usize>,
     pub imported_private_records: &'a HashMap<String, Vec<String>>,
     pub imported_schemes: &'a typecheck::TypeEnv,
@@ -309,10 +317,10 @@ fn validate_type_declarations(
     file_id: usize,
     decls: &[ast::Declaration],
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
 ) -> bool {
     let known_types = known_type_names(decls, imported_type_decls, imported_extern_types);
-    let known_type_arities = known_type_arities(decls, imported_type_decls);
+    let known_type_arities = known_type_arities(decls, imported_type_decls, imported_extern_types);
     let mut type_decl_errors = false;
     for decl in decls {
         let (name, params, usages, span) = match decl {
@@ -408,7 +416,7 @@ fn validate_extern_signatures(
     file_id: usize,
     decls: &[ast::Declaration],
     imported_type_decls: &[ast::TypeDecl],
-    imported_extern_types: &[String],
+    imported_extern_types: &[ast::ExternTypeInfo],
 ) -> bool {
     let known_types = known_type_names(decls, imported_type_decls, imported_extern_types);
     let mut extern_type_errors = false;
@@ -644,8 +652,14 @@ pub(crate) fn compile_with_imports_in_session_with_target_and_private_records(
         Err(report) => return report,
     };
     let file_id = hir.file_id;
-    let decls = hir.decls;
+    let mut decls = hir.decls;
     let files = hir.files;
+
+    ast::normalize_variant_payload_type_applications(
+        &mut decls,
+        imported_type_decls,
+        imported_extern_types,
+    );
 
     if validate_use_declarations(
         sess,

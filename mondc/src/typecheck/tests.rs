@@ -11,7 +11,8 @@ fn check_with_env(src: &str, extra_env: TypeEnv) -> Result<Rc<Type>, TypeError> 
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();
@@ -31,7 +32,8 @@ fn check(src: &str) -> Result<Rc<Type>, TypeError> {
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();
@@ -50,7 +52,8 @@ fn check_and_env(src: &str) -> Result<TypeEnv, TypeError> {
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();
@@ -281,7 +284,8 @@ fn nullary_constructor_call_has_helpful_diagnostic() {
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();
@@ -369,7 +373,8 @@ fn call_mismatch_mentions_inferred_callee_type() {
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();
@@ -413,7 +418,8 @@ fn match_on_function_value_has_helpful_hint_and_points_to_scrutinee() {
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();
@@ -539,6 +545,17 @@ fn infer_match_multi_payload_variant_constructor() {
 }
 
 #[test]
+fn infer_constructor_with_unparenthesized_applied_payload_type() {
+    let src = r#"
+            (type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])
+            (type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm) (Stop ~ Int)])
+            (let main {} (Continue (ContinuePayload :state 1 :select 2)))
+        "#;
+    let ty = check(src).unwrap();
+    assert_eq!(ty, Type::con("Next", vec![Type::int(), Type::int()]));
+}
+
+#[test]
 fn reject_multi_payload_variant_constructor_wrong_arity() {
     let src = r#"
             (type IpAddress
@@ -550,6 +567,67 @@ fn reject_multi_payload_variant_constructor_wrong_arity() {
                 (IpV6 _ _ _ _ _ _ _ _) ~> 0))
         "#;
     assert!(check(src).is_err(), "expected arity mismatch error");
+}
+
+#[test]
+fn reject_partial_constructor_pattern_for_multi_payload_constructor() {
+    let src = r#"
+            (type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])
+            (type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm String) (Stop ~ Int)])
+            (let rewrite {value}
+              (match value
+                (Continue payload) ~> value
+                (Stop _) ~> value))
+        "#;
+    let result = check(src);
+    assert!(
+        matches!(
+            result,
+            Err(TypeError::ConstructorPatternArity {
+                ref constructor,
+                expected: 2,
+                found: 1,
+                ..
+            }) if constructor == "Continue"
+        ),
+        "expected constructor-pattern arity error, got {result:?}"
+    );
+}
+
+#[test]
+fn constructor_pattern_arity_diagnostic_is_explicit() {
+    let src = r#"
+            (type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])
+            (type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm String) (Stop ~ Int)])
+            (let rewrite {value}
+              (match value
+                (Continue payload) ~> value
+                (Stop _) ~> value))
+        "#;
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let mut lowerer = crate::lower::Lowerer::new();
+    let file_id = lowerer.add_file("test.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse failed");
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
+
+    let mut checker = TypeChecker::new();
+    let mut env = primitive_env();
+    let err = checker
+        .check_program(&mut env, &decls, file_id)
+        .expect_err("expected type error");
+    let (type_err, expr) = *err;
+    let diags = type_err.to_diagnostics(file_id, expr.span());
+
+    assert!(
+        diags[0]
+            .message
+            .contains("constructor pattern `Continue` expects 2 payloads, found 1"),
+        "unexpected message: {}",
+        diags[0].message
+    );
 }
 
 #[test]
@@ -619,7 +697,8 @@ fn missing_record_fields_diagnostic_highlights_constructor_expression() {
     let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
         .parse()
         .expect("parse failed");
-    let decls = lowerer.lower_file(file_id, &sexprs);
+    let mut decls = lowerer.lower_file(file_id, &sexprs);
+    crate::ast::normalize_variant_payload_type_applications(&mut decls, &[], &[]);
 
     let mut checker = TypeChecker::new();
     let mut env = primitive_env();

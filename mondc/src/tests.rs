@@ -1080,6 +1080,74 @@ fn type_declaration_accepts_imported_extern_type() {
 }
 
 #[test]
+fn type_declaration_accepts_imported_type_in_unparenthesized_payload_application() {
+    let imported_type_decls = exported_type_decls("(pub type ['a] Option [None (Some ~ 'a)])");
+    let src = "(type ['a] Wrapper [(Wrap ~ Option 'a)])\n(let main {} ())";
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: HashMap::new(),
+        module_exports: &HashMap::new(),
+        module_aliases: HashMap::new(),
+        imported_type_decls: &imported_type_decls,
+        debug_type_decls: &imported_type_decls,
+        imported_extern_types: &[],
+        imported_field_indices: &HashMap::new(),
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &HashMap::new(),
+        compile_target: CompileTarget::Dev,
+    });
+    assert!(
+        !report.has_errors(),
+        "expected imported type payload application to compile: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn type_declaration_accepts_imported_extern_type_in_unparenthesized_payload_application() {
+    let process_src = "(pub extern type ['m] Name)";
+    let std_mods = vec![(
+        "process".to_string(),
+        "mond_process".to_string(),
+        process_src.to_string(),
+    )];
+    let analysis = crate::build_project_analysis(&std_mods, &[]).expect("analysis");
+    let src =
+        "(use process [Name])\n(type ['m] Subject [(NamedSubject ~ Name 'm)])\n(let main {} ())";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: resolved.imports,
+        module_exports: &analysis.module_exports,
+        module_aliases: resolved.module_aliases,
+        imported_type_decls: &resolved.imported_type_decls,
+        debug_type_decls: &resolved.imported_type_decls,
+        imported_extern_types: &resolved.imported_extern_types,
+        imported_field_indices: &resolved.imported_field_indices,
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &resolved.imported_schemes,
+        compile_target: CompileTarget::Dev,
+    });
+    assert!(
+        !report.has_errors(),
+        "expected imported extern payload application to compile: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn type_declaration_reports_unknown_type_without_import() {
     let src = "(pub type Next [Continue (Stop ~ ExitReason)])";
     let report = compile_with_imports_report_api(CompileWithImportsInput {
@@ -1141,6 +1209,66 @@ fn type_declaration_reports_missing_type_arguments() {
                 && m.contains("expected 2, found 0")
         }),
         "expected type argument arity diagnostic, got: {messages:?}"
+    );
+}
+
+#[test]
+fn type_declaration_accepts_unparenthesized_applied_payload_type() {
+    let src = "(type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])\n\
+               (pub type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm)])";
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: HashMap::new(),
+        module_exports: &HashMap::new(),
+        module_aliases: HashMap::new(),
+        imported_type_decls: &[],
+        debug_type_decls: &[],
+        imported_extern_types: &[],
+        imported_field_indices: &HashMap::new(),
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &HashMap::new(),
+        compile_target: CompileTarget::Dev,
+    });
+    assert!(
+        !report.has_errors(),
+        "expected unparenthesized applied payload type to compile, got diagnostics: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn type_declaration_accepts_mixed_applied_and_standalone_payload_types() {
+    let src = "(type ['s 'm] ContinuePayload [(:state ~ 's) (:select ~ 'm)])\n\
+               (pub type ['s 'm] Next [(Continue ~ ContinuePayload 's 'm Int)])";
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: HashMap::new(),
+        module_exports: &HashMap::new(),
+        module_aliases: HashMap::new(),
+        imported_type_decls: &[],
+        debug_type_decls: &[],
+        imported_extern_types: &[],
+        imported_field_indices: &HashMap::new(),
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &HashMap::new(),
+        compile_target: CompileTarget::Dev,
+    });
+    assert!(
+        !report.has_errors(),
+        "expected mixed payload declaration to compile, got diagnostics: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
     );
 }
 
