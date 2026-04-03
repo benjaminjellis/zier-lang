@@ -780,7 +780,7 @@ fn collect_unused_local_spans(
             let mut free = collect_unused_local_spans(value, out);
             let mut body_free = collect_unused_local_spans(body, out);
             let is_used = body_free.remove(name);
-            if name != "_" && !is_used {
+            if !is_intentionally_unused_binding(name) && !is_used {
                 out.push((name.clone(), name_span.clone()));
             }
             free.extend(body_free);
@@ -817,7 +817,7 @@ fn collect_unused_local_spans(
                     bind_pattern_name_spans(pat, &mut bound_spans);
                 }
                 for (name, span) in &bound_spans {
-                    if name != "_" && !body_free.contains(name) {
+                    if !is_intentionally_unused_binding(name) && !body_free.contains(name) {
                         out.push((name.clone(), span.clone()));
                     }
                 }
@@ -858,6 +858,97 @@ fn collect_unused_local_spans(
                 free.extend(collect_unused_local_spans(arg, out));
             }
             free
+        }
+    }
+}
+
+fn is_intentionally_unused_binding(name: &str) -> bool {
+    name == "_" || name.starts_with('_')
+}
+
+fn looks_like_hardcoded_erlang_module_name(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("p_")
+        .or_else(|| value.strip_prefix("d_"))
+    else {
+        return false;
+    };
+    // Canonical generated module names are lower-case ASCII and contain at least
+    // one package/module separator underscore after the prefix.
+    rest.contains('_')
+        && rest
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn collect_hardcoded_erlang_module_name_literals(
+    expr: &ast::Expr,
+    out: &mut Vec<(String, std::ops::Range<usize>)>,
+) {
+    use ast::Expr;
+    match expr {
+        Expr::Literal(ast::Literal::String(value), span)
+            if looks_like_hardcoded_erlang_module_name(value) =>
+        {
+            out.push((value.clone(), span.clone()));
+        }
+        Expr::Literal(_, _) | Expr::Variable(_, _) => {}
+        Expr::List(items, _) => {
+            for item in items {
+                collect_hardcoded_erlang_module_name_literals(item, out);
+            }
+        }
+        Expr::LetFunc { value, .. } => collect_hardcoded_erlang_module_name_literals(value, out),
+        Expr::LetLocal { value, body, .. } => {
+            collect_hardcoded_erlang_module_name_literals(value, out);
+            collect_hardcoded_erlang_module_name_literals(body, out);
+        }
+        Expr::If {
+            cond, then, els, ..
+        } => {
+            collect_hardcoded_erlang_module_name_literals(cond, out);
+            collect_hardcoded_erlang_module_name_literals(then, out);
+            collect_hardcoded_erlang_module_name_literals(els, out);
+        }
+        Expr::Debug { value, .. } => collect_hardcoded_erlang_module_name_literals(value, out),
+        Expr::Call { func, args, .. } => {
+            collect_hardcoded_erlang_module_name_literals(func, out);
+            for arg in args {
+                collect_hardcoded_erlang_module_name_literals(arg, out);
+            }
+        }
+        Expr::Match { targets, arms, .. } => {
+            for target in targets {
+                collect_hardcoded_erlang_module_name_literals(target, out);
+            }
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    collect_hardcoded_erlang_module_name_literals(guard, out);
+                }
+                collect_hardcoded_erlang_module_name_literals(&arm.body, out);
+            }
+        }
+        Expr::FieldAccess { record, .. } => {
+            collect_hardcoded_erlang_module_name_literals(record, out);
+        }
+        Expr::RecordConstruct { fields, .. } => {
+            for (_, value) in fields {
+                collect_hardcoded_erlang_module_name_literals(value, out);
+            }
+        }
+        Expr::RecordUpdate {
+            record, updates, ..
+        } => {
+            collect_hardcoded_erlang_module_name_literals(record, out);
+            for (_, value) in updates {
+                collect_hardcoded_erlang_module_name_literals(value, out);
+            }
+        }
+        Expr::Lambda { body, .. } => collect_hardcoded_erlang_module_name_literals(body, out),
+        Expr::QualifiedCall { args, .. } => {
+            for arg in args {
+                collect_hardcoded_erlang_module_name_literals(arg, out);
+            }
         }
     }
 }
@@ -1846,6 +1937,42 @@ pub(crate) fn unused_unqualified_import_diagnostics(
     }
 
     diags
+}
+
+pub(crate) fn hardcoded_erlang_module_name_diagnostics(
+    decls: &[ast::Declaration],
+    file_id: usize,
+) -> Vec<Diagnostic<usize>> {
+    let mut spans = Vec::new();
+    for decl in decls {
+        match decl {
+            ast::Declaration::Expression(expr) => {
+                collect_hardcoded_erlang_module_name_literals(expr, &mut spans);
+            }
+            ast::Declaration::Test { body, .. } => {
+                collect_hardcoded_erlang_module_name_literals(body, &mut spans);
+            }
+            ast::Declaration::Type(_)
+            | ast::Declaration::ExternLet { .. }
+            | ast::Declaration::ExternType { .. }
+            | ast::Declaration::Use { .. } => {}
+        }
+    }
+
+    spans
+        .into_iter()
+        .map(|(value, span)| {
+            Diagnostic::warning()
+                .with_message(format!("hardcoded compiled Erlang module name `{value}`"))
+                .with_labels(vec![Label::primary(file_id, span).with_message(
+                    "this literal depends on `p_`/`d_` build prefixes",
+                )])
+                .with_notes(vec![
+                    "avoid hardcoding generated module names in string literals".into(),
+                    "use a stable module reference helper/convention so code works both as top-level (`p_`) and dependency (`d_`)".into(),
+                ])
+        })
+        .collect()
 }
 
 pub(crate) fn redundant_match_diagnostics(

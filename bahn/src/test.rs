@@ -6,7 +6,8 @@ use crate::{
     TARGET_DIR, TEST_BUILD_DIR, TEST_DIR,
     build::{
         ErlSources, dependency_external_modules, dependency_source_label,
-        generate_erl_sources_with_roots, reachable_dependency_modules,
+        ensure_dependency_module_closure_complete, generate_erl_sources_with_roots,
+        reachable_dependency_modules,
     },
     compile_flow, manifest, ui,
     utils::find_mond_files,
@@ -207,6 +208,15 @@ pub(crate) async fn test(project_dir: &Path) -> eyre::Result<()> {
     }
     let selected_test_dependency_mods =
         reachable_dependency_modules(&dependency_mods, &needed_dependencies)?;
+    let known_dependency_names: std::collections::HashSet<String> = dependency_mods
+        .iter()
+        .map(|module| module.module_name.clone())
+        .collect();
+    ensure_dependency_module_closure_complete(
+        &selected_test_dependency_mods,
+        &known_dependency_names,
+        &src_module_names,
+    )?;
 
     let dependency_external_mods = dependency_external_modules(&dependency_mods);
     let dependency_analysis = Arc::new(

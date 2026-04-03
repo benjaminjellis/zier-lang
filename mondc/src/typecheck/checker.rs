@@ -6,7 +6,10 @@ use std::{
 use crate::ast::{Expr, Literal, MatchArm, Pattern, TypeDecl};
 
 use super::{
-    core::{apply_subst_predicate, apply_subst_preds, generalize, is_non_expansive},
+    core::{
+        FieldConstraintTypeError, apply_subst_predicate, apply_subst_preds, generalize,
+        is_non_expansive,
+    },
     env::type_sig_to_scheme,
     *,
 };
@@ -79,6 +82,59 @@ fn call_error_with_context(error: TypeError, context: CallErrorContext) -> TypeE
         }
         other => other,
     }
+}
+
+#[derive(Clone)]
+struct FieldConstraintErrorContext {
+    failure_span: Option<std::ops::Range<usize>>,
+    origin_span: Option<std::ops::Range<usize>>,
+    origin_message: Option<String>,
+}
+
+fn field_constraint_error_with_context(
+    error: TypeError,
+    context: FieldConstraintErrorContext,
+) -> TypeError {
+    match error {
+        TypeError::UnsatisfiedFieldConstraint { field_constraint } => {
+            let mut field_constraint = *field_constraint;
+            field_constraint.failure_span = context.failure_span.or(field_constraint.failure_span);
+            field_constraint.origin_span = context.origin_span.or(field_constraint.origin_span);
+            field_constraint.origin_message =
+                context.origin_message.or(field_constraint.origin_message);
+            TypeError::UnsatisfiedFieldConstraint {
+                field_constraint: Box::new(field_constraint),
+            }
+        }
+        TypeError::AmbiguousFieldConstraint { field_constraint } => {
+            let mut field_constraint = *field_constraint;
+            field_constraint.failure_span = context.failure_span.or(field_constraint.failure_span);
+            field_constraint.origin_span = context.origin_span.or(field_constraint.origin_span);
+            field_constraint.origin_message =
+                context.origin_message.or(field_constraint.origin_message);
+            TypeError::AmbiguousFieldConstraint {
+                field_constraint: Box::new(field_constraint),
+            }
+        }
+        other => other,
+    }
+}
+
+fn field_constraint_error(
+    field: String,
+    record_ty: Rc<Type>,
+    field_ty: Rc<Type>,
+    candidates: Vec<String>,
+) -> Box<FieldConstraintTypeError> {
+    Box::new(FieldConstraintTypeError {
+        field,
+        record_ty,
+        field_ty,
+        candidates,
+        failure_span: None,
+        origin_span: None,
+        origin_message: None,
+    })
 }
 
 pub(super) fn record_accessor_key(record_name: &str, field_name: &str) -> String {
@@ -334,10 +390,12 @@ impl TypeChecker {
     ) -> Result<Substitution, TypeError> {
         let accessor_scheme = lookup_record_accessor(env, record_name, label).ok_or_else(|| {
             TypeError::UnsatisfiedFieldConstraint {
-                field: label.to_string(),
-                record_ty: record_ty.clone(),
-                field_ty: field_ty.clone(),
-                candidates: self.field_instance_candidates_with_env(env, label),
+                field_constraint: field_constraint_error(
+                    label.to_string(),
+                    record_ty.clone(),
+                    field_ty.clone(),
+                    self.field_instance_candidates_with_env(env, label),
+                ),
             }
         })?;
         let accessor_ty = self.instantiate(accessor_scheme);
@@ -398,20 +456,21 @@ impl TypeChecker {
                                         &field_ty,
                                     )
                                     .map_err(|_| TypeError::UnsatisfiedFieldConstraint {
-                                        field: label,
-                                        record_ty: record_ty.clone(),
-                                        field_ty: field_ty.clone(),
-                                        candidates: candidates.clone(),
+                                        field_constraint: field_constraint_error(
+                                            label,
+                                            record_ty.clone(),
+                                            field_ty.clone(),
+                                            candidates.clone(),
+                                        ),
                                     })?;
                                 subst = compose_subst(&s, &subst);
                                 progressed = true;
                             }
                             Type::Fun(_, _) => {
                                 return Err(TypeError::UnsatisfiedFieldConstraint {
-                                    field: label,
-                                    record_ty,
-                                    field_ty,
-                                    candidates,
+                                    field_constraint: field_constraint_error(
+                                        label, record_ty, field_ty, candidates,
+                                    ),
                                 });
                             }
                             Type::Var(record_id) => {
@@ -490,17 +549,21 @@ impl TypeChecker {
                 let candidates = self.field_instance_candidates(label);
                 if candidates.len() > 1 {
                     TypeError::AmbiguousFieldConstraint {
-                        field: label.clone(),
-                        record_ty: record_ty.clone(),
-                        field_ty: field_ty.clone(),
-                        candidates,
+                        field_constraint: field_constraint_error(
+                            label.clone(),
+                            record_ty.clone(),
+                            field_ty.clone(),
+                            candidates,
+                        ),
                     }
                 } else {
                     TypeError::UnsatisfiedFieldConstraint {
-                        field: label.clone(),
-                        record_ty: record_ty.clone(),
-                        field_ty: field_ty.clone(),
-                        candidates,
+                        field_constraint: field_constraint_error(
+                            label.clone(),
+                            record_ty.clone(),
+                            field_ty.clone(),
+                            candidates,
+                        ),
                     }
                 }
             }
@@ -881,8 +944,20 @@ impl TypeChecker {
                         })?;
                     subst = compose_subst(&s_unify, &subst);
                     preds = apply_subst_preds(&s_unify, &preds);
-                    let (s_pred, solved_preds) =
-                        self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                    let (s_pred, solved_preds) = self
+                        .solve_predicates(&apply_subst_env(&subst, env), &preds)
+                        .map_err(|error| {
+                            field_constraint_error_with_context(
+                                error,
+                                FieldConstraintErrorContext {
+                                    failure_span: Some(span.clone()),
+                                    origin_span: callee_span.clone(),
+                                    origin_message: callee_name
+                                        .as_ref()
+                                        .map(|name| format!("constraint introduced by `{name}`")),
+                                },
+                            )
+                        })?;
                     subst = compose_subst(&s_pred, &subst);
                     preds = apply_subst_preds(&s_pred, &solved_preds);
                     let result_ty = apply_subst(&subst, &ret);
@@ -929,8 +1004,20 @@ impl TypeChecker {
                     t_func = apply_subst(&subst, &ret);
                     prev_span = Some(arg_span);
                 }
-                let (s_pred, solved_preds) =
-                    self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                let (s_pred, solved_preds) = self
+                    .solve_predicates(&apply_subst_env(&subst, env), &preds)
+                    .map_err(|error| {
+                        field_constraint_error_with_context(
+                            error,
+                            FieldConstraintErrorContext {
+                                failure_span: prev_span.clone().or(Some(span.clone())),
+                                origin_span: callee_span.clone(),
+                                origin_message: callee_name
+                                    .as_ref()
+                                    .map(|name| format!("constraint introduced by `{name}`")),
+                            },
+                        )
+                    })?;
                 subst = compose_subst(&s_pred, &subst);
                 preds = apply_subst_preds(&s_pred, &solved_preds);
                 t_func = apply_subst(&s_pred, &t_func);
@@ -1636,8 +1723,20 @@ impl TypeChecker {
                         })?;
                     subst = compose_subst(&s_unify, &subst);
                     preds = apply_subst_preds(&s_unify, &preds);
-                    let (s_pred, solved_preds) =
-                        self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                    let (s_pred, solved_preds) = self
+                        .solve_predicates(&apply_subst_env(&subst, env), &preds)
+                        .map_err(|error| {
+                            field_constraint_error_with_context(
+                                error,
+                                FieldConstraintErrorContext {
+                                    failure_span: Some(span.clone()),
+                                    origin_span: Some(fn_span.clone()),
+                                    origin_message: Some(format!(
+                                        "constraint introduced by `{callee_name}`"
+                                    )),
+                                },
+                            )
+                        })?;
                     subst = compose_subst(&s_pred, &subst);
                     preds = apply_subst_preds(&s_pred, &solved_preds);
                     let result_ty = apply_subst(&subst, &ret);
@@ -1683,8 +1782,20 @@ impl TypeChecker {
                     prev_span = Some(arg_span);
                     t_func = apply_subst(&subst, &ret);
                 }
-                let (s_pred, solved_preds) =
-                    self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
+                let (s_pred, solved_preds) = self
+                    .solve_predicates(&apply_subst_env(&subst, env), &preds)
+                    .map_err(|error| {
+                        field_constraint_error_with_context(
+                            error,
+                            FieldConstraintErrorContext {
+                                failure_span: prev_span.clone().or(Some(span.clone())),
+                                origin_span: Some(fn_span.clone()),
+                                origin_message: Some(format!(
+                                    "constraint introduced by `{callee_name}`"
+                                )),
+                            },
+                        )
+                    })?;
                 subst = compose_subst(&s_pred, &subst);
                 preds = apply_subst_preds(&s_pred, &solved_preds);
                 t_func = apply_subst(&s_pred, &t_func);
@@ -2065,7 +2176,19 @@ impl TypeChecker {
                     *env = apply_subst_env(&s, env);
                     let (s_pred, solved_preds) = match self.solve_predicates(env, &preds) {
                         Ok(result) => result,
-                        Err(error) => return Err(Box::new((error, expr.clone()))),
+                        Err(error) => {
+                            return Err(Box::new((
+                                field_constraint_error_with_context(
+                                    error,
+                                    FieldConstraintErrorContext {
+                                        failure_span: Some(expr.span()),
+                                        origin_span: None,
+                                        origin_message: None,
+                                    },
+                                ),
+                                expr.clone(),
+                            )));
+                        }
                     };
                     self.apply_expr_type_subst(&s_pred);
                     *env = apply_subst_env(&s_pred, env);
@@ -2129,7 +2252,19 @@ impl TypeChecker {
                             *env = apply_subst_env(&s, env);
                             let (s_pred, solved_preds) = match self.solve_predicates(env, &preds) {
                                 Ok(result) => result,
-                                Err(error) => return Err(Box::new((error, expr.clone()))),
+                                Err(error) => {
+                                    return Err(Box::new((
+                                        field_constraint_error_with_context(
+                                            error,
+                                            FieldConstraintErrorContext {
+                                                failure_span: Some(expr.span()),
+                                                origin_span: None,
+                                                origin_message: None,
+                                            },
+                                        ),
+                                        expr.clone(),
+                                    )));
+                                }
                             };
                             self.apply_expr_type_subst(&s_pred);
                             *env = apply_subst_env(&s_pred, env);
@@ -2160,7 +2295,19 @@ impl TypeChecker {
                             let preds = apply_subst_preds(&s, &preds);
                             let (s_pred, solved_preds) = match self.solve_predicates(env, &preds) {
                                 Ok(result) => result,
-                                Err(error) => return Err(Box::new((error, *body.clone()))),
+                                Err(error) => {
+                                    return Err(Box::new((
+                                        field_constraint_error_with_context(
+                                            error,
+                                            FieldConstraintErrorContext {
+                                                failure_span: Some(body.span()),
+                                                origin_span: None,
+                                                origin_message: None,
+                                            },
+                                        ),
+                                        *body.clone(),
+                                    )));
+                                }
                             };
                             self.apply_expr_type_subst(&s_pred);
                             *env = apply_subst_env(&s_pred, env);

@@ -263,6 +263,47 @@ pub(crate) fn reachable_dependency_modules(
         .collect::<eyre::Result<Vec<_>>>()
 }
 
+pub(crate) fn ensure_dependency_module_closure_complete(
+    selected_dependency_mods: &[mondc::DependencyModuleSource],
+    known_dependency_names: &HashSet<String>,
+    local_module_names: &HashSet<String>,
+) -> eyre::Result<()> {
+    let selected_names: HashSet<String> = selected_dependency_mods
+        .iter()
+        .map(|module| module.module_name.clone())
+        .collect();
+    let mut missing_edges: Vec<(String, String)> = Vec::new();
+
+    for module in selected_dependency_mods {
+        for (_, referenced, _) in mondc::used_modules(&module.source) {
+            if !known_dependency_names.contains(&referenced) {
+                continue;
+            }
+            if local_module_names.contains(&referenced) {
+                continue;
+            }
+            if !selected_names.contains(&referenced) {
+                missing_edges.push((module.module_name.clone(), referenced));
+            }
+        }
+    }
+
+    if missing_edges.is_empty() {
+        return Ok(());
+    }
+
+    missing_edges.sort();
+    missing_edges.dedup();
+    let details = missing_edges
+        .iter()
+        .map(|(from, to)| format!("{from} -> {to}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(eyre::eyre!(
+        "internal error: dependency module closure is incomplete ({details})"
+    ))
+}
+
 /// Compile all Mond source files and write `.erl` output into `erl_dir`.
 /// Returns the generated file paths, the project manifest, and detected project type.
 pub(crate) async fn generate_erl_sources(
@@ -399,6 +440,11 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
         .collect();
     let selected_dependency_mods =
         reachable_dependency_modules(&dependency_mods, &direct_dependency_roots)?;
+    ensure_dependency_module_closure_complete(
+        &selected_dependency_mods,
+        &known_dependency_names,
+        &local_module_names,
+    )?;
     let used_dependency_names: HashSet<String> = selected_dependency_mods
         .iter()
         .map(|module| module.module_name.clone())
@@ -975,6 +1021,77 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["list", "io"]);
+    }
+
+    #[test]
+    fn dependency_module_closure_validation_rejects_missing_transitive_module() {
+        let selected_dependency_mods = vec![mondc::DependencyModuleSource {
+            package_name: "std".to_string(),
+            module_name: "io".to_string(),
+            erlang_name: "mond_io".to_string(),
+            source: "(use list)\n(pub let println {x} (list/map x))".to_string(),
+            source_relpath: "src/io.mond".to_string(),
+        }];
+        let known_dependency_names = HashSet::from(["io".to_string(), "list".to_string()]);
+
+        let err = ensure_dependency_module_closure_complete(
+            &selected_dependency_mods,
+            &known_dependency_names,
+            &HashSet::new(),
+        )
+        .expect_err("expected closure validation error");
+        assert!(
+            err.to_string().contains("io -> list"),
+            "unexpected closure error: {err}"
+        );
+    }
+
+    #[test]
+    fn dependency_module_closure_validation_accepts_complete_set() {
+        let selected_dependency_mods = vec![
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "list".to_string(),
+                erlang_name: "mond_list".to_string(),
+                source: "(pub let map {f xs} xs)".to_string(),
+                source_relpath: "src/list.mond".to_string(),
+            },
+            mondc::DependencyModuleSource {
+                package_name: "std".to_string(),
+                module_name: "io".to_string(),
+                erlang_name: "mond_io".to_string(),
+                source: "(use list)\n(pub let println {x} (list/map x))".to_string(),
+                source_relpath: "src/io.mond".to_string(),
+            },
+        ];
+        let known_dependency_names = HashSet::from(["io".to_string(), "list".to_string()]);
+
+        ensure_dependency_module_closure_complete(
+            &selected_dependency_mods,
+            &known_dependency_names,
+            &HashSet::new(),
+        )
+        .expect("closure should be complete");
+    }
+
+    #[test]
+    fn dependency_module_closure_validation_ignores_extern_erlang_targets() {
+        let selected_dependency_mods = vec![mondc::DependencyModuleSource {
+            package_name: "std".to_string(),
+            module_name: "io".to_string(),
+            erlang_name: "mond_io".to_string(),
+            source: "(extern let send ~ (Int -> Unit) process/send)\n(pub let println {x} x)"
+                .to_string(),
+            source_relpath: "src/io.mond".to_string(),
+        }];
+        let known_dependency_names = HashSet::from(["io".to_string(), "process".to_string()]);
+
+        ensure_dependency_module_closure_complete(
+            &selected_dependency_mods,
+            &known_dependency_names,
+            &HashSet::new(),
+        )
+        .expect("extern Erlang targets should not create module closure edges");
     }
 
     #[test]

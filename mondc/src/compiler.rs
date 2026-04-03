@@ -537,6 +537,12 @@ fn emit_warning_stage(
         sess,
         files,
         diagnostics,
+        warnings::hardcoded_erlang_module_name_diagnostics(decls, file_id),
+    );
+    push_and_emit_diags(
+        sess,
+        files,
+        diagnostics,
         warnings::unused_unqualified_import_diagnostics(
             decls,
             file_id,

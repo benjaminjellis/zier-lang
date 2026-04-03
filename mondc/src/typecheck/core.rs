@@ -117,6 +117,20 @@ pub struct OccursCheckTypeError {
 }
 
 #[derive(Debug, Clone)]
+pub struct FieldConstraintTypeError {
+    pub(super) field: String,
+    pub(super) record_ty: Rc<Type>,
+    pub(super) field_ty: Rc<Type>,
+    pub(super) candidates: Vec<String>,
+    /// Span where the constraint failed, if known.
+    pub(super) failure_span: Option<std::ops::Range<usize>>,
+    /// Span where the field constraint was introduced, if known.
+    pub(super) origin_span: Option<std::ops::Range<usize>>,
+    /// Human-readable origin explanation.
+    pub(super) origin_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub enum TypeError {
     OccursCheck {
         occurs_check: Box<OccursCheckTypeError>,
@@ -157,16 +171,10 @@ pub enum TypeError {
         candidates: Vec<String>,
     },
     UnsatisfiedFieldConstraint {
-        field: String,
-        record_ty: Rc<Type>,
-        field_ty: Rc<Type>,
-        candidates: Vec<String>,
+        field_constraint: Box<FieldConstraintTypeError>,
     },
     AmbiguousFieldConstraint {
-        field: String,
-        record_ty: Rc<Type>,
-        field_ty: Rc<Type>,
-        candidates: Vec<String>,
+        field_constraint: Box<FieldConstraintTypeError>,
     },
     DuplicateRecordField {
         record: String,
@@ -478,63 +486,105 @@ impl TypeError {
                         ]),
                 ]
             }
-            TypeError::UnsatisfiedFieldConstraint {
-                field,
-                record_ty,
-                field_ty,
-                candidates,
-            } => {
+            TypeError::UnsatisfiedFieldConstraint { field_constraint } => {
                 let mut var_names = std::collections::HashMap::new();
                 let constraint_s = predicate_display_inner(
                     &Predicate::HasField {
-                        label: field.clone(),
-                        record_ty: record_ty.clone(),
-                        field_ty: field_ty.clone(),
+                        label: field_constraint.field.clone(),
+                        record_ty: field_constraint.record_ty.clone(),
+                        field_ty: field_constraint.field_ty.clone(),
                     },
                     &mut var_names,
                 );
-                let mut notes = if candidates.is_empty() {
-                    vec![format!("no record type in scope defines `:{field}`")]
+                let mut notes = if field_constraint.candidates.is_empty() {
+                    vec![format!(
+                        "no record type in scope defines `:{}`",
+                        field_constraint.field
+                    )]
                 } else {
                     vec![format!(
-                        "records with `:{field}`: {}",
-                        candidates.join(", ")
+                        "records with `:{}`: {}",
+                        field_constraint.field,
+                        field_constraint.candidates.join(", ")
                     )]
                 };
+                notes.push(format!(
+                    "receiver type at failure: `{}`",
+                    type_display(&field_constraint.record_ty)
+                ));
                 notes.push("add a type constraint so the record type is known".into());
+                let mut labels = vec![
+                    Label::primary(
+                        file_id,
+                        field_constraint
+                            .failure_span
+                            .clone()
+                            .unwrap_or_else(|| span.clone()),
+                    )
+                    .with_message(
+                        "this expression requires a record field that cannot be resolved",
+                    ),
+                ];
+                if let Some(origin_span) = field_constraint.origin_span.as_ref() {
+                    labels.push(
+                        Label::secondary(file_id, origin_span.clone()).with_message(
+                            field_constraint
+                                .origin_message
+                                .clone()
+                                .unwrap_or_else(|| "field constraint introduced here".to_string()),
+                        ),
+                    );
+                }
                 vec![
                     Diagnostic::error()
                         .with_message(format!("unsatisfied field constraint `{constraint_s}`"))
-                        .with_labels(vec![Label::primary(file_id, span).with_message(
-                            "this expression requires a record field that cannot be resolved",
-                        )])
+                        .with_labels(labels)
                         .with_notes(notes),
                 ]
             }
-            TypeError::AmbiguousFieldConstraint {
-                field,
-                record_ty,
-                field_ty,
-                candidates,
-            } => {
+            TypeError::AmbiguousFieldConstraint { field_constraint } => {
                 let mut var_names = std::collections::HashMap::new();
                 let constraint_s = predicate_display_inner(
                     &Predicate::HasField {
-                        label: field.clone(),
-                        record_ty: record_ty.clone(),
-                        field_ty: field_ty.clone(),
+                        label: field_constraint.field.clone(),
+                        record_ty: field_constraint.record_ty.clone(),
+                        field_ty: field_constraint.field_ty.clone(),
                     },
                     &mut var_names,
                 );
+                let mut labels = vec![
+                    Label::primary(
+                        file_id,
+                        field_constraint
+                            .failure_span
+                            .clone()
+                            .unwrap_or_else(|| span.clone()),
+                    )
+                    .with_message("the record type is still polymorphic here"),
+                ];
+                if let Some(origin_span) = field_constraint.origin_span.as_ref() {
+                    labels.push(
+                        Label::secondary(file_id, origin_span.clone()).with_message(
+                            field_constraint
+                                .origin_message
+                                .clone()
+                                .unwrap_or_else(|| "field constraint introduced here".to_string()),
+                        ),
+                    );
+                }
                 vec![
                     Diagnostic::error()
                         .with_message(format!("ambiguous field constraint `{constraint_s}`"))
-                        .with_labels(vec![
-                            Label::primary(file_id, span)
-                                .with_message("the record type is still polymorphic here"),
-                        ])
+                        .with_labels(labels)
                         .with_notes(vec![
-                            format!("candidate records: {}", candidates.join(", ")),
+                            format!(
+                                "candidate records: {}",
+                                field_constraint.candidates.join(", ")
+                            ),
+                            format!(
+                                "receiver type at failure: `{}`",
+                                type_display(&field_constraint.record_ty)
+                            ),
                             "add a concrete record type constraint before using this value".into(),
                         ]),
                 ]
@@ -619,14 +669,43 @@ impl TypeError {
                         )]),
                 ]
             }
-            TypeError::UnboundVariable(name, precise_span) => vec![
-                Diagnostic::error()
-                    .with_message(format!("unbound variable `{name}`"))
-                    .with_labels(vec![
-                        Label::primary(file_id, precise_span.clone())
-                            .with_message(format!("`{name}` is not defined in this scope")),
-                    ]),
-            ],
+            TypeError::UnboundVariable(name, precise_span) => {
+                let mut notes = Vec::new();
+                if let Some((module, member)) = name.split_once('/') {
+                    if member
+                        .chars()
+                        .next()
+                        .map(|ch| ch.is_ascii_uppercase())
+                        .unwrap_or(false)
+                    {
+                        notes.push(format!(
+                            "hint: `{name}` looks like a qualified constructor. ensure `{module}` is imported and exports `{member}`"
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "hint: ensure module `{module}` is imported and exports `{member}`"
+                        ));
+                    }
+                } else if name
+                    .chars()
+                    .next()
+                    .map(|ch| ch.is_ascii_uppercase())
+                    .unwrap_or(false)
+                {
+                    notes.push(format!(
+                        "hint: `{name}` looks like a constructor. import its type/module or reference it as `module/{name}`"
+                    ));
+                }
+                vec![
+                    Diagnostic::error()
+                        .with_message(format!("unbound variable `{name}`"))
+                        .with_labels(vec![
+                            Label::primary(file_id, precise_span.clone())
+                                .with_message(format!("`{name}` is not defined in this scope")),
+                        ])
+                        .with_notes(notes),
+                ]
+            }
             TypeError::OccursCheck { occurs_check } => {
                 let OccursCheckTypeError {
                     var,

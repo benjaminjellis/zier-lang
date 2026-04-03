@@ -127,10 +127,15 @@ fn scheme_display_renders_qualified_types() {
 #[test]
 fn unsatisfied_field_constraint_diagnostic_renders_full_predicate() {
     let err = TypeError::UnsatisfiedFieldConstraint {
-        field: "selector".to_string(),
-        record_ty: Type::con("Initialised", vec![]),
-        field_ty: Type::bool(),
-        candidates: vec!["ContinuePayload".to_string()],
+        field_constraint: Box::new(super::core::FieldConstraintTypeError {
+            field: "selector".to_string(),
+            record_ty: Type::con("Initialised", vec![]),
+            field_ty: Type::bool(),
+            candidates: vec!["ContinuePayload".to_string()],
+            failure_span: None,
+            origin_span: None,
+            origin_message: None,
+        }),
     };
     let diags = err.to_diagnostics(0, 0..0);
     assert!(
@@ -1074,9 +1079,69 @@ fn call_reports_unsatisfied_hasfield_constraint() {
     assert!(
         matches!(
             err,
-            TypeError::UnsatisfiedFieldConstraint { ref field, .. } if field == "selector"
+            TypeError::UnsatisfiedFieldConstraint { ref field_constraint }
+                if field_constraint.field == "selector"
         ),
         "expected UnsatisfiedFieldConstraint for :selector, got {err:?}"
+    );
+}
+
+#[test]
+fn call_unsatisfied_hasfield_diagnostic_tracks_origin_and_receiver_type() {
+    let mut extra_env = TypeEnv::new();
+    let record_var = 13_001_u64;
+    let field_var = 13_002_u64;
+    extra_env.insert(
+        "get_selector".into(),
+        Scheme {
+            vars: vec![record_var, field_var],
+            preds: vec![Predicate::HasField {
+                label: "selector".to_string(),
+                record_ty: Rc::new(Type::Var(record_var)),
+                field_ty: Rc::new(Type::Var(field_var)),
+            }],
+            ty: Type::fun(
+                Rc::new(Type::Var(record_var)),
+                Rc::new(Type::Var(field_var)),
+            ),
+        },
+    );
+
+    let src = r#"
+            (type ContinuePayload [(:state ~ Int)])
+            (let main {} (get_selector (ContinuePayload :state 1)))
+        "#;
+    let err = check_with_env(src, extra_env).expect_err("expected unsatisfied HasField");
+    let diags = err.to_diagnostics(0, 0..0);
+
+    assert!(
+        diags[0].labels.iter().any(|label| label
+            .message
+            .contains("constraint introduced by `get_selector`")),
+        "expected origin label for HasField constraint, got labels: {:?}",
+        diags[0].labels
+    );
+    assert!(
+        diags[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("receiver type at failure")),
+        "expected receiver-type note, got notes: {:?}",
+        diags[0].notes
+    );
+}
+
+#[test]
+fn unbound_qualified_constructor_diagnostic_includes_hint() {
+    let err = TypeError::UnboundVariable("option/Some".into(), 0..11);
+    let diags = err.to_diagnostics(0, 0..11);
+    assert!(
+        diags[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("qualified constructor")),
+        "expected qualified-constructor hint, got notes: {:?}",
+        diags[0].notes
     );
 }
 

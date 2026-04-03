@@ -2001,6 +2001,24 @@ fn unused_local_analysis_ignores_underscore_and_shadowed_outer_usage() {
 }
 
 #[test]
+fn unused_local_analysis_ignores_underscore_prefixed_bindings() {
+    let src = "(let main {} (let [_ignored 1 still_used 2] still_used))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let unused: Vec<String> = warnings::unused_local_spans(&decls)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert!(unused.is_empty(), "unexpected unused locals: {unused:?}");
+}
+
+#[test]
 fn unused_local_analysis_marks_unused_match_pattern_bindings() {
     let src = "(let main {x} (match x y ~> 1))";
     let mut lowerer = lower::Lowerer::new();
@@ -2088,6 +2106,62 @@ fn compile_emits_unused_match_binding_warning() {
             .iter()
             .any(|m| m.contains("unused local binding `y`")),
         "missing unused match binding warning: {messages:?}"
+    );
+}
+
+#[test]
+fn compile_does_not_emit_unused_warning_for_underscore_prefixed_binding() {
+    let src = "(let main {} (let [_selector 1] 1))";
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: HashMap::new(),
+        module_exports: &HashMap::new(),
+        module_aliases: HashMap::new(),
+        imported_type_decls: &[],
+        debug_type_decls: &[],
+        imported_extern_types: &[],
+        imported_field_indices: &HashMap::new(),
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &HashMap::new(),
+        compile_target: CompileTarget::Dev,
+    });
+
+    let messages: Vec<String> = report.diagnostics.into_iter().map(|d| d.message).collect();
+    assert!(
+        !messages
+            .iter()
+            .any(|m| m.contains("unused local binding `_selector`")),
+        "unexpected underscore-prefixed unused warning: {messages:?}"
+    );
+}
+
+#[test]
+fn compile_emits_hardcoded_compiled_module_name_warning() {
+    let src = "(let main {} (debug \"p_tcp_selector\"))";
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: HashMap::new(),
+        module_exports: &HashMap::new(),
+        module_aliases: HashMap::new(),
+        imported_type_decls: &[],
+        debug_type_decls: &[],
+        imported_extern_types: &[],
+        imported_field_indices: &HashMap::new(),
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &HashMap::new(),
+        compile_target: CompileTarget::Dev,
+    });
+
+    let messages: Vec<String> = report.diagnostics.into_iter().map(|d| d.message).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("hardcoded compiled Erlang module name `p_tcp_selector`")),
+        "missing hardcoded module-name warning: {messages:?}"
     );
 }
 
