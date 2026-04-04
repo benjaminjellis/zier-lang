@@ -127,6 +127,24 @@ fn resolve_type_name(name: &str, aliases: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+fn plain_field_accessor_scheme(field_name: &str) -> Scheme {
+    // Use stable high IDs so these vars never collide with inference vars.
+    const FIELD_RECORD_VAR: u64 = u64::MAX - 16384;
+    const FIELD_VALUE_VAR: u64 = u64::MAX - 16385;
+
+    let record_ty = Rc::new(Type::Var(FIELD_RECORD_VAR));
+    let field_ty = Rc::new(Type::Var(FIELD_VALUE_VAR));
+    Scheme {
+        vars: vec![FIELD_RECORD_VAR, FIELD_VALUE_VAR],
+        preds: vec![Predicate::HasField {
+            label: field_name.to_string(),
+            record_ty: record_ty.clone(),
+            field_ty: field_ty.clone(),
+        }],
+        ty: Type::fun(record_ty, field_ty),
+    }
+}
+
 /// Build a `Type` from a `TypeSig`, replacing `Generic` names with `Var` IDs
 /// from the provided map.
 fn type_sig_with_vars(
@@ -242,10 +260,11 @@ pub fn constructor_schemes_with_aliases(
                 .map(|(p, &v)| (p.clone(), Rc::new(Type::Var(v))))
                 .collect();
 
-            // result_ty = Con(name, [Var(SCHEME_VAR_BASE), Var(SCHEME_VAR_BASE-1), ...])
+            // result_ty = Con(canonical_name, [Var(SCHEME_VAR_BASE), Var(SCHEME_VAR_BASE-1), ...])
+            let canonical_name = resolve_type_name(name, aliases);
             let result_ty_args: Vec<Rc<Type>> =
                 scheme_vars.iter().map(|&v| Rc::new(Type::Var(v))).collect();
-            let result_ty = Type::con(name, result_ty_args);
+            let result_ty = Type::con(canonical_name, result_ty_args);
 
             for (con_name, payloads) in constructors {
                 let ty = payloads.iter().rev().fold(result_ty.clone(), |acc, usage| {
@@ -279,10 +298,11 @@ pub fn constructor_schemes_with_aliases(
                 .map(|(p, &v)| (p.clone(), Rc::new(Type::Var(v))))
                 .collect();
 
-            // result_ty = Con(name, [Var(SCHEME_VAR_BASE), ...])
+            // result_ty = Con(canonical_name, [Var(SCHEME_VAR_BASE), ...])
+            let canonical_name = resolve_type_name(name, aliases);
             let result_ty_args: Vec<Rc<Type>> =
                 scheme_vars.iter().map(|&v| Rc::new(Type::Var(v))).collect();
-            let result_ty = Type::con(name, result_ty_args);
+            let result_ty = Type::con(canonical_name.clone(), result_ty_args);
 
             // Constructor function: name -> T_f1 -> T_f2 -> ... -> result_ty
             // Built by folding fields in reverse
@@ -313,9 +333,10 @@ pub fn constructor_schemes_with_aliases(
                 };
                 // Record-qualified accessor key avoids collisions when multiple
                 // records share a field name.
-                env.insert(record_accessor_key(name, field_name), scheme.clone());
-                // Keep the plain accessor key as a fallback for older call paths.
-                env.entry(format!(":{field_name}")).or_insert(scheme);
+                env.insert(record_accessor_key(&canonical_name, field_name), scheme);
+                // Plain field accessors are polymorphic and constrained by `HasField`.
+                env.entry(format!(":{field_name}"))
+                    .or_insert_with(|| plain_field_accessor_scheme(field_name));
             }
         }
     }

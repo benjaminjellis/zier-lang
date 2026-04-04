@@ -99,10 +99,27 @@ pub struct MismatchTypeError {
 }
 
 #[derive(Debug, Clone)]
+pub struct OccursCheckTypeError {
+    pub(super) var: u64,
+    pub(super) ty: Rc<Type>,
+    /// Precise source span of the offending sub-expression, if known.
+    pub(super) span: Option<std::ops::Range<usize>>,
+    /// Span of an earlier argument that first constrained the expected type, if known.
+    pub(super) prior_span: Option<std::ops::Range<usize>>,
+    /// Span that introduced a type expectation (for example, a constraining pattern).
+    pub(super) expected_from_span: Option<std::ops::Range<usize>>,
+    /// Human-readable reason for why the expected type was inferred.
+    pub(super) expected_from_message: Option<String>,
+    /// Name of the function being called, for call-site context.
+    pub(super) callee_name: Option<String>,
+    /// Source span of the callee expression, for a secondary label.
+    pub(super) callee_span: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Debug, Clone)]
 pub enum TypeError {
     OccursCheck {
-        var: u64,
-        ty: Rc<Type>,
+        occurs_check: Box<OccursCheckTypeError>,
     },
     Mismatch {
         mismatch: Box<MismatchTypeError>,
@@ -610,17 +627,64 @@ impl TypeError {
                             .with_message(format!("`{name}` is not defined in this scope")),
                     ]),
             ],
-            TypeError::OccursCheck { ty, .. } => vec![
-                Diagnostic::error()
-                    .with_message("infinite type")
-                    .with_labels(vec![Label::primary(file_id, span).with_message(format!(
-                        "this expression would have the infinite type `{}`",
-                        type_display(ty)
-                    ))])
-                    .with_notes(vec![
+            TypeError::OccursCheck { occurs_check } => {
+                let OccursCheckTypeError {
+                    var,
+                    ty,
+                    span: err_span,
+                    prior_span,
+                    expected_from_span,
+                    expected_from_message,
+                    callee_name,
+                    callee_span,
+                } = occurs_check.as_ref();
+                let label_span = err_span.clone().unwrap_or(span);
+                let mut labels = vec![Label::primary(file_id, label_span).with_message(format!(
+                    "this expression would have the infinite type `{}`",
+                    type_display(ty)
+                ))];
+                if let Some(ps) = prior_span.as_ref() {
+                    labels.push(
+                        Label::secondary(file_id, ps.clone())
+                            .with_message("inferred from a previous argument"),
+                    );
+                }
+                if let Some(ps) = expected_from_span.as_ref() {
+                    let msg = expected_from_message
+                        .clone()
+                        .unwrap_or_else(|| "constraint introduced here".to_string());
+                    labels.push(Label::secondary(file_id, ps.clone()).with_message(msg));
+                }
+                if let (Some(name), Some(cs)) = (callee_name.as_ref(), callee_span.as_ref()) {
+                    labels.push(
+                        Label::secondary(file_id, cs.clone())
+                            .with_message(format!("in call to `{name}`")),
+                    );
+                }
+
+                let mut var_names = std::collections::HashMap::new();
+                let var_s = type_display_inner(&Type::Var(*var), &mut var_names);
+                let ty_s = type_display_inner(ty, &mut var_names);
+                let mut notes = vec![format!(
+                    "this would require `{var_s}` to contain itself (`{var_s} = {ty_s}`)"
+                )];
+                if callee_name.is_some() {
+                    notes.push(
+                        "hint: this call creates a recursive type constraint between the callee and argument".into(),
+                    );
+                } else {
+                    notes.push(
                         "hint: this usually means a function is being applied to itself".into(),
-                    ]),
-            ],
+                    );
+                }
+
+                vec![
+                    Diagnostic::error()
+                        .with_message("infinite type")
+                        .with_labels(labels)
+                        .with_notes(notes),
+                ]
+            }
         }
     }
 }
@@ -951,8 +1015,16 @@ pub fn unify(t1: &Rc<Type>, t2: &Rc<Type>) -> Result<Substitution, TypeError> {
         (Type::Var(id), _) => {
             if free_vars(t2).contains(id) {
                 return Err(TypeError::OccursCheck {
-                    var: *id,
-                    ty: t2.clone(),
+                    occurs_check: Box::new(OccursCheckTypeError {
+                        var: *id,
+                        ty: t2.clone(),
+                        span: None,
+                        prior_span: None,
+                        expected_from_span: None,
+                        expected_from_message: None,
+                        callee_name: None,
+                        callee_span: None,
+                    }),
                 });
             }
             Ok(HashMap::from([(*id, t2.clone())]))

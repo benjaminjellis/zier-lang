@@ -1290,6 +1290,86 @@ fn infer_occurs_check() {
 }
 
 #[test]
+fn infer_occurs_check_in_call_carries_argument_span_and_callee_context() {
+    let src = "(let recur {x} (recur recur))";
+    let err = check(src).expect_err("expected infinite type error");
+    match err {
+        TypeError::OccursCheck { occurs_check } => {
+            let OccursCheckTypeError {
+                span: Some(span),
+                callee_name: Some(callee_name),
+                callee_span: Some(callee_span),
+                prior_span,
+                ..
+            } = *occurs_check
+            else {
+                panic!("expected occurs check with call context, got {occurs_check:?}");
+            };
+            assert_eq!(callee_name, "recur");
+            assert_eq!(&src[span.clone()], "recur");
+            assert_eq!(&src[callee_span.clone()], "recur");
+            assert!(
+                span.start > callee_span.start,
+                "expected argument span to come after callee span, got {span:?} and {callee_span:?}"
+            );
+            assert!(
+                prior_span.is_none(),
+                "unexpected prior span: {prior_span:?}"
+            );
+        }
+        other => panic!("expected occurs check with call context, got {other:?}"),
+    }
+}
+
+#[test]
+fn occurs_check_diagnostic_uses_embedded_span_and_call_labels() {
+    let err = TypeError::OccursCheck {
+        occurs_check: Box::new(OccursCheckTypeError {
+            var: 42,
+            ty: Type::con("Message", vec![Rc::new(Type::Var(42))]),
+            span: Some(8..9),
+            prior_span: Some(6..7),
+            expected_from_span: Some(2..5),
+            expected_from_message: Some("`Message 'a` inferred from this argument".into()),
+            callee_name: Some("start_pool".into()),
+            callee_span: Some(0..1),
+        }),
+    };
+    let diags = err.to_diagnostics(0, 50..60);
+    let diag = &diags[0];
+
+    let primary = diag
+        .labels
+        .iter()
+        .find(|label| {
+            matches!(
+                label.style,
+                codespan_reporting::diagnostic::LabelStyle::Primary
+            )
+        })
+        .expect("missing primary label");
+    assert_eq!(
+        primary.range,
+        8..9,
+        "occurs-check diagnostic should prefer embedded span"
+    );
+    assert!(
+        diag.labels
+            .iter()
+            .any(|label| label.message.contains("in call to `start_pool`")),
+        "expected callee context label, got labels: {:?}",
+        diag.labels
+    );
+    assert!(
+        diag.notes
+            .iter()
+            .any(|note| note.contains("recursive type constraint")),
+        "expected call-specific occurs-check hint, got notes: {:?}",
+        diag.notes
+    );
+}
+
+#[test]
 fn infer_higher_order_function() {
     // apply : (a -> b) -> a -> b applied to double
     let src = r#"

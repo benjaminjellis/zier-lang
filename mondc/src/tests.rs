@@ -317,6 +317,51 @@ fn record_constructor_type_mismatch_points_to_field_value() {
 }
 
 #[test]
+fn occurs_check_diagnostic_points_to_offending_call_argument() {
+    let src = "(let recur {x} (recur recur))";
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: HashMap::new(),
+        module_exports: &HashMap::new(),
+        module_aliases: HashMap::new(),
+        imported_type_decls: &[],
+        debug_type_decls: &[],
+        imported_extern_types: &[],
+        imported_field_indices: &HashMap::new(),
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &HashMap::new(),
+        compile_target: CompileTarget::Dev,
+    });
+    assert!(report.has_errors(), "expected type error");
+    let occurs = report
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("infinite type"))
+        .expect("missing infinite type diagnostic");
+    let primary = occurs
+        .labels
+        .iter()
+        .find(|label| {
+            matches!(
+                label.style,
+                codespan_reporting::diagnostic::LabelStyle::Primary
+            )
+        })
+        .expect("missing primary label");
+
+    let call_start = src.find("(recur recur)").expect("call start");
+    let expected_arg_start = call_start + "(recur ".len();
+    let expected_arg_end = expected_arg_start + "recur".len();
+    assert_eq!(
+        primary.range,
+        expected_arg_start..expected_arg_end,
+        "occurs-check primary label should highlight the argument in `(recur recur)`"
+    );
+}
+
+#[test]
 fn duplicate_variant_constructors_error() {
     let src = "(type LotsOVariants [One One Two (Three ~ Int)])";
     let result = compile_with_imports_api(CompileWithImportsInput {
@@ -694,6 +739,235 @@ fn qualified_only_use_keeps_record_updates_available() {
             .diagnostics
             .iter()
             .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_calls_keep_same_basename_record_types_distinct() {
+    let a_src = "(pub type Connection [(:id ~ Int)])\n\
+                 (pub let id {connection} (:id connection))\n\
+                 (pub let make {id} (Connection :id id))";
+    let b_src = "(pub type Connection [(:id ~ Int)])\n\
+                 (pub let make {id} (Connection :id id))";
+    let mods = vec![
+        ("a".to_string(), "mond_a".to_string(), a_src.to_string()),
+        ("b".to_string(), "mond_b".to_string(), b_src.to_string()),
+    ];
+    let analysis = crate::build_project_analysis(&mods, &[]).expect("analysis");
+    let src = "(use a)\n(use b)\n(let main {} (a/id (b/make 1)))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: resolved.imports,
+        module_exports: &analysis.module_exports,
+        module_aliases: resolved.module_aliases,
+        imported_type_decls: &resolved.imported_type_decls,
+        debug_type_decls: &resolved.imported_type_decls,
+        imported_extern_types: &resolved.imported_extern_types,
+        imported_field_indices: &resolved.imported_field_indices,
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &resolved.imported_schemes,
+        compile_target: CompileTarget::Dev,
+    });
+
+    assert!(
+        report.has_errors(),
+        "expected type mismatch between `a/Connection` and `b/Connection`"
+    );
+    let messages: Vec<String> = report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("type mismatch")),
+        "expected a type mismatch diagnostic, got: {messages:?}"
+    );
+}
+
+#[test]
+fn plain_field_accessor_value_is_polymorphic_across_imported_record_types() {
+    let a_src = "(pub type First [(:state ~ Int)])\n\
+                 (pub let make {} (First :state 1))";
+    let b_src = "(pub type Second [(:state ~ Int)])\n\
+                 (pub let make {} (Second :state 2))";
+    let mods = vec![
+        ("a".to_string(), "mond_a".to_string(), a_src.to_string()),
+        ("b".to_string(), "mond_b".to_string(), b_src.to_string()),
+    ];
+    let analysis = crate::build_project_analysis(&mods, &[]).expect("analysis");
+    let src = "(use a)\n\
+               (use b)\n\
+               (let read_state {item} (:state item))\n\
+               (let main {} (+ (read_state (a/make)) (read_state (b/make))))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: resolved.imports,
+        module_exports: &analysis.module_exports,
+        module_aliases: resolved.module_aliases,
+        imported_type_decls: &resolved.imported_type_decls,
+        debug_type_decls: &resolved.imported_type_decls,
+        imported_extern_types: &resolved.imported_extern_types,
+        imported_field_indices: &resolved.imported_field_indices,
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &resolved.imported_schemes,
+        compile_target: CompileTarget::Dev,
+    });
+
+    assert!(
+        !report.has_errors(),
+        "expected polymorphic `:state` accessor to work across records: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_imported_extern_type_is_consistent_across_module_functions() {
+    let process_src = "(pub extern type ['a] Name)\n\
+                       (pub extern let new_name ~ (String -> (Name 'a)) mond_process/new_name)";
+    let factory_src = "(use process [Name])\n\
+                       (pub extern type ['arg 'data] Message)\n\
+                       (pub type ['arg 'data] SupervisorRef [(NamedSupervisor ~ (Name (Message 'arg 'data)))])\n\
+                       (pub type ['arg 'data] Builder [(:name ~ (Name (Message 'arg 'data)))])\n\
+                       (pub let get_by_name {name} (NamedSupervisor name))\n\
+                       (pub let make_builder {name} (Builder :name name))\n\
+                       (pub let named {name builder} (with builder :name name))";
+    let listener_src = "(pub type Message [Ping])";
+    let handler_src = "(pub type ['a] Message [(Data ~ 'a)])";
+    let mods = vec![
+        (
+            "process".to_string(),
+            "mond_process".to_string(),
+            process_src.to_string(),
+        ),
+        (
+            "factory".to_string(),
+            "mond_factory".to_string(),
+            factory_src.to_string(),
+        ),
+        (
+            "listener".to_string(),
+            "mond_listener".to_string(),
+            listener_src.to_string(),
+        ),
+        (
+            "handler".to_string(),
+            "mond_handler".to_string(),
+            handler_src.to_string(),
+        ),
+    ];
+    let analysis = crate::build_project_analysis(&mods, &[]).expect("analysis");
+    let src = "(use process)\n\
+               (use factory)\n\
+               (use listener)\n\
+               (use handler)\n\
+               (let main {}\n\
+                 (let [name (process/new_name \"factory\")\n\
+                       builder (factory/make_builder name)\n\
+                       named_value (factory/named name builder)\n\
+                       supervisor_value (factory/get_by_name name)]\n\
+                   ()))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: resolved.imports,
+        module_exports: &analysis.module_exports,
+        module_aliases: resolved.module_aliases,
+        imported_type_decls: &resolved.imported_type_decls,
+        debug_type_decls: &resolved.imported_type_decls,
+        imported_extern_types: &resolved.imported_extern_types,
+        imported_field_indices: &resolved.imported_field_indices,
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &resolved.imported_schemes,
+        compile_target: CompileTarget::Dev,
+    });
+
+    assert!(
+        !report.has_errors(),
+        "expected `factory/Message` to stay consistent across imported functions: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_accessors_do_not_overfit_to_local_record_with_same_fields() {
+    let handler_src = "(pub type ['user_message] LoopMessage [(Packet ~ Int) (Custom ~ 'user_message)])\n\
+                       (pub type ['user_message] Connection [(:socket ~ Int) (:transport ~ Int)])\n\
+                       (pub type ['state 'user_message] Next [(Continue ~ 'state)])\n\
+                       (pub let socket_value {connection} (:socket connection))\n\
+                       (pub let transport_value {connection} (:transport connection))";
+    let acceptor_src = "(use handler [Connection Packet])\n\
+                        (pub let pool {loop_fn}\n\
+                          (loop_fn\n\
+                            0\n\
+                            (Packet 0)\n\
+                            (Connection :socket 1 :transport 2)))";
+    let mods = vec![
+        (
+            "handler".to_string(),
+            "mond_handler".to_string(),
+            handler_src.to_string(),
+        ),
+        (
+            "acceptor".to_string(),
+            "mond_acceptor".to_string(),
+            acceptor_src.to_string(),
+        ),
+    ];
+    let analysis = crate::build_project_analysis(&mods, &[]).expect("analysis");
+    let src = "(use handler)\n\
+               (use acceptor)\n\
+               (pub type ['user_message] Connection [(:socket ~ Int) (:transport ~ Int)])\n\
+               (let convert_loop {loop_fn}\n\
+                 (f {state msg conn} ->\n\
+                   (let [public_conn (Connection\n\
+                                       :socket (handler/socket_value conn)\n\
+                                       :transport (handler/transport_value conn))]\n\
+                     (loop_fn state msg public_conn))))\n\
+               (let start {loop_fn}\n\
+                 (acceptor/pool (convert_loop loop_fn)))";
+    let resolved = crate::resolve_imports_for_source(src, &analysis.module_exports, &analysis);
+    let report = compile_with_imports_report_api(CompileWithImportsInput {
+        module_name: "main",
+        source: src,
+        source_path: "main.mond",
+        imports: resolved.imports,
+        module_exports: &analysis.module_exports,
+        module_aliases: resolved.module_aliases,
+        imported_type_decls: &resolved.imported_type_decls,
+        debug_type_decls: &resolved.imported_type_decls,
+        imported_extern_types: &resolved.imported_extern_types,
+        imported_field_indices: &resolved.imported_field_indices,
+        imported_private_records: &HashMap::new(),
+        imported_schemes: &resolved.imported_schemes,
+        compile_target: CompileTarget::Dev,
+    });
+
+    assert!(
+        !report.has_errors(),
+        "expected qualified handler accessors to preserve `handler/Connection`: {:?}",
+        report
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
             .collect::<Vec<_>>()
     );
 }

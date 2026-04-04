@@ -24,6 +24,63 @@ fn mismatch_with_span(error: TypeError, span: std::ops::Range<usize>) -> TypeErr
     }
 }
 
+#[derive(Clone)]
+struct CallErrorContext {
+    span: std::ops::Range<usize>,
+    prior_span: Option<std::ops::Range<usize>>,
+    expected_from_span: Option<std::ops::Range<usize>>,
+    expected_from_message: Option<String>,
+    arg_ty: Option<Rc<Type>>,
+    expected_arg_ty: Option<Rc<Type>>,
+    callee_name: Option<String>,
+    callee_span: Option<std::ops::Range<usize>>,
+    callee_def: Option<(usize, std::ops::Range<usize>)>,
+    callee_ty: Option<Rc<Type>>,
+}
+
+fn call_error_with_context(error: TypeError, context: CallErrorContext) -> TypeError {
+    match error {
+        TypeError::Mismatch { mismatch } => {
+            let mismatch = *mismatch;
+            TypeError::Mismatch {
+                mismatch: MismatchTypeError {
+                    expected: mismatch.expected,
+                    found: mismatch.found,
+                    span: Some(context.span),
+                    prior_span: context.prior_span,
+                    expected_from_span: context.expected_from_span.or(mismatch.expected_from_span),
+                    expected_from_message: context
+                        .expected_from_message
+                        .or(mismatch.expected_from_message),
+                    arg_ty: context.arg_ty,
+                    expected_arg_ty: context.expected_arg_ty,
+                    callee_name: context.callee_name,
+                    callee_span: context.callee_span,
+                    callee_def: context.callee_def,
+                    callee_ty: context.callee_ty,
+                }
+                .into(),
+            }
+        }
+        TypeError::OccursCheck { occurs_check } => {
+            let occurs_check = *occurs_check;
+            TypeError::OccursCheck {
+                occurs_check: Box::new(OccursCheckTypeError {
+                    var: occurs_check.var,
+                    ty: occurs_check.ty,
+                    span: Some(context.span),
+                    prior_span: context.prior_span,
+                    expected_from_span: context.expected_from_span,
+                    expected_from_message: context.expected_from_message,
+                    callee_name: context.callee_name,
+                    callee_span: context.callee_span,
+                }),
+            }
+        }
+        other => other,
+    }
+}
+
 pub(super) fn record_accessor_key(record_name: &str, field_name: &str) -> String {
     format!(":{record_name}:{field_name}")
 }
@@ -34,7 +91,10 @@ fn lookup_record_accessor<'a>(
     field_name: &str,
 ) -> Option<&'a Scheme> {
     env.get(&record_accessor_key(record_name, field_name))
-        .or_else(|| env.get(&format!(":{field_name}")))
+}
+
+fn lookup_plain_field_accessor<'a>(env: &'a TypeEnv, field_name: &str) -> Option<&'a Scheme> {
+    env.get(&format!(":{field_name}"))
 }
 
 fn top_level_fun_arity(ty: &Rc<Type>) -> usize {
@@ -102,13 +162,15 @@ pub struct TypeChecker {
     field_instances: HashMap<String, Vec<String>>,
     /// Maps record type name -> number of type parameters.
     record_param_arity: HashMap<String, usize>,
+    /// Record type names declared in the current module (not imported).
+    local_record_types: HashSet<String>,
     /// Record type name -> module names where the record exists but is private.
     private_record_origins: HashMap<String, Vec<String>>,
     /// Maps value/function name → (file_id, definition span) for error reporting.
     value_def_spans: HashMap<String, (usize, std::ops::Range<usize>)>,
     /// Best-effort inferred types for expression spans, used by editor tooling.
     expr_types: Vec<(std::ops::Range<usize>, Rc<Type>)>,
-    /// Maps qualified type names (`module/Type`) to canonical local names (`Type`).
+    /// Maps imported unqualified names (`Type`) to canonical qualified names (`module/Type`).
     qualified_type_aliases: HashMap<String, String>,
 }
 
@@ -121,6 +183,7 @@ impl TypeChecker {
             record_fields: HashMap::new(),
             field_instances: HashMap::new(),
             record_param_arity: HashMap::new(),
+            local_record_types: HashSet::new(),
             private_record_origins: HashMap::new(),
             value_def_spans: HashMap::new(),
             expr_types: Vec::new(),
@@ -153,6 +216,7 @@ impl TypeChecker {
                         name.clone(),
                         fields.iter().map(|(field, _)| field.clone()).collect(),
                         params.len(),
+                        false,
                     );
                 }
             }
@@ -166,7 +230,16 @@ impl TypeChecker {
         self.private_record_origins = imported_private_records;
     }
 
-    fn register_record_type_info(&mut self, name: String, fields: Vec<String>, arity: usize) {
+    fn register_record_type_info(
+        &mut self,
+        name: String,
+        fields: Vec<String>,
+        arity: usize,
+        is_local: bool,
+    ) {
+        if is_local {
+            self.local_record_types.insert(name.clone());
+        }
         self.record_fields.insert(name.clone(), fields.clone());
         self.record_param_arity.insert(name.clone(), arity);
         for field in fields {
@@ -200,6 +273,42 @@ impl TypeChecker {
         }
         candidates.sort();
         candidates
+    }
+
+    fn type_contains_vars(ty: &Rc<Type>) -> bool {
+        match ty.as_ref() {
+            Type::Var(_) => true,
+            Type::Fun(arg, ret) => Self::type_contains_vars(arg) || Self::type_contains_vars(ret),
+            Type::Con(_, args) => args.iter().any(Self::type_contains_vars),
+        }
+    }
+
+    fn local_candidates_share_concrete_field_type(
+        &self,
+        env: &TypeEnv,
+        label: &str,
+        local_candidates: &[String],
+    ) -> bool {
+        let mut expected_field_ty: Option<Rc<Type>> = None;
+        for record_name in local_candidates {
+            let Some(accessor_scheme) = lookup_record_accessor(env, record_name, label) else {
+                return false;
+            };
+            let Type::Fun(_, field_ty) = accessor_scheme.ty.as_ref() else {
+                return false;
+            };
+            if Self::type_contains_vars(field_ty) {
+                return false;
+            }
+            if let Some(expected) = &expected_field_ty {
+                if expected.as_ref() != field_ty.as_ref() {
+                    return false;
+                }
+            } else {
+                expected_field_ty = Some(field_ty.clone());
+            }
+        }
+        expected_field_ty.is_some()
     }
 
     fn inaccessible_private_record_modules(&self, record_ty: &Rc<Type>) -> Option<Vec<String>> {
@@ -251,95 +360,124 @@ impl TypeChecker {
         preds: &[Predicate],
     ) -> Result<(Substitution, Vec<Predicate>), TypeError> {
         let mut subst = HashMap::new();
-        let mut residual = vec![];
+        let mut pending: Vec<Predicate> = preds.to_vec();
 
-        for pred in preds {
-            let pred = apply_subst_predicate(&subst, pred);
-            match pred {
-                Predicate::HasField {
-                    label,
-                    record_ty,
-                    field_ty,
-                } => {
-                    let candidates = self.field_instance_candidates_with_env(env, &label);
-                    match record_ty.as_ref() {
-                        Type::Con(record_name, _) => {
-                            let s = self
-                                .solve_has_field_against_record(
-                                    env,
-                                    &label,
-                                    record_name,
-                                    &record_ty,
-                                    &field_ty,
-                                )
-                                .map_err(|_| TypeError::UnsatisfiedFieldConstraint {
-                                    field: label,
-                                    record_ty: record_ty.clone(),
-                                    field_ty: field_ty.clone(),
-                                    candidates: candidates.clone(),
-                                })?;
-                            subst = compose_subst(&s, &subst);
-                            residual = apply_subst_preds(&s, &residual);
+        loop {
+            let mut progressed = false;
+            let mut residual = vec![];
+            let mut record_var_occurrences: HashMap<u64, usize> = HashMap::new();
+
+            for pred in &pending {
+                let pred = apply_subst_predicate(&subst, pred);
+                match pred {
+                    Predicate::HasField { record_ty, .. } => {
+                        if let Type::Var(id) = record_ty.as_ref() {
+                            *record_var_occurrences.entry(*id).or_insert(0) += 1;
                         }
-                        Type::Fun(_, _) => {
-                            return Err(TypeError::UnsatisfiedFieldConstraint {
-                                field: label,
-                                record_ty,
-                                field_ty,
-                                candidates,
-                            });
-                        }
-                        Type::Var(_) => match candidates.as_slice() {
-                            [] => {
-                                let accessor_name = format!(":{label}");
-                                let Some(accessor_scheme) = env.get(&accessor_name) else {
-                                    return Err(TypeError::UnsatisfiedFieldConstraint {
-                                        field: label,
-                                        record_ty,
-                                        field_ty,
-                                        candidates,
-                                    });
-                                };
-                                let accessor_ty = self.instantiate(accessor_scheme);
-                                match accessor_ty.as_ref() {
-                                    Type::Fun(accessor_record_ty, accessor_field_ty) => {
-                                        let s1 = unify(accessor_record_ty, &record_ty)?;
-                                        let s2 = unify(
-                                            &apply_subst(&s1, accessor_field_ty),
-                                            &apply_subst(&s1, &field_ty),
-                                        )?;
-                                        let s = compose_subst(&s2, &s1);
-                                        subst = compose_subst(&s, &subst);
-                                        residual = apply_subst_preds(&s, &residual);
-                                    }
-                                    _ => unreachable!("record accessor must be a unary function"),
-                                }
-                            }
-                            [record_name] => {
-                                let s = self.solve_has_field_against_record(
-                                    env,
-                                    &label,
-                                    record_name,
-                                    &record_ty,
-                                    &field_ty,
-                                )?;
-                                subst = compose_subst(&s, &subst);
-                                residual = apply_subst_preds(&s, &residual);
-                            }
-                            _ => {
-                                residual.push(Predicate::HasField {
-                                    label,
-                                    record_ty,
-                                    field_ty,
-                                });
-                            }
-                        },
                     }
                 }
             }
-        }
 
-        Ok((subst, residual))
+            for pred in &pending {
+                let pred = apply_subst_predicate(&subst, pred);
+                match pred {
+                    Predicate::HasField {
+                        label,
+                        record_ty,
+                        field_ty,
+                    } => {
+                        let candidates = self.field_instance_candidates_with_env(env, &label);
+                        match record_ty.as_ref() {
+                            Type::Con(record_name, _) => {
+                                let s = self
+                                    .solve_has_field_against_record(
+                                        env,
+                                        &label,
+                                        record_name,
+                                        &record_ty,
+                                        &field_ty,
+                                    )
+                                    .map_err(|_| TypeError::UnsatisfiedFieldConstraint {
+                                        field: label,
+                                        record_ty: record_ty.clone(),
+                                        field_ty: field_ty.clone(),
+                                        candidates: candidates.clone(),
+                                    })?;
+                                subst = compose_subst(&s, &subst);
+                                progressed = true;
+                            }
+                            Type::Fun(_, _) => {
+                                return Err(TypeError::UnsatisfiedFieldConstraint {
+                                    field: label,
+                                    record_ty,
+                                    field_ty,
+                                    candidates,
+                                });
+                            }
+                            Type::Var(record_id) => {
+                                let local_candidates: Vec<String> = candidates
+                                    .iter()
+                                    .filter(|name| self.local_record_types.contains(name.as_str()))
+                                    .cloned()
+                                    .collect();
+                                let appears_once = record_var_occurrences
+                                    .get(record_id)
+                                    .copied()
+                                    .unwrap_or_default()
+                                    == 1;
+
+                                let explicit_record_name = if candidates.len() == 1 {
+                                    candidates.first().cloned()
+                                } else if local_candidates.len() == 1 && appears_once {
+                                    local_candidates.first().cloned()
+                                } else {
+                                    None
+                                };
+
+                                let fallback_record_name = if explicit_record_name.is_none()
+                                    && appears_once
+                                    && !local_candidates.is_empty()
+                                    && local_candidates.len() == candidates.len()
+                                    && self.local_candidates_share_concrete_field_type(
+                                        env,
+                                        &label,
+                                        &local_candidates,
+                                    ) {
+                                    local_candidates.first().cloned()
+                                } else {
+                                    None
+                                };
+
+                                if let Some(record_name) =
+                                    explicit_record_name.or(fallback_record_name)
+                                {
+                                    let s = self.solve_has_field_against_record(
+                                        env,
+                                        &label,
+                                        &record_name,
+                                        &record_ty,
+                                        &field_ty,
+                                    )?;
+                                    subst = compose_subst(&s, &subst);
+                                    progressed = true;
+                                } else {
+                                    residual.push(Predicate::HasField {
+                                        label,
+                                        record_ty,
+                                        field_ty,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !progressed {
+                return Ok((subst, residual));
+            }
+            pending = residual;
+        }
     }
 
     fn unresolved_predicate_error(&self, pred: &Predicate) -> TypeError {
@@ -723,28 +861,24 @@ impl TypeChecker {
                 // Enforce this in the type checker so calling a non-function is caught.
                 if args.is_empty() {
                     let ret = self.fresh();
-                    let s_unify = unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(
-                        |e| match e {
-                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
-                                mismatch: MismatchTypeError {
-                                    expected: mismatch.expected,
-                                    found: mismatch.found,
-                                    span: Some(span.clone()),
+                    let s_unify =
+                        unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(|e| {
+                            call_error_with_context(
+                                e,
+                                CallErrorContext {
+                                    span: span.clone(),
                                     prior_span: None,
-                                    expected_from_span: mismatch.expected_from_span,
-                                    expected_from_message: mismatch.expected_from_message,
+                                    expected_from_span: None,
+                                    expected_from_message: None,
                                     arg_ty: None,
                                     expected_arg_ty: None,
                                     callee_name: callee_name.clone(),
                                     callee_span: callee_span.clone(),
                                     callee_def: callee_def.clone(),
                                     callee_ty: callee_ty.clone(),
-                                }
-                                .into(),
-                            },
-                            other => other,
-                        },
-                    )?;
+                                },
+                            )
+                        })?;
                     subst = compose_subst(&s_unify, &subst);
                     preds = apply_subst_preds(&s_unify, &preds);
                     let (s_pred, solved_preds) =
@@ -772,33 +906,28 @@ impl TypeChecker {
                     } else {
                         None
                     };
-                    let callee = callee_name.clone();
-                    let cs = callee_span.clone();
-                    let s_unify =
-                        unify(&t_func, &Type::fun(t_arg, ret.clone())).map_err(|e| match e {
-                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
-                                mismatch: MismatchTypeError {
-                                    expected: mismatch.expected,
-                                    found: mismatch.found,
-                                    span: Some(arg.span()),
-                                    prior_span: prior,
-                                    expected_from_span: mismatch.expected_from_span,
-                                    expected_from_message: mismatch.expected_from_message,
-                                    arg_ty: Some(t_arg_for_err),
-                                    expected_arg_ty: expected_arg_for_err,
-                                    callee_name: callee,
-                                    callee_span: cs,
-                                    callee_def: callee_def.clone(),
-                                    callee_ty: callee_ty.clone(),
-                                }
-                                .into(),
+                    let arg_span = arg.span();
+                    let s_unify = unify(&t_func, &Type::fun(t_arg, ret.clone())).map_err(|e| {
+                        call_error_with_context(
+                            e,
+                            CallErrorContext {
+                                span: arg_span.clone(),
+                                prior_span: prior,
+                                expected_from_span: None,
+                                expected_from_message: None,
+                                arg_ty: Some(t_arg_for_err),
+                                expected_arg_ty: expected_arg_for_err,
+                                callee_name: callee_name.clone(),
+                                callee_span: callee_span.clone(),
+                                callee_def: callee_def.clone(),
+                                callee_ty: callee_ty.clone(),
                             },
-                            other => other,
-                        })?;
+                        )
+                    })?;
                     subst = compose_subst(&s_unify, &subst);
                     preds = apply_subst_preds(&s_unify, &preds);
                     t_func = apply_subst(&subst, &ret);
-                    prev_span = Some(arg.span());
+                    prev_span = Some(arg_span);
                 }
                 let (s_pred, solved_preds) =
                     self.solve_predicates(&apply_subst_env(&subst, env), &preds)?;
@@ -1025,7 +1154,7 @@ impl TypeChecker {
                         if has_local_layout {
                             None
                         } else {
-                            env.get(&format!(":{field}"))
+                            lookup_plain_field_accessor(env, field)
                         }
                     });
                     if let Some(scheme) = scheme {
@@ -1303,8 +1432,19 @@ impl TypeChecker {
                             }
                         })
                         .collect();
-                    if candidates.len() == 1 {
-                        let (record_name, layout, arity) = candidates.pop().expect("checked len");
+                    let mut local_candidates: Vec<(String, Vec<String>, usize)> = candidates
+                        .iter()
+                        .filter(|(name, _, _)| self.local_record_types.contains(name))
+                        .cloned()
+                        .collect();
+                    let selected = if local_candidates.len() == 1 {
+                        local_candidates.pop()
+                    } else if candidates.len() == 1 {
+                        candidates.pop()
+                    } else {
+                        None
+                    };
+                    if let Some((record_name, layout, arity)) = selected {
                         let input_args: Vec<Rc<Type>> = (0..arity).map(|_| self.fresh()).collect();
                         let inferred_input = Type::con(record_name.clone(), input_args);
                         let s_infer = unify(&apply_subst(&subst, &t_record), &inferred_input)?;
@@ -1476,28 +1616,24 @@ impl TypeChecker {
                 let mut prev_span: Option<std::ops::Range<usize>> = None;
                 if args.is_empty() {
                     let ret = self.fresh();
-                    let s_unify = unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(
-                        |e| match e {
-                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
-                                mismatch: MismatchTypeError {
-                                    expected: mismatch.expected,
-                                    found: mismatch.found,
-                                    span: Some(span.clone()),
+                    let s_unify =
+                        unify(&t_func, &Type::fun(Type::unit(), ret.clone())).map_err(|e| {
+                            call_error_with_context(
+                                e,
+                                CallErrorContext {
+                                    span: span.clone(),
                                     prior_span: None,
-                                    expected_from_span: mismatch.expected_from_span,
-                                    expected_from_message: mismatch.expected_from_message,
+                                    expected_from_span: None,
+                                    expected_from_message: None,
                                     arg_ty: None,
                                     expected_arg_ty: None,
                                     callee_name: Some(callee_name.clone()),
                                     callee_span: Some(fn_span.clone()),
                                     callee_def: None,
                                     callee_ty: None,
-                                }
-                                .into(),
-                            },
-                            other => other,
-                        },
-                    )?;
+                                },
+                            )
+                        })?;
                     subst = compose_subst(&s_unify, &subst);
                     preds = apply_subst_preds(&s_unify, &preds);
                     let (s_pred, solved_preds) =
@@ -1524,30 +1660,27 @@ impl TypeChecker {
                     } else {
                         None
                     };
-                    let s_unify =
-                        unify(&t_func, &Type::fun(t_arg, ret.clone())).map_err(|e| match e {
-                            TypeError::Mismatch { mismatch } => TypeError::Mismatch {
-                                mismatch: MismatchTypeError {
-                                    expected: mismatch.expected,
-                                    found: mismatch.found,
-                                    span: Some(arg.span()),
-                                    prior_span: prior,
-                                    expected_from_span: mismatch.expected_from_span,
-                                    expected_from_message: mismatch.expected_from_message,
-                                    arg_ty: Some(t_arg_for_err),
-                                    expected_arg_ty: expected_arg_for_err,
-                                    callee_name: Some(callee_name.clone()),
-                                    callee_span: Some(fn_span.clone()),
-                                    callee_def: None,
-                                    callee_ty: None,
-                                }
-                                .into(),
+                    let arg_span = arg.span();
+                    let s_unify = unify(&t_func, &Type::fun(t_arg, ret.clone())).map_err(|e| {
+                        call_error_with_context(
+                            e,
+                            CallErrorContext {
+                                span: arg_span.clone(),
+                                prior_span: prior,
+                                expected_from_span: None,
+                                expected_from_message: None,
+                                arg_ty: Some(t_arg_for_err),
+                                expected_arg_ty: expected_arg_for_err,
+                                callee_name: Some(callee_name.clone()),
+                                callee_span: Some(fn_span.clone()),
+                                callee_def: None,
+                                callee_ty: None,
                             },
-                            other => other,
-                        })?;
+                        )
+                    })?;
                     subst = compose_subst(&s_unify, &subst);
                     preds = apply_subst_preds(&s_unify, &preds);
-                    prev_span = Some(arg.span());
+                    prev_span = Some(arg_span);
                     t_func = apply_subst(&subst, &ret);
                 }
                 let (s_pred, solved_preds) =
@@ -1797,6 +1930,20 @@ impl TypeChecker {
         use crate::ast::{Declaration, Expr};
 
         let mut last_ty = Type::unit();
+        let local_type_names: HashSet<String> = decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Declaration::Type(crate::ast::TypeDecl::Record { name, .. })
+                | Declaration::Type(crate::ast::TypeDecl::Variant { name, .. }) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut aliases_without_local_types = self.qualified_type_aliases.clone();
+        for type_name in &local_type_names {
+            aliases_without_local_types.remove(type_name);
+        }
 
         let mut top_level_let_decl_indices = Vec::new();
         let mut inferred_top_level_raw_by_decl: HashMap<usize, Rc<Type>> = HashMap::new();
@@ -1830,10 +1977,11 @@ impl TypeChecker {
                             name.clone(),
                             fields.iter().map(|(field, _)| field.clone()).collect(),
                             params.len(),
+                            true,
                         );
                     }
                     for (name, scheme) in
-                        constructor_schemes_with_aliases(type_decl, &self.qualified_type_aliases)
+                        constructor_schemes_with_aliases(type_decl, &aliases_without_local_types)
                     {
                         // Plain field accessor keys (e.g. `:state`) are overloaded
                         // across records. Preserve first declaration order rather than
@@ -1853,7 +2001,7 @@ impl TypeChecker {
                     ty,
                     ..
                 } => {
-                    let mut scheme = type_sig_to_scheme(ty, &self.qualified_type_aliases);
+                    let mut scheme = type_sig_to_scheme(ty, &aliases_without_local_types);
                     if *is_nullary {
                         // Nullary externs are declared as Unit -> ReturnType in source and
                         // lowered to a 0-arity function internally, so wrap back here.
@@ -2001,10 +2149,10 @@ impl TypeChecker {
                 Declaration::Test { name, body, span } => {
                     // Result is ['a 'e] — ok first, error second
                     // test bodies must return Result Unit String (Ok=Unit, Error=String)
-                    let expected = Rc::new(Type::Con(
-                        "Result".into(),
-                        vec![Type::unit(), Type::string()],
-                    ));
+                    let result_type_name = aliases_without_local_types
+                        .get("Result")
+                        .cloned()
+                        .unwrap_or_else(|| "Result".to_string());
                     match self.infer(env, body) {
                         Ok((s, ty, preds)) => {
                             self.apply_expr_type_subst(&s);
@@ -2023,6 +2171,22 @@ impl TypeChecker {
                                 )));
                             }
                             let ty = apply_subst(&s_pred, &apply_subst(&s, &ty));
+                            let expected_result_name = match ty.as_ref() {
+                                Type::Con(name, _) if name == "Result" => name.clone(),
+                                Type::Con(name, _)
+                                    if name
+                                        .rsplit_once('/')
+                                        .map(|(_, local)| local == "Result")
+                                        .unwrap_or(false) =>
+                                {
+                                    name.clone()
+                                }
+                                _ => result_type_name.clone(),
+                            };
+                            let expected = Rc::new(Type::Con(
+                                expected_result_name,
+                                vec![Type::unit(), Type::string()],
+                            ));
                             if let Err(e) = unify(&ty, &expected) {
                                 return Err(Box::new((e, *body.clone())));
                             }

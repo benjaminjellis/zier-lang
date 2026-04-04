@@ -58,9 +58,37 @@ fn type_decl_name(type_decl: &crate::ast::TypeDecl) -> &str {
     }
 }
 
+fn rewrite_type_usage_with_aliases(
+    usage: &crate::ast::TypeUsage,
+    aliases: &HashMap<String, String>,
+) -> crate::ast::TypeUsage {
+    match usage {
+        crate::ast::TypeUsage::Named(name, span) => crate::ast::TypeUsage::Named(
+            aliases.get(name).cloned().unwrap_or_else(|| name.clone()),
+            span.clone(),
+        ),
+        crate::ast::TypeUsage::Generic(name, span) => {
+            crate::ast::TypeUsage::Generic(name.clone(), span.clone())
+        }
+        crate::ast::TypeUsage::App(head, args, span) => crate::ast::TypeUsage::App(
+            aliases.get(head).cloned().unwrap_or_else(|| head.clone()),
+            args.iter()
+                .map(|arg| rewrite_type_usage_with_aliases(arg, aliases))
+                .collect(),
+            span.clone(),
+        ),
+        crate::ast::TypeUsage::Fun(arg, ret, span) => crate::ast::TypeUsage::Fun(
+            Box::new(rewrite_type_usage_with_aliases(arg, aliases)),
+            Box::new(rewrite_type_usage_with_aliases(ret, aliases)),
+            span.clone(),
+        ),
+    }
+}
+
 fn clone_type_decl_with_name(
     type_decl: &crate::ast::TypeDecl,
     name: String,
+    aliases: &HashMap<String, String>,
 ) -> crate::ast::TypeDecl {
     match type_decl {
         crate::ast::TypeDecl::Record {
@@ -73,7 +101,15 @@ fn clone_type_decl_with_name(
             is_pub: *is_pub,
             name,
             params: params.clone(),
-            fields: fields.clone(),
+            fields: fields
+                .iter()
+                .map(|(field_name, field_ty)| {
+                    (
+                        field_name.clone(),
+                        rewrite_type_usage_with_aliases(field_ty, aliases),
+                    )
+                })
+                .collect(),
             span: span.clone(),
         },
         crate::ast::TypeDecl::Variant {
@@ -86,10 +122,46 @@ fn clone_type_decl_with_name(
             is_pub: *is_pub,
             name,
             params: params.clone(),
-            constructors: constructors.clone(),
+            constructors: constructors
+                .iter()
+                .map(|(constructor_name, payloads)| {
+                    (
+                        constructor_name.clone(),
+                        payloads
+                            .iter()
+                            .map(|payload| rewrite_type_usage_with_aliases(payload, aliases))
+                            .collect(),
+                    )
+                })
+                .collect(),
             span: span.clone(),
         },
     }
+}
+
+fn module_type_aliases(
+    module_name: &str,
+    module_type_decls: &HashMap<String, Vec<crate::ast::TypeDecl>>,
+    module_extern_types: &HashMap<String, Vec<crate::ast::ExternTypeInfo>>,
+) -> HashMap<String, String> {
+    let mut aliases: HashMap<String, String> = module_type_decls
+        .get(module_name)
+        .into_iter()
+        .flat_map(|type_decls| type_decls.iter())
+        .map(|type_decl| {
+            let type_name = type_decl_name(type_decl).to_string();
+            (type_name.clone(), format!("{module_name}/{type_name}"))
+        })
+        .collect();
+    if let Some(extern_types) = module_extern_types.get(module_name) {
+        for extern_type in extern_types {
+            aliases.insert(
+                extern_type.name.clone(),
+                format!("{module_name}/{}", extern_type.name),
+            );
+        }
+    }
+    aliases
 }
 
 fn collect_type_names_in_type(ty: &crate::typecheck::Type, out: &mut HashSet<String>) {
@@ -255,6 +327,8 @@ pub fn build_project_analysis_with_modules_and_package(
             &imports.imported_extern_types,
             &imports.imported_schemes,
         );
+        let aliases = module_type_aliases(user_name, &module_type_decls, &module_extern_types);
+        let schemes = crate::typecheck::normalize_env_type_aliases(&schemes, &aliases);
         all_module_schemes.insert(user_name.clone(), schemes);
     }
 
@@ -282,6 +356,8 @@ pub fn build_project_analysis_with_modules_and_package(
             &imports.imported_extern_types,
             &imports.imported_schemes,
         );
+        let aliases = module_type_aliases(module_name, &module_type_decls, &module_extern_types);
+        let schemes = crate::typecheck::normalize_env_type_aliases(&schemes, &aliases);
         all_module_schemes.insert(module_name.clone(), schemes);
     }
 
@@ -480,15 +556,40 @@ pub fn resolve_imports_for_source(
                 .and_then(|alias_target| project.all_module_schemes.get(alias_target))
         });
         if let Some(mod_schemes) = mod_schemes {
+            let module_type_aliases_for_schemes = module_type_aliases(
+                &mod_name,
+                &project.module_type_decls,
+                &project.module_extern_types,
+            );
             for (fn_name, scheme) in mod_schemes {
+                let scheme = crate::typecheck::normalize_scheme_type_aliases(
+                    scheme,
+                    &module_type_aliases_for_schemes,
+                );
                 if unqualified.includes(fn_name) {
                     imported_schemes.insert(fn_name.clone(), scheme.clone());
                 }
-                imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme.clone());
+                imported_schemes.insert(format!("{mod_name}/{fn_name}"), scheme);
             }
         }
 
         if let Some(type_decls) = project.module_type_decls.get(&mod_name) {
+            let mut qualified_type_aliases_for_module: HashMap<String, String> = type_decls
+                .iter()
+                .map(|type_decl| {
+                    let type_name = type_decl_name(type_decl).to_string();
+                    (type_name.clone(), format!("{mod_name}/{type_name}"))
+                })
+                .collect();
+            if let Some(extern_types) = project.module_extern_types.get(&mod_name) {
+                for extern_type in extern_types {
+                    qualified_type_aliases_for_module.insert(
+                        extern_type.name.clone(),
+                        format!("{mod_name}/{}", extern_type.name),
+                    );
+                }
+            }
+
             // Always add qualified type aliases (module/TypeName) for modules in scope.
             for type_decl in type_decls {
                 let type_name = type_decl_name(type_decl).to_string();
@@ -496,19 +597,13 @@ pub fn resolve_imports_for_source(
                     imported_type_decls.push(clone_type_decl_with_name(
                         type_decl,
                         format!("{mod_name}/{type_name}"),
+                        &qualified_type_aliases_for_module,
                     ));
                 }
             }
 
             // Qualified constructors should be available whenever the module is in scope,
             // even if types are not imported unqualified.
-            let qualified_type_aliases_for_module: HashMap<String, String> = type_decls
-                .iter()
-                .map(|type_decl| {
-                    let type_name = type_decl_name(type_decl).to_string();
-                    (format!("{mod_name}/{type_name}"), type_name)
-                })
-                .collect();
             for type_decl in type_decls {
                 let constructor_schemes = crate::typecheck::constructor_schemes_with_aliases(
                     type_decl,
@@ -528,18 +623,28 @@ pub fn resolve_imports_for_source(
             // referenced, even if constructors require explicit unqualified type import.
             for type_decl in type_decls {
                 if matches!(type_decl, crate::ast::TypeDecl::Record { .. }) {
-                    let accessor_schemes = crate::typecheck::constructor_schemes(type_decl);
+                    let accessor_schemes = crate::typecheck::constructor_schemes_with_aliases(
+                        type_decl,
+                        &qualified_type_aliases_for_module,
+                    );
                     for (name, scheme) in accessor_schemes {
-                        if name.starts_with(':') {
+                        if !name.starts_with(':') {
+                            continue;
+                        }
+                        if name[1..].contains(':') {
                             imported_schemes.insert(name, scheme);
+                        } else {
+                            imported_schemes.entry(name).or_insert(scheme);
                         }
                     }
                     if let crate::ast::TypeDecl::Record { fields, .. } = type_decl {
+                        let local_name = type_decl_name(type_decl).to_string();
+                        let qualified_name = format!("{mod_name}/{local_name}");
                         for (i, (field_name, _)) in fields.iter().enumerate() {
-                            imported_field_indices.insert(
-                                (type_decl_name(type_decl).to_string(), field_name.clone()),
-                                i + 2,
-                            );
+                            imported_field_indices
+                                .insert((local_name.clone(), field_name.clone()), i + 2);
+                            imported_field_indices
+                                .insert((qualified_name.clone(), field_name.clone()), i + 2);
                         }
                     }
                 }
@@ -572,12 +677,28 @@ pub fn resolve_imports_for_source(
         }
 
         if let Some(type_decls) = project.module_all_type_decls.get(&mod_name) {
+            let mut qualified_type_aliases_for_module: HashMap<String, String> = type_decls
+                .iter()
+                .map(|type_decl| {
+                    let type_name = type_decl_name(type_decl).to_string();
+                    (type_name.clone(), format!("{mod_name}/{type_name}"))
+                })
+                .collect();
+            if let Some(extern_types) = project.module_extern_types.get(&mod_name) {
+                for extern_type in extern_types {
+                    qualified_type_aliases_for_module.insert(
+                        extern_type.name.clone(),
+                        format!("{mod_name}/{}", extern_type.name),
+                    );
+                }
+            }
             for type_decl in type_decls {
                 let type_name = type_decl_name(type_decl).to_string();
                 if imported_debug_type_keys.insert((mod_name.clone(), type_name.clone())) {
                     debug_type_decls.push(clone_type_decl_with_name(
                         type_decl,
                         format!("{mod_name}/{type_name}"),
+                        &qualified_type_aliases_for_module,
                     ));
                 }
             }
@@ -650,9 +771,15 @@ pub fn resolve_imports_for_source(
         };
         let local_name = type_decl_name(&type_decl).to_string();
         if imported_debug_type_keys.insert((module_name.clone(), local_name.clone())) {
+            let aliases = module_type_aliases(
+                &module_name,
+                &project.module_type_decls,
+                &project.module_extern_types,
+            );
             debug_type_decls.push(clone_type_decl_with_name(
                 &type_decl,
                 format!("{module_name}/{local_name}"),
+                &aliases,
             ));
         }
     }
@@ -1185,6 +1312,58 @@ mod tests {
     }
 
     #[test]
+    fn resolve_imports_qualifies_extern_types_consistently_across_schemes() {
+        let modules = vec![
+            (
+                "process".to_string(),
+                "mond_process".to_string(),
+                "(pub extern type ['a] Name)\n\
+                 (pub extern let new_name ~ (String -> (Name 'a)) mond_process/new_name)"
+                    .to_string(),
+            ),
+            (
+                "factory".to_string(),
+                "mond_factory".to_string(),
+                "(use process [Name])\n\
+                 (pub extern type ['arg 'data] Message)\n\
+                 (pub type ['arg 'data] SupervisorRef [(NamedSupervisor ~ (Name (Message 'arg 'data)))])\n\
+                 (pub type ['arg 'data] Builder [(:name ~ (Name (Message 'arg 'data)))])\n\
+                 (pub let named {name builder} (with builder :name name))\n\
+                 (pub let get_by_name {name} (NamedSupervisor name))"
+                    .to_string(),
+            ),
+            (
+                "other".to_string(),
+                "mond_other".to_string(),
+                "(pub type Message [Only])".to_string(),
+            ),
+        ];
+        let analysis = build_project_analysis(&modules, &[]).expect("analysis");
+        let source = "(use process)\n(use factory)\n(use other)\n(let main {} ())";
+        let resolved = resolve_imports_for_source(source, &analysis.module_exports, &analysis);
+
+        let named = resolved
+            .imported_schemes
+            .get("factory/named")
+            .expect("factory/named scheme");
+        let get_by_name = resolved
+            .imported_schemes
+            .get("factory/get_by_name")
+            .expect("factory/get_by_name scheme");
+        let named_s = crate::typecheck::scheme_display(named);
+        let get_by_name_s = crate::typecheck::scheme_display(get_by_name);
+
+        assert!(
+            named_s.contains("factory/Message"),
+            "expected `factory/named` to use qualified Message, got: {named_s}"
+        );
+        assert!(
+            get_by_name_s.contains("factory/Message"),
+            "expected `factory/get_by_name` to use qualified Message, got: {get_by_name_s}"
+        );
+    }
+
+    #[test]
     fn build_project_analysis_with_package_infers_precise_types_for_package_imports() {
         let src_modules = vec![
             (
@@ -1212,7 +1391,7 @@ mod tests {
         let parse_scheme = cookie_schemes.get("parse").expect("parse scheme");
         assert_eq!(
             crate::typecheck::scheme_display(parse_scheme),
-            "String -> List Header"
+            "String -> List time/Header"
         );
     }
 
