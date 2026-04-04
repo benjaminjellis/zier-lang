@@ -241,6 +241,14 @@ fn match_arm_wrapped_call_aligns_after_arrow() {
     assert_eq!(out, expected);
 }
 
+#[test]
+fn match_in_let_binding_hangs_under_match_head() {
+    let src = "(let receive_message {self} (let [base_selector (match (:mode self) Suspended ~> (process/new_selector) Running ~> (|> (process/new_selector) (process/select_other Unexpected) (process/merge_selector (:selector self)))) selector (select_system_messages base_selector)] (process/selector_receive_forever selector)))";
+    let out = fmt(src);
+    let expected = "(let receive_message {self}\n  (let [base_selector (match (:mode self)\n                        Suspended ~> (process/new_selector)\n                        Running ~> (|> (process/new_selector)\n                                       (process/select_other Unexpected)\n                                       (process/merge_selector (:selector self))))\n        selector (select_system_messages base_selector)]\n    (process/selector_receive_forever selector)))\n";
+    assert_eq!(out, expected);
+}
+
 // ── type ──────────────────────────────────────────────────────────────────
 
 #[test]
@@ -403,6 +411,17 @@ fn idempotent_match() {
     assert_eq!(
         once, twice,
         "match is not idempotent:\nFirst:\n{once}\nSecond:\n{twice}"
+    );
+}
+
+#[test]
+fn idempotent_match_in_let_binding_value() {
+    let src = "(let receive_message {self} (let [base_selector (match (:mode self) Suspended ~> (process/new_selector) Running ~> (|> (process/new_selector) (process/select_other Unexpected) (process/merge_selector (:selector self)))) selector (select_system_messages base_selector)] (process/selector_receive_forever selector)))";
+    let once = fmt(src);
+    let twice = fmt(once.trim());
+    assert_eq!(
+        once, twice,
+        "match in let-binding value is not idempotent:\nFirst:\n{once}\nSecond:\n{twice}"
     );
 }
 

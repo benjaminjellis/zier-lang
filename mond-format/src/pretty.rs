@@ -606,7 +606,7 @@ fn fmt_match(rest: &[SExpr], source: &str) -> Doc {
         })
         .collect();
 
-    concat_all([
+    align(concat_all([
         text("(match "),
         targets_doc,
         nest(
@@ -619,7 +619,7 @@ fn fmt_match(rest: &[SExpr], source: &str) -> Doc {
             ),
         ),
         text(")"),
-    ])
+    ]))
 }
 
 struct SplitMatchTargetsAndArmsResult<'a>(Vec<&'a SExpr>, Arms<'a>);
