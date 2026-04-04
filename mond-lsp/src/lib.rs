@@ -12,17 +12,16 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
 use codespan_reporting::diagnostic::{Diagnostic as CodeDiagnostic, LabelStyle, Severity};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower_lsp::{
     LspService, Server,
-    lsp_types::{Diagnostic, SymbolKind, Url},
+    lsp_types::{Diagnostic, SymbolKind},
 };
 
-use crate::{backend::Backend, state::ServerState};
+use crate::backend::Backend;
 
 pub async fn serve<R, W>(stdin: R, stdout: W)
 where

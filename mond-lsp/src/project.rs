@@ -19,18 +19,20 @@ use crate::{
     local_type_decls, module_name_for_path, package_name_from_manifest, push_completion_item,
     source_path_for_compile,
     state::{
-        AnalysisCacheKey, CachedDocumentState, DocumentState, IndexedModuleFile, ServerState,
-        WorkspaceState,
+        AnalysisCacheKey, CachedDocumentState, CachedModuleDiagnostics, DocumentState,
+        IndexedModuleFile, ServerState, WorkspaceState,
     },
     top_level_docs, top_level_symbols, visible_exports,
 };
 
+#[derive(Clone)]
 pub(crate) struct Project {
     pub(crate) root: Option<PathBuf>,
     pub(crate) external_modules: Arc<BTreeMap<String, ModuleSource>>,
     pub(crate) src_modules: Arc<BTreeMap<String, ModuleSource>>,
     pub(crate) test_modules: Arc<BTreeMap<String, ModuleSource>>,
     pub(crate) analysis: Arc<mondc::ProjectAnalysis>,
+    pub(crate) analysis_generation: u64,
     pub(crate) workspace_generation: u64,
     document_revisions: Arc<HashMap<PathBuf, u64>>,
     workspace: Option<Arc<Mutex<WorkspaceState>>>,
@@ -44,6 +46,12 @@ enum ModuleSetKind {
 }
 
 const UNWATCHED_FULL_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+
+#[derive(Debug, Default)]
+pub(crate) struct WorkspaceRefreshResult {
+    pub(crate) dirty_modules: HashSet<String>,
+    pub(crate) force_full_reconcile: bool,
+}
 
 fn file_modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path)
@@ -155,6 +163,86 @@ fn module_set_mut(
             &mut workspace.external_files,
         ),
     }
+}
+
+fn module_name_for_workspace_path(
+    workspace: &WorkspaceState,
+    kind: ModuleSetKind,
+    path: &Path,
+) -> Option<String> {
+    match kind {
+        ModuleSetKind::Src => workspace
+            .src_files
+            .get(path)
+            .map(|file| file.module_name.clone()),
+        ModuleSetKind::Test => workspace
+            .test_files
+            .get(path)
+            .map(|file| file.module_name.clone()),
+        ModuleSetKind::External => workspace
+            .external_files
+            .get(path)
+            .map(|file| file.module_name.clone()),
+    }
+}
+
+fn refresh_workspace_dependency_graph(workspace: &mut WorkspaceState) {
+    let mut import_graph: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut reverse_graph: HashMap<String, HashSet<String>> = HashMap::new();
+    let module_aliases = workspace
+        .analysis
+        .as_ref()
+        .map(|analysis| analysis.module_aliases.clone())
+        .unwrap_or_default();
+    let local_module_names: HashSet<String> = workspace
+        .src_modules
+        .keys()
+        .chain(workspace.test_modules.keys())
+        .cloned()
+        .collect();
+
+    for module in workspace
+        .src_modules
+        .values()
+        .chain(workspace.test_modules.values())
+    {
+        let imports = import_graph.entry(module.name.clone()).or_default();
+        reverse_graph.entry(module.name.clone()).or_default();
+        for (_, imported_module, _) in mondc::used_modules(&module.source) {
+            let resolved_module = module_aliases
+                .get(&imported_module)
+                .cloned()
+                .unwrap_or(imported_module);
+            if resolved_module == module.name {
+                continue;
+            }
+            imports.insert(resolved_module.clone());
+            reverse_graph
+                .entry(resolved_module)
+                .or_default()
+                .insert(module.name.clone());
+        }
+    }
+
+    for module_name in local_module_names {
+        import_graph.entry(module_name.clone()).or_default();
+        reverse_graph.entry(module_name).or_default();
+    }
+
+    workspace.module_import_graph = import_graph;
+    workspace.module_reverse_import_graph = reverse_graph;
+}
+
+fn prune_module_diagnostics_cache(workspace: &mut WorkspaceState) {
+    let active_module_paths: HashSet<&Path> = workspace
+        .src_modules
+        .values()
+        .chain(workspace.test_modules.values())
+        .map(|module| module.path.as_path())
+        .collect();
+    workspace
+        .module_diagnostics_cache
+        .retain(|module_path, _| active_module_paths.contains(module_path.as_path()));
 }
 
 fn tracked_module_source<'a>(
@@ -431,6 +519,8 @@ fn rebuild_analysis_if_needed(
         )?));
         workspace.analysis_generation += 1;
     }
+    refresh_workspace_dependency_graph(workspace);
+    prune_module_diagnostics_cache(workspace);
     Ok(())
 }
 
@@ -439,6 +529,7 @@ fn invalidate_document_cache(workspace: &mut WorkspaceState) {
     workspace.document_cache.clear();
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_workspace_overlays(
     root: Option<&Path>,
     state: &Arc<Mutex<ServerState>>,
@@ -472,18 +563,28 @@ pub(crate) fn reconcile_workspace_overlays(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_workspace_path(
     root: Option<&Path>,
     state: &Arc<Mutex<ServerState>>,
     path: &Path,
 ) -> std::result::Result<(), String> {
+    let _ = refresh_workspace_paths(root, state, &[path.to_path_buf()])?;
+    Ok(())
+}
+
+pub(crate) fn refresh_workspace_paths(
+    root: Option<&Path>,
+    state: &Arc<Mutex<ServerState>>,
+    paths: &[PathBuf],
+) -> std::result::Result<WorkspaceRefreshResult, String> {
     let Some(root) = root else {
-        return Ok(());
+        return Ok(WorkspaceRefreshResult::default());
     };
     let workspace = {
         let state = state.lock().unwrap();
         let Some(workspace) = state.workspaces.get(root).cloned() else {
-            return Ok(());
+            return Ok(WorkspaceRefreshResult::default());
         };
         workspace
     };
@@ -492,12 +593,37 @@ pub(crate) fn refresh_workspace_path(
     let previous_external = workspace.external_modules.clone();
     let previous_src = workspace.src_modules.clone();
     let previous_package_name = workspace.package_name.clone();
+    let mut result = WorkspaceRefreshResult::default();
+    let mut changed = false;
 
-    let changed = if path == root.join("bahn.toml") {
-        refresh_manifest(&mut workspace, root)
-    } else {
-        refresh_disk_module_path(&mut workspace, root, path)
-    };
+    for path in paths {
+        if path == &root.join("bahn.toml") {
+            changed |= refresh_manifest(&mut workspace, root);
+            result.force_full_reconcile = true;
+            continue;
+        }
+
+        let kind = path_kind(root, path);
+        if matches!(kind, Some(ModuleSetKind::External)) {
+            result.force_full_reconcile = true;
+        }
+
+        if let Some(kind @ (ModuleSetKind::Src | ModuleSetKind::Test)) = kind {
+            if let Some(module_name) = module_name_for_workspace_path(&workspace, kind, path) {
+                result.dirty_modules.insert(module_name);
+            } else {
+                result.dirty_modules.insert(module_name_for_path(path));
+            }
+        }
+
+        changed |= refresh_disk_module_path(&mut workspace, root, path);
+
+        if let Some(kind @ (ModuleSetKind::Src | ModuleSetKind::Test)) = kind
+            && let Some(module_name) = module_name_for_workspace_path(&workspace, kind, path)
+        {
+            result.dirty_modules.insert(module_name);
+        }
+    }
 
     rebuild_analysis_if_needed(
         &mut workspace,
@@ -509,7 +635,37 @@ pub(crate) fn refresh_workspace_path(
     if changed {
         invalidate_document_cache(&mut workspace);
     }
-    Ok(())
+    Ok(result)
+}
+
+pub(crate) fn bump_workspace_diagnostics_generation(
+    root: Option<&Path>,
+    state: &Arc<Mutex<ServerState>>,
+) -> Option<u64> {
+    let root = root?;
+    let workspace = {
+        let mut state = state.lock().unwrap();
+        state
+            .workspaces
+            .entry(root.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(WorkspaceState::default())))
+            .clone()
+    };
+    let mut workspace = workspace.lock().unwrap();
+    workspace.diagnostics_reconcile_generation += 1;
+    Some(workspace.diagnostics_reconcile_generation)
+}
+
+pub(crate) fn workspace_diagnostics_generation(
+    root: Option<&Path>,
+    state: &Arc<Mutex<ServerState>>,
+) -> Option<u64> {
+    let root = root?;
+    let workspace = {
+        let state = state.lock().unwrap();
+        state.workspaces.get(root).cloned()
+    }?;
+    Some(workspace.lock().unwrap().diagnostics_reconcile_generation)
 }
 
 impl Project {
@@ -529,6 +685,7 @@ impl Project {
                 build_project_analysis(&external_modules, &src_modules, package_name)
                     .expect("project analysis"),
             ),
+            analysis_generation: 0,
             workspace_generation: 0,
             document_revisions: Arc::new(HashMap::new()),
             workspace: None,
@@ -566,6 +723,7 @@ impl Project {
                 src_modules: Arc::new(src_modules),
                 test_modules: Arc::new(test_modules),
                 analysis,
+                analysis_generation: 0,
                 workspace_generation: 0,
                 document_revisions: Arc::new(HashMap::new()),
                 workspace: None,
@@ -653,6 +811,7 @@ impl Project {
                 .analysis
                 .clone()
                 .expect("workspace analysis is seeded"),
+            analysis_generation: workspace_state.analysis_generation,
             workspace_generation: workspace_state.workspace_generation,
             document_revisions: workspace_state.document_revisions.clone(),
             workspace: Some(workspace.clone()),
@@ -713,6 +872,142 @@ impl Project {
             .chain(self.test_modules.values())
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn diagnostic_modules(&self) -> Vec<ModuleSource> {
+        self.src_modules
+            .values()
+            .chain(self.test_modules.values())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn diagnostic_module_names(&self) -> HashSet<String> {
+        self.diagnostic_modules()
+            .into_iter()
+            .map(|module| module.name)
+            .collect()
+    }
+
+    pub(crate) fn diagnostic_modules_for_names(
+        &self,
+        module_names: &HashSet<String>,
+    ) -> Vec<ModuleSource> {
+        self.diagnostic_modules()
+            .into_iter()
+            .filter(|module| module_names.contains(&module.name))
+            .collect()
+    }
+
+    pub(crate) fn affected_diagnostic_module_names(
+        &self,
+        dirty_modules: &HashSet<String>,
+    ) -> HashSet<String> {
+        let local_module_names = self.diagnostic_module_names();
+        let Some(workspace) = self.workspace.as_ref() else {
+            return dirty_modules
+                .iter()
+                .filter(|module_name| local_module_names.contains(*module_name))
+                .cloned()
+                .collect();
+        };
+
+        let reverse_graph = {
+            let workspace = workspace.lock().unwrap();
+            workspace.module_reverse_import_graph.clone()
+        };
+
+        let mut affected: HashSet<String> = dirty_modules
+            .iter()
+            .filter(|module_name| local_module_names.contains(*module_name))
+            .cloned()
+            .collect();
+        let mut queue: Vec<String> = dirty_modules.iter().cloned().collect();
+
+        while let Some(module_name) = queue.pop() {
+            if let Some(dependents) = reverse_graph.get(&module_name) {
+                for dependent in dependents {
+                    if !local_module_names.contains(dependent) {
+                        continue;
+                    }
+                    if affected.insert(dependent.clone()) {
+                        queue.push(dependent.clone());
+                    }
+                }
+            }
+        }
+
+        affected
+    }
+
+    pub(crate) fn stale_diagnostic_module_names(&self) -> HashSet<String> {
+        let modules = self.diagnostic_modules();
+        let Some(workspace) = self.workspace.as_ref() else {
+            return modules.into_iter().map(|module| module.name).collect();
+        };
+
+        let workspace = workspace.lock().unwrap();
+        let mut stale = HashSet::new();
+
+        for module in modules {
+            let Some(revision) = self.cacheable_document_revision(&module.path) else {
+                stale.insert(module.name);
+                continue;
+            };
+            let is_fresh = workspace
+                .module_diagnostics_cache
+                .get(&module.path)
+                .is_some_and(|entry| {
+                    entry.source_revision == revision
+                        && entry.analysis_generation <= self.analysis_generation
+                });
+            if !is_fresh {
+                stale.insert(module.name);
+            }
+        }
+
+        stale
+    }
+
+    pub(crate) fn cache_module_diagnostics(
+        &self,
+        module: &ModuleSource,
+        diagnostics: Vec<tower_lsp::lsp_types::Diagnostic>,
+    ) {
+        let Some(revision) = self.cacheable_document_revision(&module.path) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.as_ref() else {
+            return;
+        };
+
+        let mut workspace = workspace.lock().unwrap();
+        if workspace.document_revisions.get(&module.path).copied() != Some(revision) {
+            return;
+        }
+        workspace.module_diagnostics_cache.insert(
+            module.path.clone(),
+            CachedModuleDiagnostics {
+                source_revision: revision,
+                analysis_generation: self.analysis_generation,
+                diagnostics: Arc::new(diagnostics),
+            },
+        );
+    }
+
+    pub(crate) fn cached_module_diagnostics(
+        &self,
+        module: &ModuleSource,
+    ) -> Option<Vec<tower_lsp::lsp_types::Diagnostic>> {
+        let revision = self.cacheable_document_revision(&module.path)?;
+        let workspace = self.workspace.as_ref()?;
+        let workspace = workspace.lock().unwrap();
+        let entry = workspace.module_diagnostics_cache.get(&module.path)?;
+        if entry.source_revision != revision || entry.analysis_generation > self.analysis_generation
+        {
+            return None;
+        }
+        Some(entry.diagnostics.as_ref().clone())
     }
 
     pub(crate) fn reference_locations(

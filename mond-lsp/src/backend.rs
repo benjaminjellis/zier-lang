@@ -3,7 +3,9 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
+use tokio::time::{Duration, sleep};
 
 use tower_lsp::{
     Client, LanguageServer,
@@ -26,16 +28,18 @@ use tower_lsp::{
 
 use crate::{
     CompletionContext, DocumentAnalysis, HoverTarget, ModuleSource, OccurrenceKind, Symbol,
-    analysis::project_diagnostic_batches_for_uri,
     best_expr_type_at_offset, byte_range_to_lsp_range, collect_local_occurrences,
     completion_context, find_hover_target, find_project_root, full_document_range,
     full_text_change, function_arity, local_symbol_at, lsp_documentation, lsp_error_diagnostic,
     position_to_offset,
-    project::{Project, reconcile_workspace_overlays, refresh_workspace_path},
+    project::{
+        Project, bump_workspace_diagnostics_generation, refresh_workspace_paths,
+        workspace_diagnostics_generation,
+    },
     record_field_context, scheme_for_symbol,
     semantic_tokens::{compute_semantic_tokens_full, semantic_tokens_capabilities},
     signature_target_at,
-    state::{DocumentState, ServerState},
+    state::{CachedDocumentSymbols, CachedSemanticTokens, DocumentState, ServerState},
     symbol_at, symbol_documentation_for_symbol, top_level_symbols, use_module_at_offset,
 };
 
@@ -94,16 +98,156 @@ impl Backend {
             .map(|d| d.version)
     }
 
+    fn semantic_tokens_generation(&self, uri: &Url) -> u64 {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .semantic_tokens_generation
+            .get(uri)
+            .unwrap_or(&0)
+    }
+
+    fn is_semantic_tokens_generation_current(&self, uri: &Url, expected_generation: u64) -> bool {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .semantic_tokens_generation
+            .get(uri)
+            .unwrap_or(&0)
+            == expected_generation
+    }
+
+    fn cached_semantic_tokens(
+        &self,
+        uri: &Url,
+        version: i32,
+    ) -> Option<tower_lsp::lsp_types::SemanticTokens> {
+        self.state
+            .lock()
+            .unwrap()
+            .semantic_tokens_cache
+            .get(uri)
+            .filter(|cached| cached.version == version)
+            .map(|cached| cached.tokens.clone())
+    }
+
+    fn store_semantic_tokens_cache(
+        &self,
+        uri: Url,
+        version: i32,
+        tokens: tower_lsp::lsp_types::SemanticTokens,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .semantic_tokens_cache
+            .insert(uri, CachedSemanticTokens { version, tokens });
+    }
+
+    fn document_symbol_generation(&self, uri: &Url) -> u64 {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .document_symbol_generation
+            .get(uri)
+            .unwrap_or(&0)
+    }
+
+    fn is_document_symbol_generation_current(&self, uri: &Url, expected_generation: u64) -> bool {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .document_symbol_generation
+            .get(uri)
+            .unwrap_or(&0)
+            == expected_generation
+    }
+
+    fn cached_document_symbols(&self, uri: &Url, version: i32) -> Option<Vec<DocumentSymbol>> {
+        self.state
+            .lock()
+            .unwrap()
+            .document_symbol_cache
+            .get(uri)
+            .filter(|cached| cached.version == version)
+            .map(|cached| cached.symbols.clone())
+    }
+
+    fn store_document_symbols_cache(&self, uri: Url, version: i32, symbols: Vec<DocumentSymbol>) {
+        self.state
+            .lock()
+            .unwrap()
+            .document_symbol_cache
+            .insert(uri, CachedDocumentSymbols { version, symbols });
+    }
+
+    fn invalidate_document_presentation_caches(&self, uri: &Url) {
+        let mut state = self.state.lock().unwrap();
+        state.semantic_tokens_cache.remove(uri);
+        state.document_symbol_cache.remove(uri);
+        let semantic_generation = state
+            .semantic_tokens_generation
+            .entry(uri.clone())
+            .or_insert(0);
+        *semantic_generation += 1;
+        let symbol_generation = state
+            .document_symbol_generation
+            .entry(uri.clone())
+            .or_insert(0);
+        *symbol_generation += 1;
+    }
+
+    fn next_document_diagnostics_generation(&self, uri: &Url) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        let generation = state
+            .document_diagnostics_generation
+            .entry(uri.clone())
+            .or_insert(0);
+        *generation += 1;
+        *generation
+    }
+
+    fn is_document_diagnostics_generation_current(
+        &self,
+        uri: &Url,
+        expected_generation: u64,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .document_diagnostics_generation
+            .get(uri)
+            .is_some_and(|generation| *generation == expected_generation)
+    }
+
     fn schedule_document_diagnostics(&self, uri: Url, version: i32) {
+        let generation = self.next_document_diagnostics_generation(&uri);
         let backend = self.clone();
         tokio::spawn(async move {
+            // Debounce diagnostics while typing to avoid queuing heavy analyses per keystroke.
+            sleep(Duration::from_millis(120)).await;
             backend
-                .publish_document_diagnostics(uri, Some(version))
+                .publish_document_diagnostics(uri, Some(version), Some(generation))
                 .await;
         });
     }
 
-    async fn publish_document_diagnostics(&self, uri: Url, version: Option<i32>) {
+    async fn publish_document_diagnostics(
+        &self,
+        uri: Url,
+        version: Option<i32>,
+        generation: Option<u64>,
+    ) {
+        if let Some(expected_generation) = generation
+            && !self.is_document_diagnostics_generation_current(&uri, expected_generation)
+        {
+            return;
+        }
+
         // If another edit arrived while this diagnostic task was queued/running,
         // skip publishing stale results to avoid flickering old errors.
         if let Some(expected) = version {
@@ -114,11 +258,39 @@ impl Backend {
             }
         }
 
-        let diagnostics = match self.document_diagnostics(&uri) {
-            Ok(Some(diagnostics)) => diagnostics,
-            Ok(None) => Vec::new(),
-            Err(err) => vec![lsp_error_diagnostic(err)],
+        let diagnostics = {
+            let state = self.state.clone();
+            let uri_for_worker = uri.clone();
+            match tokio::task::spawn_blocking(move || {
+                let path = match uri_for_worker.to_file_path() {
+                    Ok(path) => path,
+                    Err(_) => return Ok(None),
+                };
+                let root = find_project_root(&path);
+                let project = Project::load(root.as_deref(), &state, &uri_for_worker)?;
+                let doc = match project.document_for_path(&path) {
+                    Some(doc) => doc,
+                    None => return Ok(None),
+                };
+                let diagnostics = project.diagnostics_for_document(&doc)?;
+                Ok::<Option<Vec<tower_lsp::lsp_types::Diagnostic>>, String>(Some(diagnostics))
+            })
+            .await
+            {
+                Ok(Ok(Some(diagnostics))) => diagnostics,
+                Ok(Ok(None)) => Vec::new(),
+                Ok(Err(err)) => vec![lsp_error_diagnostic(err)],
+                Err(err) => vec![lsp_error_diagnostic(format!(
+                    "internal error: document diagnostics task failed: {err}"
+                ))],
+            }
         };
+
+        if let Some(expected_generation) = generation
+            && !self.is_document_diagnostics_generation_current(&uri, expected_generation)
+        {
+            return;
+        }
 
         if let Some(expected) = version {
             match self.current_document_version(&uri) {
@@ -133,31 +305,170 @@ impl Backend {
             .await;
     }
 
-    async fn publish_project_diagnostics(&self, focus_uri: Url) {
-        let path = match focus_uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => {
-                self.publish_document_diagnostics(focus_uri, None).await;
+    fn schedule_workspace_reconciliation(
+        &self,
+        root: Option<PathBuf>,
+        changed_paths: Vec<PathBuf>,
+        focus_uri: Url,
+    ) {
+        let backend = self.clone();
+        tokio::spawn(async move {
+            backend
+                .run_workspace_reconciliation(root, changed_paths, focus_uri)
+                .await;
+        });
+    }
+
+    fn is_workspace_reconcile_generation_current(
+        &self,
+        root: Option<&std::path::Path>,
+        expected_generation: u64,
+    ) -> bool {
+        workspace_diagnostics_generation(root, &self.state)
+            .is_some_and(|generation| generation == expected_generation)
+    }
+
+    async fn run_workspace_reconciliation(
+        &self,
+        root: Option<PathBuf>,
+        changed_paths: Vec<PathBuf>,
+        focus_uri: Url,
+    ) {
+        let Some(root) = root else {
+            self.publish_document_diagnostics(focus_uri, None, None)
+                .await;
+            return;
+        };
+
+        let Some(reconcile_generation) =
+            bump_workspace_diagnostics_generation(Some(root.as_path()), &self.state)
+        else {
+            return;
+        };
+
+        let refresh_state = self.state.clone();
+        let refresh_root = root.clone();
+        let refresh_paths = changed_paths.clone();
+        let refresh_result = match tokio::task::spawn_blocking(move || {
+            refresh_workspace_paths(Some(refresh_root.as_path()), &refresh_state, &refresh_paths)
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                self.client
+                    .publish_diagnostics(focus_uri, vec![lsp_error_diagnostic(err)], None)
+                    .await;
+                return;
+            }
+            Err(err) => {
+                self.client
+                    .publish_diagnostics(
+                        focus_uri,
+                        vec![lsp_error_diagnostic(format!(
+                            "internal error: workspace refresh task failed: {err}"
+                        ))],
+                        None,
+                    )
+                    .await;
                 return;
             }
         };
-        let root = find_project_root(&path);
-        let batches =
-            match project_diagnostic_batches_for_uri(root.as_deref(), &self.state, &focus_uri) {
-                Ok(Some(batches)) => batches,
-                Ok(None) => {
-                    self.publish_document_diagnostics(focus_uri, None).await;
-                    return;
-                }
-                Err(err) => {
-                    self.client
-                        .publish_diagnostics(focus_uri, vec![lsp_error_diagnostic(err)], None)
-                        .await;
-                    return;
+
+        if !self
+            .is_workspace_reconcile_generation_current(Some(root.as_path()), reconcile_generation)
+        {
+            return;
+        }
+
+        let project_state = self.state.clone();
+        let project_root = root.clone();
+        let project_uri = focus_uri.clone();
+        let project = match tokio::task::spawn_blocking(move || {
+            Project::load(Some(project_root.as_path()), &project_state, &project_uri)
+        })
+        .await
+        {
+            Ok(Ok(project)) => project,
+            Ok(Err(err)) => {
+                self.client
+                    .publish_diagnostics(focus_uri, vec![lsp_error_diagnostic(err)], None)
+                    .await;
+                return;
+            }
+            Err(err) => {
+                self.client
+                    .publish_diagnostics(
+                        focus_uri,
+                        vec![lsp_error_diagnostic(format!(
+                            "internal error: project load task failed: {err}"
+                        ))],
+                        None,
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        if !self
+            .is_workspace_reconcile_generation_current(Some(root.as_path()), reconcile_generation)
+        {
+            return;
+        }
+
+        let affected_modules = if refresh_result.force_full_reconcile {
+            project.diagnostic_module_names()
+        } else {
+            project.affected_diagnostic_module_names(&refresh_result.dirty_modules)
+        };
+        let mut modules_to_recompute = affected_modules.clone();
+        modules_to_recompute.extend(project.stale_diagnostic_module_names());
+        if modules_to_recompute.is_empty() {
+            return;
+        }
+
+        let modules = project.diagnostic_modules_for_names(&modules_to_recompute);
+        for module in modules {
+            if !self.is_workspace_reconcile_generation_current(
+                Some(root.as_path()),
+                reconcile_generation,
+            ) {
+                return;
+            }
+
+            let diagnostics = if !affected_modules.contains(&module.name) {
+                project.cached_module_diagnostics(&module)
+            } else {
+                None
+            };
+
+            let diagnostics = if let Some(diagnostics) = diagnostics {
+                diagnostics
+            } else {
+                let compute_project = project.clone();
+                let compute_module = module.clone();
+                match tokio::task::spawn_blocking(move || {
+                    compute_project.diagnostics_for_document(&compute_module)
+                })
+                .await
+                {
+                    Ok(Ok(diagnostics)) => diagnostics,
+                    Ok(Err(err)) => vec![lsp_error_diagnostic(err)],
+                    Err(err) => vec![lsp_error_diagnostic(format!(
+                        "internal error: diagnostics task failed for `{}`: {err}",
+                        module.name
+                    ))],
                 }
             };
 
-        for (module, diagnostics) in batches {
+            if !self.is_workspace_reconcile_generation_current(
+                Some(root.as_path()),
+                reconcile_generation,
+            ) {
+                return;
+            }
+
+            project.cache_module_diagnostics(&module, diagnostics.clone());
             if let Ok(uri) = Url::from_file_path(&module.path) {
                 self.client
                     .publish_diagnostics(uri, diagnostics, None)
@@ -187,24 +498,6 @@ impl Backend {
         Ok(Some((project, doc, analysis)))
     }
 
-    fn document_diagnostics(
-        &self,
-        uri: &Url,
-    ) -> std::result::Result<Option<Vec<tower_lsp::lsp_types::Diagnostic>>, String> {
-        let path = match uri.to_file_path() {
-            Ok(path) => path,
-            Err(_) => return Ok(None),
-        };
-        let root = find_project_root(&path);
-        let project = Project::load(root.as_deref(), &self.state, uri)?;
-        let doc = match project.document_for_path(&path) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-        let diagnostics = project.diagnostics_for_document(&doc)?;
-        Ok(Some(diagnostics))
-    }
-
     fn document_text(&self, uri: &Url) -> Option<String> {
         if let Some(doc) = self.state.lock().unwrap().open_docs.get(uri).cloned() {
             return Some(doc.text);
@@ -224,6 +517,12 @@ impl Backend {
         };
         let root = find_project_root(&path);
         Project::load(root.as_deref(), &self.state, &uri).map(Some)
+    }
+
+    fn formatting_enabled() -> bool {
+        !std::env::var("MOND_LSP_DISABLE_FORMATTING")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 }
 
@@ -285,7 +584,8 @@ impl LanguageServer for Backend {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
-                document_formatting_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Self::formatting_enabled()
+                    .then_some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(semantic_tokens_capabilities()),
                 ..ServerCapabilities::default()
             },
@@ -320,6 +620,14 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "mond-lsp initialized")
             .await;
+        if !Self::formatting_enabled() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    "mond-lsp: formatting disabled via MOND_LSP_DISABLE_FORMATTING",
+                )
+                .await;
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -337,14 +645,32 @@ impl LanguageServer for Backend {
         let Ok(path) = uri.to_file_path() else {
             return Ok(None);
         };
-        let imported_type_decls = self
-            .analyze_document(&uri, false, false)
-            .ok()
-            .flatten()
-            .map(|(_, _, analysis)| analysis.imports.imported_type_decls)
-            .unwrap_or_default();
-        let tokens = compute_semantic_tokens_full(&path, &source, &imported_type_decls)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+        let expected_version = self.current_document_version(&uri);
+        if let Some(version) = expected_version
+            && let Some(cached) = self.cached_semantic_tokens(&uri, version)
+        {
+            return Ok(Some(SemanticTokensResult::Tokens(cached)));
+        }
+        let generation = self.semantic_tokens_generation(&uri);
+        let tokens =
+            tokio::task::spawn_blocking(move || compute_semantic_tokens_full(&path, &source, &[]))
+                .await
+                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+                .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+
+        if !self.is_semantic_tokens_generation_current(&uri, generation) {
+            return Ok(None);
+        }
+
+        if let Some(expected) = expected_version {
+            match self.current_document_version(&uri) {
+                Some(current) if current == expected => {
+                    self.store_semantic_tokens_cache(uri.clone(), expected, tokens.clone());
+                }
+                _ => return Ok(None),
+            }
+        }
+
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
@@ -361,10 +687,7 @@ impl LanguageServer for Backend {
                 },
             );
         }
-        if let Ok(path) = uri.to_file_path() {
-            let root = find_project_root(&path);
-            let _ = reconcile_workspace_overlays(root.as_deref(), &self.state);
-        }
+        self.invalidate_document_presentation_caches(&uri);
         self.schedule_document_diagnostics(uri, version);
     }
 
@@ -379,24 +702,22 @@ impl LanguageServer for Backend {
                 doc.text = text;
             }
         }
-        if let Ok(path) = uri.to_file_path() {
-            let root = find_project_root(&path);
-            let _ = reconcile_workspace_overlays(root.as_deref(), &self.state);
-        }
+        self.invalidate_document_presentation_caches(&uri);
         self.schedule_document_diagnostics(uri, version);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        if let Ok(path) = params.text_document.uri.to_file_path() {
-            let root = if path.file_name().and_then(|name| name.to_str()) == Some("bahn.toml") {
-                path.parent().map(PathBuf::from)
-            } else {
-                find_project_root(&path)
-            };
-            let _ = refresh_workspace_path(root.as_deref(), &self.state, &path);
-        }
-        self.publish_project_diagnostics(params.text_document.uri)
-            .await;
+        let uri = params.text_document.uri;
+        let Ok(path) = uri.to_file_path() else {
+            self.publish_document_diagnostics(uri, None, None).await;
+            return;
+        };
+        let root = if path.file_name().and_then(|name| name.to_str()) == Some("bahn.toml") {
+            path.parent().map(PathBuf::from)
+        } else {
+            find_project_root(&path)
+        };
+        self.schedule_workspace_reconciliation(root, vec![path], uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -404,15 +725,17 @@ impl LanguageServer for Backend {
         {
             let mut state = self.state.lock().unwrap();
             state.open_docs.remove(&uri);
-        }
-        if let Ok(path) = uri.to_file_path() {
-            let root = find_project_root(&path);
-            let _ = reconcile_workspace_overlays(root.as_deref(), &self.state);
+            state.document_diagnostics_generation.remove(&uri);
+            state.semantic_tokens_generation.remove(&uri);
+            state.document_symbol_generation.remove(&uri);
+            state.semantic_tokens_cache.remove(&uri);
+            state.document_symbol_cache.remove(&uri);
         }
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut changes_by_root: HashMap<PathBuf, (Vec<PathBuf>, Url)> = HashMap::new();
         for change in params.changes {
             let Ok(path) = change.uri.to_file_path() else {
                 continue;
@@ -422,7 +745,17 @@ impl LanguageServer for Backend {
             } else {
                 find_project_root(&path)
             };
-            let _ = refresh_workspace_path(root.as_deref(), &self.state, &path);
+            let Some(root) = root else {
+                continue;
+            };
+            let entry = changes_by_root
+                .entry(root)
+                .or_insert_with(|| (Vec::new(), change.uri.clone()));
+            entry.0.push(path);
+        }
+
+        for (root, (paths, focus_uri)) in changes_by_root {
+            self.schedule_workspace_reconciliation(Some(root), paths, focus_uri);
         }
     }
 
@@ -593,10 +926,34 @@ impl LanguageServer for Backend {
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
-        let Some(source) = self.document_text(&params.text_document.uri) else {
+        if !Self::formatting_enabled() {
+            return Ok(None);
+        }
+        let uri = params.text_document.uri;
+        let Some(source) = self.document_text(&uri) else {
             return Ok(None);
         };
-        let formatted = mond_format::format_default(&source);
+        let started = Instant::now();
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("mond-lsp: formatting started ({uri})"),
+            )
+            .await;
+        let source_for_worker = source.clone();
+        let formatted =
+            tokio::task::spawn_blocking(move || mond_format::format_default(&source_for_worker))
+                .await
+                .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "mond-lsp: formatting finished in {}ms ({uri})",
+                    started.elapsed().as_millis()
+                ),
+            )
+            .await;
         if formatted == source {
             return Ok(Some(Vec::new()));
         }
@@ -783,60 +1140,85 @@ impl LanguageServer for Backend {
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
-        let root = find_project_root(&path);
-        let project = Project::load(root.as_deref(), &self.state, &uri)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-        let doc = match project.document_for_path(&path) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-        let Some(offset) = position_to_offset(&doc.source, params.text_document_position.position)
-        else {
-            return Ok(None);
-        };
-        let Some(ctx) = completion_context(&doc.source, offset) else {
-            return Ok(None);
-        };
+        let expected_version = self.current_document_version(&uri);
+        let state = self.state.clone();
+        let uri_for_worker = uri.clone();
+        let items = tokio::task::spawn_blocking(move || {
+            let root = find_project_root(&path);
+            let project = match Project::load(root.as_deref(), &state, &uri_for_worker) {
+                Ok(project) => project,
+                Err(_) => {
+                    return Ok::<Option<Vec<tower_lsp::lsp_types::CompletionItem>>, String>(Some(
+                        Vec::new(),
+                    ));
+                }
+            };
+            let doc = match project.document_for_path(&path) {
+                Some(doc) => doc,
+                None => return Ok(None),
+            };
+            let Some(offset) = position_to_offset(&doc.source, position) else {
+                return Ok(None);
+            };
+            let Some(ctx) = completion_context(&doc.source, offset) else {
+                return Ok(None);
+            };
 
-        let items = match ctx {
-            CompletionContext::Qualified { module, prefix } => {
-                project.qualified_completion_items(&module, &prefix)
-            }
-            CompletionContext::ImportPath { root, prefix } => {
-                project.import_path_completion_items(&root, &prefix)
-            }
-            CompletionContext::UseImportList { module, prefix } => {
-                project.use_import_list_completion_items(&module, &prefix)
-            }
-            CompletionContext::RecordField {
-                record_name,
-                prefix,
-            } => {
-                let analysis = project
-                    .analyze_document(&doc)
-                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-                project.record_field_completion_items(
-                    &doc,
-                    &analysis,
-                    record_name.as_deref(),
-                    &prefix,
-                )
-            }
-            CompletionContext::Unqualified { prefix } => {
-                let analysis = project
-                    .analyze_document(&doc)
-                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-                project
-                    .unqualified_completion_items(&doc, &analysis, offset, &prefix)
-                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
-            }
-        };
+            let items = match ctx {
+                CompletionContext::Qualified { module, prefix } => {
+                    project.qualified_completion_items(&module, &prefix)
+                }
+                CompletionContext::ImportPath { root, prefix } => {
+                    project.import_path_completion_items(&root, &prefix)
+                }
+                CompletionContext::UseImportList { module, prefix } => {
+                    project.use_import_list_completion_items(&module, &prefix)
+                }
+                CompletionContext::RecordField {
+                    record_name,
+                    prefix,
+                } => {
+                    let analysis = match project.analyze_document(&doc) {
+                        Ok(analysis) => analysis,
+                        Err(_) => return Ok(Some(Vec::new())),
+                    };
+                    project.record_field_completion_items(
+                        &doc,
+                        &analysis,
+                        record_name.as_deref(),
+                        &prefix,
+                    )
+                }
+                CompletionContext::Unqualified { prefix } => {
+                    let analysis = match project.analyze_document(&doc) {
+                        Ok(analysis) => analysis,
+                        Err(_) => return Ok(Some(Vec::new())),
+                    };
+                    project
+                        .unqualified_completion_items(&doc, &analysis, offset, &prefix)
+                        .unwrap_or_default()
+                }
+            };
 
-        Ok(Some(CompletionResponse::Array(items)))
+            Ok(Some(items))
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+        .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+
+        if let Some(expected) = expected_version {
+            match self.current_document_version(&uri) {
+                Some(current) if current == expected => {}
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(items.map(CompletionResponse::Array))
     }
 
     #[allow(deprecated)]
@@ -845,39 +1227,61 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
+        let Some(source) = self.document_text(&uri) else {
+            return Ok(None);
+        };
+        let expected_version = self.current_document_version(&uri);
+        if let Some(version) = expected_version
+            && let Some(cached) = self.cached_document_symbols(&uri, version)
+        {
+            return Ok(Some(DocumentSymbolResponse::Nested(cached)));
+        }
+        let generation = self.document_symbol_generation(&uri);
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
-        let root = find_project_root(&path);
-        let project = Project::load(root.as_deref(), &self.state, &uri)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-        let doc = match project.document_for_path(&path) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-        let symbols = top_level_symbols(&doc.path, &doc.source)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
-            .into_iter()
-            .map(|symbol| DocumentSymbol {
-                name: symbol.name,
-                detail: None,
-                kind: symbol.kind,
-                tags: None,
-                deprecated: None,
-                range: byte_range_to_lsp_range(
-                    &doc.source,
-                    symbol.full_range.start,
-                    symbol.full_range.end,
-                ),
-                selection_range: byte_range_to_lsp_range(
-                    &doc.source,
-                    symbol.selection_range.start,
-                    symbol.selection_range.end,
-                ),
-                children: None,
-            })
-            .collect();
+        let symbols = tokio::task::spawn_blocking(move || {
+            let symbols = top_level_symbols(&path, &source)?
+                .into_iter()
+                .map(|symbol| DocumentSymbol {
+                    name: symbol.name,
+                    detail: None,
+                    kind: symbol.kind,
+                    tags: None,
+                    deprecated: None,
+                    range: byte_range_to_lsp_range(
+                        &source,
+                        symbol.full_range.start,
+                        symbol.full_range.end,
+                    ),
+                    selection_range: byte_range_to_lsp_range(
+                        &source,
+                        symbol.selection_range.start,
+                        symbol.selection_range.end,
+                    ),
+                    children: None,
+                })
+                .collect::<Vec<_>>();
+            Ok::<Vec<DocumentSymbol>, String>(symbols)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+        .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+
+        if !self.is_document_symbol_generation_current(&uri, generation) {
+            return Ok(None);
+        }
+
+        if let Some(expected) = expected_version {
+            match self.current_document_version(&uri) {
+                Some(current) if current == expected => {
+                    self.store_document_symbols_cache(uri.clone(), expected, symbols.clone());
+                }
+                _ => return Ok(None),
+            }
+        }
+
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
@@ -900,63 +1304,81 @@ impl LanguageServer for Backend {
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
-        let root = find_project_root(&path);
-        let project = Project::load(root.as_deref(), &self.state, &uri)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-        let doc = match project.document_for_path(&path) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-        let analysis = project
-            .analyze_document(&doc)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
-        let Some(offset) =
-            position_to_offset(&doc.source, params.text_document_position_params.position)
-        else {
-            return Ok(None);
-        };
-        let Some(target) =
-            signature_target_at(&doc.path, &doc.source, &doc.name, &analysis.imports, offset)
-                .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
-        else {
-            return Ok(None);
-        };
-        let Some(scheme) = scheme_for_symbol(&project, &doc, &analysis, &target.symbol) else {
-            return Ok(None);
-        };
-        let label = format!(
-            "{} : {}",
-            if target.symbol.module == doc.name {
-                target.symbol.function.clone()
-            } else {
-                format!("{}/{}", target.symbol.module, target.symbol.function)
-            },
-            mondc::typecheck::type_display(&scheme.ty)
-        );
-        let arity = function_arity(&scheme.ty);
-        let params = (0..arity)
-            .map(|index| ParameterInformation {
-                label: ParameterLabel::Simple(format!("arg{}", index + 1)),
-                documentation: None,
-            })
-            .collect();
-        let documentation =
-            symbol_documentation_for_symbol(&project, &doc, &analysis, &target.symbol)
-                .map(lsp_documentation);
-        Ok(Some(SignatureHelp {
-            signatures: vec![SignatureInformation {
-                label,
-                documentation,
-                parameters: Some(params),
+        let expected_version = self.current_document_version(&uri);
+        let state = self.state.clone();
+        let uri_for_worker = uri.clone();
+        let help = tokio::task::spawn_blocking(move || {
+            let root = find_project_root(&path);
+            let project = match Project::load(root.as_deref(), &state, &uri_for_worker) {
+                Ok(project) => project,
+                Err(_) => return Ok::<Option<SignatureHelp>, String>(None),
+            };
+            let doc = match project.document_for_path(&path) {
+                Some(doc) => doc,
+                None => return Ok(None),
+            };
+            let analysis = match project.analyze_document(&doc) {
+                Ok(analysis) => analysis,
+                Err(_) => return Ok(None),
+            };
+            let Some(offset) = position_to_offset(&doc.source, position) else {
+                return Ok(None);
+            };
+            let Some(target) =
+                signature_target_at(&doc.path, &doc.source, &doc.name, &analysis.imports, offset)?
+            else {
+                return Ok(None);
+            };
+            let Some(scheme) = scheme_for_symbol(&project, &doc, &analysis, &target.symbol) else {
+                return Ok(None);
+            };
+            let label = format!(
+                "{} : {}",
+                if target.symbol.module == doc.name {
+                    target.symbol.function.clone()
+                } else {
+                    format!("{}/{}", target.symbol.module, target.symbol.function)
+                },
+                mondc::typecheck::type_display(&scheme.ty)
+            );
+            let arity = function_arity(&scheme.ty);
+            let params = (0..arity)
+                .map(|index| ParameterInformation {
+                    label: ParameterLabel::Simple(format!("arg{}", index + 1)),
+                    documentation: None,
+                })
+                .collect();
+            let documentation =
+                symbol_documentation_for_symbol(&project, &doc, &analysis, &target.symbol)
+                    .map(lsp_documentation);
+            Ok(Some(SignatureHelp {
+                signatures: vec![SignatureInformation {
+                    label,
+                    documentation,
+                    parameters: Some(params),
+                    active_parameter: Some(target.arg_index.min(arity.saturating_sub(1)) as u32),
+                }],
+                active_signature: Some(0),
                 active_parameter: Some(target.arg_index.min(arity.saturating_sub(1)) as u32),
-            }],
-            active_signature: Some(0),
-            active_parameter: Some(target.arg_index.min(arity.saturating_sub(1)) as u32),
-        }))
+            }))
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+        .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
+
+        if let Some(expected) = expected_version {
+            match self.current_document_version(&uri) {
+                Some(current) if current == expected => {}
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(help)
     }
 }
 

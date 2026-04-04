@@ -89,32 +89,12 @@ pub(crate) enum CompletionContext {
     },
 }
 
-type ProjectDiagnostic = Vec<(ModuleSource, Vec<Diagnostic>)>;
-
 struct OccurrenceContext<'a> {
     current_module: &'a str,
     top_level: &'a HashSet<String>,
     type_origins: &'a HashMap<String, String>,
     constructor_origins: &'a HashMap<String, String>,
     imports: &'a mondc::ResolvedImports,
-}
-
-pub(crate) fn project_diagnostic_batches_for_uri(
-    root: Option<&Path>,
-    state: &Arc<Mutex<ServerState>>,
-    focus_uri: &Url,
-) -> std::result::Result<Option<ProjectDiagnostic>, String> {
-    let project = Project::load(root, state, focus_uri)?;
-    let project_modules = project
-        .src_modules
-        .values()
-        .chain(project.test_modules.values())
-        .cloned()
-        .collect::<Vec<_>>();
-    if project_modules.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(project_diagnostic_batches(&project, project_modules)))
 }
 
 #[derive(Clone)]
@@ -495,6 +475,7 @@ pub(super) fn lsp_error_diagnostic(message: String) -> Diagnostic {
     }
 }
 
+#[cfg(test)]
 pub(super) fn project_diagnostic_batches(
     project: &Project,
     modules: Vec<ModuleSource>,

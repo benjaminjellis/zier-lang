@@ -5,7 +5,7 @@ use std::{
     time::SystemTime,
 };
 
-use tower_lsp::lsp_types::{Diagnostic, Url};
+use tower_lsp::lsp_types::{Diagnostic, DocumentSymbol, SemanticTokens, Url};
 
 use crate::{DocumentAnalysis, ModuleSource};
 
@@ -22,11 +22,30 @@ pub(crate) struct AnalysisCacheKey {
 }
 
 #[derive(Clone)]
+pub(crate) struct CachedSemanticTokens {
+    pub(crate) version: i32,
+    pub(crate) tokens: SemanticTokens,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedDocumentSymbols {
+    pub(crate) version: i32,
+    pub(crate) symbols: Vec<DocumentSymbol>,
+}
+
+#[derive(Clone)]
 pub(crate) struct CachedDocumentState {
     pub(crate) source_revision: u64,
     pub(crate) workspace_generation: u64,
     pub(crate) analyses: HashMap<AnalysisCacheKey, Arc<DocumentAnalysis>>,
     pub(crate) diagnostics: Option<Arc<Vec<Diagnostic>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedModuleDiagnostics {
+    pub(crate) source_revision: u64,
+    pub(crate) analysis_generation: u64,
+    pub(crate) diagnostics: Arc<Vec<Diagnostic>>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +65,10 @@ pub(crate) struct WorkspaceState {
     pub(crate) next_revision: u64,
     pub(crate) document_revisions: Arc<HashMap<PathBuf, u64>>,
     pub(crate) document_cache: HashMap<PathBuf, CachedDocumentState>,
+    pub(crate) module_import_graph: HashMap<String, HashSet<String>>,
+    pub(crate) module_reverse_import_graph: HashMap<String, HashSet<String>>,
+    pub(crate) module_diagnostics_cache: HashMap<PathBuf, CachedModuleDiagnostics>,
+    pub(crate) diagnostics_reconcile_generation: u64,
     pub(crate) src_files: HashMap<PathBuf, IndexedModuleFile>,
     pub(crate) test_files: HashMap<PathBuf, IndexedModuleFile>,
     pub(crate) external_files: HashMap<PathBuf, IndexedModuleFile>,
@@ -68,6 +91,10 @@ impl Default for WorkspaceState {
             next_revision: 1,
             document_revisions: Arc::new(HashMap::new()),
             document_cache: HashMap::new(),
+            module_import_graph: HashMap::new(),
+            module_reverse_import_graph: HashMap::new(),
+            module_diagnostics_cache: HashMap::new(),
+            diagnostics_reconcile_generation: 0,
             src_files: HashMap::new(),
             test_files: HashMap::new(),
             external_files: HashMap::new(),
@@ -82,6 +109,11 @@ impl Default for WorkspaceState {
 #[derive(Default)]
 pub(crate) struct ServerState {
     pub(crate) open_docs: HashMap<Url, DocumentState>,
+    pub(crate) document_diagnostics_generation: HashMap<Url, u64>,
+    pub(crate) semantic_tokens_generation: HashMap<Url, u64>,
+    pub(crate) document_symbol_generation: HashMap<Url, u64>,
+    pub(crate) semantic_tokens_cache: HashMap<Url, CachedSemanticTokens>,
+    pub(crate) document_symbol_cache: HashMap<Url, CachedDocumentSymbols>,
     pub(crate) workspaces: HashMap<PathBuf, Arc<Mutex<WorkspaceState>>>,
     pub(crate) watched_files_dynamic_registration: bool,
     pub(crate) watched_files_registered: bool,

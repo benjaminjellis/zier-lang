@@ -6,7 +6,7 @@ version.workspace = true
 [dependencies]
 tower-lsp = { workspace = true }
 codespan-reporting = { workspace = true }
-tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 mondc = { path = "../mondc" }
 mond-format = { path = "../mond-format" }
 toml = { workspace = true }

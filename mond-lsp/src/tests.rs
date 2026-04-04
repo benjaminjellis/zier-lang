@@ -1,7 +1,9 @@
 use tower_lsp::lsp_types::{CompletionItemKind, Position, Range, Url};
 
 use crate::{
-    project::{Project, reconcile_workspace_overlays, refresh_workspace_path},
+    project::{
+        Project, reconcile_workspace_overlays, refresh_workspace_path, refresh_workspace_paths,
+    },
     state::{DocumentState, ServerState},
 };
 
@@ -1387,6 +1389,99 @@ fn refresh_workspace_path_updates_external_modules() {
     refresh_workspace_path(Some(&root), &state, &extra_path).expect("remove external path");
     let project = Project::load(Some(&root), &state, &uri).expect("reload after delete");
     assert!(!project.external_modules.contains_key("extra"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn refresh_workspace_paths_tracks_reverse_dependency_closure() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/helper.mond", "(pub let value {} 1)\n");
+    write_project_file(
+        &root,
+        "src/middle.mond",
+        "(use helper)\n(let v {} (helper/value))\n",
+    );
+    write_project_file(
+        &root,
+        "src/main.mond",
+        "(use middle)\n(let main {} (middle/v))\n",
+    );
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let uri = Url::from_file_path(root.join("src/main.mond")).expect("main uri");
+    let _ = Project::load(Some(&root), &state, &uri).expect("seed workspace");
+
+    write_project_file(&root, "src/helper.mond", "(pub let value {} 2)\n");
+    let helper_path = root.join("src/helper.mond");
+    let refresh = refresh_workspace_paths(Some(&root), &state, std::slice::from_ref(&helper_path))
+        .expect("refresh helper");
+    assert!(refresh.dirty_modules.contains("helper"));
+
+    let project = Project::load(Some(&root), &state, &uri).expect("reload");
+    let affected = project.affected_diagnostic_module_names(&refresh.dirty_modules);
+    assert!(affected.contains("helper"));
+    assert!(affected.contains("middle"));
+    assert!(affected.contains("main"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn deleted_module_marks_dependents_as_affected() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/helper.mond", "(pub let value {} 1)\n");
+    write_project_file(
+        &root,
+        "src/main.mond",
+        "(use helper)\n(let main {} (helper/value))\n",
+    );
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let uri = Url::from_file_path(root.join("src/main.mond")).expect("main uri");
+    let _ = Project::load(Some(&root), &state, &uri).expect("seed workspace");
+
+    let helper_path = root.join("src/helper.mond");
+    fs::remove_file(&helper_path).expect("remove helper module");
+    let refresh = refresh_workspace_paths(Some(&root), &state, std::slice::from_ref(&helper_path))
+        .expect("refresh delete");
+    assert!(refresh.dirty_modules.contains("helper"));
+
+    let project = Project::load(Some(&root), &state, &uri).expect("reload");
+    let affected = project.affected_diagnostic_module_names(&refresh.dirty_modules);
+    assert!(affected.contains("main"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn module_diagnostics_cache_tracks_module_revisions() {
+    let root = unique_temp_root();
+    write_project_file(&root, "bahn.toml", "[package]\nname = \"demo\"\n");
+    write_project_file(&root, "src/main.mond", "(let main {} 1)\n");
+
+    let state = Arc::new(Mutex::new(ServerState::default()));
+    let path = root.join("src/main.mond");
+    let uri = Url::from_file_path(&path).expect("main uri");
+
+    let project = Project::load(Some(&root), &state, &uri).expect("load project");
+    let doc = project.document_for_path(&path).expect("main doc");
+    assert!(project.stale_diagnostic_module_names().contains("main"));
+
+    let diagnostics = project
+        .diagnostics_for_document(&doc)
+        .expect("compute diagnostics");
+    project.cache_module_diagnostics(&doc, diagnostics.clone());
+    assert_eq!(project.cached_module_diagnostics(&doc), Some(diagnostics));
+    assert!(!project.stale_diagnostic_module_names().contains("main"));
+
+    write_project_file(&root, "src/main.mond", "(let main {} 2)\n");
+    refresh_workspace_path(Some(&root), &state, &path).expect("refresh path");
+
+    let project = Project::load(Some(&root), &state, &uri).expect("reload project");
+    assert!(project.stale_diagnostic_module_names().contains("main"));
 
     let _ = fs::remove_dir_all(root);
 }

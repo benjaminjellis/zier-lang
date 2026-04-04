@@ -9,12 +9,12 @@ use mondc::{
     sexpr::SExpr,
 };
 use tower_lsp::lsp_types::{
-    SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
+    Position, SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens,
     SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensServerCapabilities, WorkDoneProgressOptions,
 };
 
-use crate::{offset_to_position, parse_module};
+use crate::parse_module;
 
 const TOKEN_TYPE_FUNCTION: u32 = 0;
 const TOKEN_TYPE_PARAMETER: u32 = 1;
@@ -94,6 +94,7 @@ impl TypeClassifier {
 #[derive(Default)]
 struct TokenCollector {
     tokens: Vec<AbsoluteToken>,
+    token_index_by_span: HashMap<(usize, usize), usize>,
     classifier: TypeClassifier,
 }
 
@@ -101,6 +102,7 @@ impl TokenCollector {
     fn new(classifier: TypeClassifier) -> Self {
         Self {
             tokens: Vec::new(),
+            token_index_by_span: HashMap::new(),
             classifier,
         }
     }
@@ -123,11 +125,8 @@ impl TokenCollector {
             return;
         }
 
-        if let Some(existing) = self
-            .tokens
-            .iter_mut()
-            .find(|token| token.start == start && token.end == end)
-        {
+        if let Some(index) = self.token_index_by_span.get(&(start, end)).copied() {
+            let existing = &mut self.tokens[index];
             if priority >= existing.priority {
                 existing.token_type = token_type;
                 existing.token_modifiers_bitset = token_modifiers_bitset;
@@ -138,6 +137,7 @@ impl TokenCollector {
             return;
         }
 
+        let index = self.tokens.len();
         self.tokens.push(AbsoluteToken {
             start,
             end,
@@ -145,6 +145,7 @@ impl TokenCollector {
             token_modifiers_bitset,
             priority,
         });
+        self.token_index_by_span.insert((start, end), index);
     }
 
     fn collect_decl(&mut self, source: &str, decl: &Declaration) {
@@ -413,12 +414,19 @@ impl TokenCollector {
     }
 
     fn encode(self, source: &str) -> Vec<SemanticToken> {
+        let mut offsets = Vec::with_capacity(self.tokens.len() * 2);
+        for token in &self.tokens {
+            offsets.push(token.start);
+            offsets.push(token.end);
+        }
+        let positions = positions_for_offsets(source, &offsets);
+
         let mut positioned = self
             .tokens
             .into_iter()
             .filter_map(|token| {
-                let start = offset_to_position(source, token.start);
-                let end = offset_to_position(source, token.end);
+                let start = *positions.get(&token.start)?;
+                let end = *positions.get(&token.end)?;
                 if start.line != end.line || end.character <= start.character {
                     return None;
                 }
@@ -456,6 +464,43 @@ impl TokenCollector {
         }
         data
     }
+}
+
+fn positions_for_offsets(source: &str, offsets: &[usize]) -> HashMap<usize, Position> {
+    let mut targets = offsets.to_vec();
+    targets.sort_unstable();
+    targets.dedup();
+
+    let mut positions = HashMap::with_capacity(targets.len());
+    if targets.is_empty() {
+        return positions;
+    }
+
+    let mut target_index = 0usize;
+    let mut line = 0u32;
+    let mut col = 0u32;
+    let mut byte = 0usize;
+
+    while target_index < targets.len() {
+        let target = targets[target_index];
+        while byte < target {
+            let ch = source[byte..]
+                .chars()
+                .next()
+                .expect("target offset always points into source");
+            byte += ch.len_utf8();
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += ch.len_utf16() as u32;
+            }
+        }
+        positions.insert(target, Position::new(line, col));
+        target_index += 1;
+    }
+
+    positions
 }
 
 fn is_constructor_name(name: &str) -> bool {
@@ -555,6 +600,7 @@ pub(crate) fn compute_semantic_tokens_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::offset_to_position;
 
     fn decode(tokens: &[SemanticToken]) -> Vec<(u32, u32, u32, u32, u32)> {
         let mut out = Vec::with_capacity(tokens.len());
