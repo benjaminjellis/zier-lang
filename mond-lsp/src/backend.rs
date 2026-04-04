@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
@@ -11,18 +12,19 @@ use tower_lsp::{
     Client, LanguageServer,
     jsonrpc::Result,
     lsp_types::{
-        CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-        DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
-        DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-        DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse,
-        FileSystemWatcher, GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-        HoverContents, HoverParams, InitializeParams, InitializeResult, InitializedParams,
-        Location, MarkedString, MarkupContent, MarkupKind, MessageType, OneOf,
-        ParameterInformation, ParameterLabel, ReferenceParams, Registration, RenameParams,
-        SemanticTokensParams, SemanticTokensResult, ServerCapabilities, SignatureHelp,
-        SignatureHelpParams, SignatureInformation, SymbolInformation, TextDocumentSyncCapability,
-        TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
-        WorkspaceEdit, WorkspaceSymbolParams,
+        CompletionOptions, CompletionParams, CompletionResponse, CompletionTriggerKind,
+        DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+        DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+        DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+        DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher,
+        GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+        HoverParams, InitializeParams, InitializeResult, InitializedParams, Location, MarkedString,
+        MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel,
+        Position, ReferenceParams, Registration, RenameParams, SemanticTokensParams,
+        SemanticTokensResult, ServerCapabilities, SignatureHelp, SignatureHelpParams,
+        SignatureHelpTriggerKind, SignatureInformation, SymbolInformation,
+        TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+        TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
     },
 };
 
@@ -39,7 +41,10 @@ use crate::{
     record_field_context, scheme_for_symbol,
     semantic_tokens::{compute_semantic_tokens_full, semantic_tokens_capabilities},
     signature_target_at,
-    state::{CachedDocumentSymbols, CachedSemanticTokens, DocumentState, ServerState},
+    state::{
+        CachedCompletionItems, CachedDocumentSymbols, CachedFrontendSnapshot, CachedSemanticTokens,
+        CachedSignatureHelp, DocumentState, FrontendSnapshot, ServerState,
+    },
     symbol_at, symbol_documentation_for_symbol, top_level_symbols, use_module_at_offset,
 };
 
@@ -133,6 +138,38 @@ impl Backend {
             .map(|cached| cached.tokens.clone())
     }
 
+    fn cached_frontend_snapshot(&self, uri: &Url, version: i32) -> Option<FrontendSnapshot> {
+        self.state
+            .lock()
+            .unwrap()
+            .frontend_snapshot_cache
+            .get(uri)
+            .filter(|cached| cached.version == version)
+            .map(|cached| cached.snapshot.clone())
+    }
+
+    fn update_frontend_snapshot<F>(&self, uri: Url, version: i32, update: F)
+    where
+        F: FnOnce(&mut FrontendSnapshot),
+    {
+        let mut state = self.state.lock().unwrap();
+        let entry =
+            state
+                .frontend_snapshot_cache
+                .entry(uri)
+                .or_insert_with(|| CachedFrontendSnapshot {
+                    version,
+                    snapshot: FrontendSnapshot::default(),
+                });
+        if entry.version != version {
+            *entry = CachedFrontendSnapshot {
+                version,
+                snapshot: FrontendSnapshot::default(),
+            };
+        }
+        update(&mut entry.snapshot);
+    }
+
     fn store_semantic_tokens_cache(
         &self,
         uri: Url,
@@ -185,10 +222,99 @@ impl Backend {
             .insert(uri, CachedDocumentSymbols { version, symbols });
     }
 
+    fn cached_completion_items(
+        &self,
+        uri: &Url,
+        version: i32,
+        line: u32,
+        character: u32,
+        context_hash: u64,
+    ) -> Option<Vec<tower_lsp::lsp_types::CompletionItem>> {
+        self.state
+            .lock()
+            .unwrap()
+            .completion_cache
+            .get(uri)
+            .filter(|cached| {
+                cached.version == version
+                    && cached.line == line
+                    && cached.character == character
+                    && cached.context_hash == context_hash
+            })
+            .map(|cached| cached.items.clone())
+    }
+
+    fn store_completion_items_cache(
+        &self,
+        uri: Url,
+        version: i32,
+        line: u32,
+        character: u32,
+        context_hash: u64,
+        items: Vec<tower_lsp::lsp_types::CompletionItem>,
+    ) {
+        self.state.lock().unwrap().completion_cache.insert(
+            uri,
+            CachedCompletionItems {
+                version,
+                context_hash,
+                line,
+                character,
+                items,
+            },
+        );
+    }
+
+    fn cached_signature_help(
+        &self,
+        uri: &Url,
+        version: i32,
+        line: u32,
+        character: u32,
+        context_hash: u64,
+    ) -> Option<Option<SignatureHelp>> {
+        self.state
+            .lock()
+            .unwrap()
+            .signature_help_cache
+            .get(uri)
+            .filter(|cached| {
+                cached.version == version
+                    && cached.line == line
+                    && cached.character == character
+                    && cached.context_hash == context_hash
+            })
+            .map(|cached| cached.help.clone())
+    }
+
+    fn store_signature_help_cache(
+        &self,
+        uri: Url,
+        version: i32,
+        line: u32,
+        character: u32,
+        context_hash: u64,
+        help: Option<SignatureHelp>,
+    ) {
+        self.state.lock().unwrap().signature_help_cache.insert(
+            uri,
+            CachedSignatureHelp {
+                version,
+                context_hash,
+                line,
+                character,
+                help,
+            },
+        );
+    }
+
     fn invalidate_document_presentation_caches(&self, uri: &Url) {
         let mut state = self.state.lock().unwrap();
+        state.frontend_snapshot_cache.remove(uri);
         state.semantic_tokens_cache.remove(uri);
         state.document_symbol_cache.remove(uri);
+        state.completion_cache.remove(uri);
+        state.signature_help_cache.remove(uri);
         let semantic_generation = state
             .semantic_tokens_generation
             .entry(uri.clone())
@@ -224,14 +350,157 @@ impl Backend {
             .is_some_and(|generation| *generation == expected_generation)
     }
 
+    fn is_stale_document_request(
+        &self,
+        uri: &Url,
+        version: Option<i32>,
+        generation: Option<u64>,
+    ) -> bool {
+        if let Some(expected_generation) = generation
+            && !self.is_document_diagnostics_generation_current(uri, expected_generation)
+        {
+            return true;
+        }
+
+        if let Some(expected_version) = version {
+            match self.current_document_version(uri) {
+                Some(current) if current == expected_version => {}
+                _ => return true,
+            }
+        }
+
+        false
+    }
+
+    fn parse_duration_ms_env(name: &str, default_ms: u64) -> Duration {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(default_ms))
+    }
+
+    fn source_window_hash(source: &str, position: Position) -> Option<u64> {
+        let offset = position_to_offset(source, position)?;
+        let start = offset.saturating_sub(64);
+        let end = source.len().min(offset.saturating_add(64));
+        let mut hasher = DefaultHasher::new();
+        source.as_bytes().get(start..end)?.hash(&mut hasher);
+        (offset - start).hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
+    fn completion_context_hash(source: &str, params: &CompletionParams) -> Option<u64> {
+        let mut hasher = DefaultHasher::new();
+        let window_hash = Self::source_window_hash(source, params.text_document_position.position)?;
+        window_hash.hash(&mut hasher);
+        if let Some(context) = params.context.as_ref() {
+            let trigger_kind = match context.trigger_kind {
+                CompletionTriggerKind::INVOKED => 1u8,
+                CompletionTriggerKind::TRIGGER_CHARACTER => 2u8,
+                CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS => 3u8,
+                _ => 255u8,
+            };
+            trigger_kind.hash(&mut hasher);
+            context.trigger_character.hash(&mut hasher);
+        } else {
+            0u8.hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    fn signature_help_context_hash(source: &str, params: &SignatureHelpParams) -> Option<u64> {
+        let mut hasher = DefaultHasher::new();
+        let window_hash =
+            Self::source_window_hash(source, params.text_document_position_params.position)?;
+        window_hash.hash(&mut hasher);
+        if let Some(context) = params.context.as_ref() {
+            let trigger_kind = match context.trigger_kind {
+                SignatureHelpTriggerKind::INVOKED => 1u8,
+                SignatureHelpTriggerKind::TRIGGER_CHARACTER => 2u8,
+                SignatureHelpTriggerKind::CONTENT_CHANGE => 3u8,
+                _ => 255u8,
+            };
+            trigger_kind.hash(&mut hasher);
+            context.is_retrigger.hash(&mut hasher);
+            context.trigger_character.hash(&mut hasher);
+            if let Some(active_help) = context.active_signature_help.as_ref() {
+                active_help.active_signature.hash(&mut hasher);
+                active_help.active_parameter.hash(&mut hasher);
+                active_help.signatures.len().hash(&mut hasher);
+            } else {
+                0usize.hash(&mut hasher);
+            }
+        } else {
+            0u8.hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    fn fast_diagnostics_debounce() -> Duration {
+        Self::parse_duration_ms_env("MOND_LSP_FAST_DIAG_DEBOUNCE_MS", 40)
+    }
+
+    fn project_diagnostics_debounce() -> Duration {
+        Self::parse_duration_ms_env("MOND_LSP_PROJECT_DIAG_DEBOUNCE_MS", 250)
+    }
+
+    fn perf_logs_enabled() -> bool {
+        std::env::var("MOND_LSP_ENABLE_PERF_LOGS")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    async fn compute_fast_document_diagnostics(
+        &self,
+        uri: &Url,
+    ) -> Option<Vec<tower_lsp::lsp_types::Diagnostic>> {
+        let expected_version = self.current_document_version(uri);
+        if let Some(version) = expected_version
+            && let Some(snapshot) = self.cached_frontend_snapshot(uri, version)
+            && let Some(diagnostics) = snapshot.fast_diagnostics
+        {
+            return Some(diagnostics);
+        }
+
+        let source = self.document_text(uri)?;
+        let path = uri.to_file_path().ok()?;
+        let diagnostics = match tokio::task::spawn_blocking(move || {
+            Project::fast_diagnostics_for_source(&path, &source)
+        })
+        .await
+        {
+            Ok(diagnostics) => diagnostics,
+            Err(err) => vec![lsp_error_diagnostic(format!(
+                "internal error: fast diagnostics task failed: {err}"
+            ))],
+        };
+
+        if let Some(version) = expected_version
+            && self.current_document_version(uri) == Some(version)
+        {
+            self.update_frontend_snapshot(uri.clone(), version, |snapshot| {
+                snapshot.fast_diagnostics = Some(diagnostics.clone());
+            });
+        }
+
+        Some(diagnostics)
+    }
+
     fn schedule_document_diagnostics(&self, uri: Url, version: i32) {
         let generation = self.next_document_diagnostics_generation(&uri);
         let backend = self.clone();
+        let fast_debounce = Self::fast_diagnostics_debounce();
+        let project_debounce = Self::project_diagnostics_debounce();
         tokio::spawn(async move {
-            // Debounce diagnostics while typing to avoid queuing heavy analyses per keystroke.
-            sleep(Duration::from_millis(120)).await;
+            sleep(fast_debounce).await;
             backend
-                .publish_document_diagnostics(uri, Some(version), Some(generation))
+                .publish_document_diagnostics(
+                    uri,
+                    Some(version),
+                    Some(generation),
+                    project_debounce.saturating_sub(fast_debounce),
+                )
                 .await;
         });
     }
@@ -241,24 +510,32 @@ impl Backend {
         uri: Url,
         version: Option<i32>,
         generation: Option<u64>,
+        full_delay_after_fast: Duration,
     ) {
-        if let Some(expected_generation) = generation
-            && !self.is_document_diagnostics_generation_current(&uri, expected_generation)
-        {
+        if self.is_stale_document_request(&uri, version, generation) {
             return;
         }
 
-        // If another edit arrived while this diagnostic task was queued/running,
-        // skip publishing stale results to avoid flickering old errors.
-        if let Some(expected) = version {
-            match self.current_document_version(&uri) {
-                Some(current) if current != expected => return,
-                None => return,
-                Some(_) => {}
+        let fast_started = Instant::now();
+        if let Some(fast_diagnostics) = self.compute_fast_document_diagnostics(&uri).await {
+            if self.is_stale_document_request(&uri, version, generation) {
+                return;
+            }
+            self.client
+                .publish_diagnostics(uri.clone(), fast_diagnostics, version)
+                .await;
+        }
+        let fast_elapsed = fast_started.elapsed().as_millis();
+
+        if !full_delay_after_fast.is_zero() {
+            sleep(full_delay_after_fast).await;
+            if self.is_stale_document_request(&uri, version, generation) {
+                return;
             }
         }
 
-        let diagnostics = {
+        let full_started = Instant::now();
+        let full_diagnostics = {
             let state = self.state.clone();
             let uri_for_worker = uri.clone();
             match tokio::task::spawn_blocking(move || {
@@ -285,23 +562,26 @@ impl Backend {
                 ))],
             }
         };
+        let full_elapsed = full_started.elapsed().as_millis();
 
-        if let Some(expected_generation) = generation
-            && !self.is_document_diagnostics_generation_current(&uri, expected_generation)
-        {
+        if self.is_stale_document_request(&uri, version, generation) {
             return;
         }
 
-        if let Some(expected) = version {
-            match self.current_document_version(&uri) {
-                Some(current) if current != expected => return,
-                None => return,
-                Some(_) => {}
-            }
+        if Self::perf_logs_enabled() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "mond-lsp: diagnostics fast={}ms full={}ms ({uri})",
+                        fast_elapsed, full_elapsed
+                    ),
+                )
+                .await;
         }
 
         self.client
-            .publish_diagnostics(uri, diagnostics, version)
+            .publish_diagnostics(uri, full_diagnostics, version)
             .await;
     }
 
@@ -335,7 +615,7 @@ impl Backend {
         focus_uri: Url,
     ) {
         let Some(root) = root else {
-            self.publish_document_diagnostics(focus_uri, None, None)
+            self.publish_document_diagnostics(focus_uri, None, None, Duration::ZERO)
                 .await;
             return;
         };
@@ -646,10 +926,15 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let expected_version = self.current_document_version(&uri);
-        if let Some(version) = expected_version
-            && let Some(cached) = self.cached_semantic_tokens(&uri, version)
-        {
-            return Ok(Some(SemanticTokensResult::Tokens(cached)));
+        if let Some(version) = expected_version {
+            if let Some(snapshot) = self.cached_frontend_snapshot(&uri, version)
+                && let Some(tokens) = snapshot.semantic_tokens
+            {
+                return Ok(Some(SemanticTokensResult::Tokens(tokens)));
+            }
+            if let Some(cached) = self.cached_semantic_tokens(&uri, version) {
+                return Ok(Some(SemanticTokensResult::Tokens(cached)));
+            }
         }
         let generation = self.semantic_tokens_generation(&uri);
         let tokens =
@@ -666,6 +951,9 @@ impl LanguageServer for Backend {
             match self.current_document_version(&uri) {
                 Some(current) if current == expected => {
                     self.store_semantic_tokens_cache(uri.clone(), expected, tokens.clone());
+                    self.update_frontend_snapshot(uri.clone(), expected, |snapshot| {
+                        snapshot.semantic_tokens = Some(tokens.clone());
+                    });
                 }
                 _ => return Ok(None),
             }
@@ -709,7 +997,8 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         let Ok(path) = uri.to_file_path() else {
-            self.publish_document_diagnostics(uri, None, None).await;
+            self.publish_document_diagnostics(uri, None, None, Duration::ZERO)
+                .await;
             return;
         };
         let root = if path.file_name().and_then(|name| name.to_str()) == Some("bahn.toml") {
@@ -728,8 +1017,11 @@ impl LanguageServer for Backend {
             state.document_diagnostics_generation.remove(&uri);
             state.semantic_tokens_generation.remove(&uri);
             state.document_symbol_generation.remove(&uri);
+            state.frontend_snapshot_cache.remove(&uri);
             state.semantic_tokens_cache.remove(&uri);
             state.document_symbol_cache.remove(&uri);
+            state.completion_cache.remove(&uri);
+            state.signature_help_cache.remove(&uri);
         }
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -761,17 +1053,14 @@ impl LanguageServer for Backend {
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
-        let Some((project, doc, analysis)) = self
-            .analyze_document(&uri, false, false)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
-        else {
+        let Some((project, doc, analysis)) = (match self.analyze_document(&uri, false, false) {
+            Ok(result) => result,
+            Err(_) => return Ok(None),
+        }) else {
             return Ok(None);
         };
-        let Some(offset) =
-            position_to_offset(&doc.source, params.text_document_position_params.position)
-        else {
-            return Ok(None);
-        };
+        let offset = position_to_offset(&doc.source, params.text_document_position_params.position)
+            .unwrap_or(doc.source.len());
         let hover_target = find_hover_target(&doc.path, &doc.source, offset);
         let mut scheme = if let Some(target) = hover_target.as_ref() {
             match target {
@@ -838,7 +1127,8 @@ impl LanguageServer for Backend {
             }
         } else {
             symbol_at(&doc.path, &doc.source, &doc.name, &analysis.imports, offset)
-                .map_err(tower_lsp::jsonrpc::Error::invalid_params)?
+                .ok()
+                .flatten()
                 .and_then(|symbol| {
                     let name = if symbol.module == doc.name {
                         symbol.function.clone()
@@ -1139,13 +1429,29 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
+        let uri = params.text_document_position.text_document.uri.clone();
         let position = params.text_document_position.position;
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
+        let Some(source) = self.document_text(&uri) else {
+            return Ok(None);
+        };
+        let context_hash = Self::completion_context_hash(&source, &params);
         let expected_version = self.current_document_version(&uri);
+        if let Some(version) = expected_version
+            && let Some(context_hash) = context_hash
+            && let Some(cached) = self.cached_completion_items(
+                &uri,
+                version,
+                position.line,
+                position.character,
+                context_hash,
+            )
+        {
+            return Ok(Some(CompletionResponse::Array(cached)));
+        }
         let state = self.state.clone();
         let uri_for_worker = uri.clone();
         let items = tokio::task::spawn_blocking(move || {
@@ -1162,12 +1468,13 @@ impl LanguageServer for Backend {
                 Some(doc) => doc,
                 None => return Ok(None),
             };
-            let Some(offset) = position_to_offset(&doc.source, position) else {
-                return Ok(None);
-            };
-            let Some(ctx) = completion_context(&doc.source, offset) else {
-                return Ok(None);
-            };
+            // Be resilient to occasional out-of-range positions from clients while edits are
+            // still in flight; fall back to EOF so completion still responds.
+            let offset = position_to_offset(&doc.source, position).unwrap_or(doc.source.len());
+            let ctx =
+                completion_context(&doc.source, offset).unwrap_or(CompletionContext::Unqualified {
+                    prefix: String::new(),
+                });
 
             let items = match ctx {
                 CompletionContext::Qualified { module, prefix } => {
@@ -1211,11 +1518,21 @@ impl LanguageServer for Backend {
         .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
         .map_err(tower_lsp::jsonrpc::Error::invalid_params)?;
 
-        if let Some(expected) = expected_version {
-            match self.current_document_version(&uri) {
-                Some(current) if current == expected => {}
-                _ => return Ok(None),
-            }
+        // Completion requests often race text updates; returning stale-but-useful results
+        // is better than dropping responses entirely. Only cache when the version still matches.
+        if let Some(expected) = expected_version
+            && self.current_document_version(&uri) == Some(expected)
+            && let Some(ref completion_items) = items
+            && let Some(context_hash) = context_hash
+        {
+            self.store_completion_items_cache(
+                uri.clone(),
+                expected,
+                position.line,
+                position.character,
+                context_hash,
+                completion_items.clone(),
+            );
         }
 
         Ok(items.map(CompletionResponse::Array))
@@ -1231,10 +1548,15 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let expected_version = self.current_document_version(&uri);
-        if let Some(version) = expected_version
-            && let Some(cached) = self.cached_document_symbols(&uri, version)
-        {
-            return Ok(Some(DocumentSymbolResponse::Nested(cached)));
+        if let Some(version) = expected_version {
+            if let Some(snapshot) = self.cached_frontend_snapshot(&uri, version)
+                && let Some(symbols) = snapshot.document_symbols
+            {
+                return Ok(Some(DocumentSymbolResponse::Nested(symbols)));
+            }
+            if let Some(cached) = self.cached_document_symbols(&uri, version) {
+                return Ok(Some(DocumentSymbolResponse::Nested(cached)));
+            }
         }
         let generation = self.document_symbol_generation(&uri);
         let path = match uri.to_file_path() {
@@ -1277,6 +1599,9 @@ impl LanguageServer for Backend {
             match self.current_document_version(&uri) {
                 Some(current) if current == expected => {
                     self.store_document_symbols_cache(uri.clone(), expected, symbols.clone());
+                    self.update_frontend_snapshot(uri.clone(), expected, |snapshot| {
+                        snapshot.document_symbols = Some(symbols.clone());
+                    });
                 }
                 _ => return Ok(None),
             }
@@ -1303,13 +1628,34 @@ impl LanguageServer for Backend {
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
-        let uri = params.text_document_position_params.text_document.uri;
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
         let position = params.text_document_position_params.position;
         let path = match uri.to_file_path() {
             Ok(path) => path,
             Err(_) => return Ok(None),
         };
+        let Some(source) = self.document_text(&uri) else {
+            return Ok(None);
+        };
+        let Some(context_hash) = Self::signature_help_context_hash(&source, &params) else {
+            return Ok(None);
+        };
         let expected_version = self.current_document_version(&uri);
+        if let Some(version) = expected_version
+            && let Some(cached) = self.cached_signature_help(
+                &uri,
+                version,
+                position.line,
+                position.character,
+                context_hash,
+            )
+        {
+            return Ok(cached);
+        }
         let state = self.state.clone();
         let uri_for_worker = uri.clone();
         let help = tokio::task::spawn_blocking(move || {
@@ -1373,7 +1719,16 @@ impl LanguageServer for Backend {
 
         if let Some(expected) = expected_version {
             match self.current_document_version(&uri) {
-                Some(current) if current == expected => {}
+                Some(current) if current == expected => {
+                    self.store_signature_help_cache(
+                        uri.clone(),
+                        expected,
+                        position.line,
+                        position.character,
+                        context_hash,
+                        help.clone(),
+                    );
+                }
                 _ => return Ok(None),
             }
         }

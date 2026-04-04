@@ -5,7 +5,9 @@ use std::{
     time::SystemTime,
 };
 
-use tower_lsp::lsp_types::{Diagnostic, DocumentSymbol, SemanticTokens, Url};
+use tower_lsp::lsp_types::{
+    CompletionItem, Diagnostic, DocumentSymbol, SemanticTokens, SignatureHelp, Url,
+};
 
 use crate::{DocumentAnalysis, ModuleSource};
 
@@ -31,6 +33,37 @@ pub(crate) struct CachedSemanticTokens {
 pub(crate) struct CachedDocumentSymbols {
     pub(crate) version: i32,
     pub(crate) symbols: Vec<DocumentSymbol>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FrontendSnapshot {
+    pub(crate) fast_diagnostics: Option<Vec<Diagnostic>>,
+    pub(crate) semantic_tokens: Option<SemanticTokens>,
+    pub(crate) document_symbols: Option<Vec<DocumentSymbol>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedFrontendSnapshot {
+    pub(crate) version: i32,
+    pub(crate) snapshot: FrontendSnapshot,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedCompletionItems {
+    pub(crate) version: i32,
+    pub(crate) context_hash: u64,
+    pub(crate) line: u32,
+    pub(crate) character: u32,
+    pub(crate) items: Vec<CompletionItem>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedSignatureHelp {
+    pub(crate) version: i32,
+    pub(crate) context_hash: u64,
+    pub(crate) line: u32,
+    pub(crate) character: u32,
+    pub(crate) help: Option<SignatureHelp>,
 }
 
 #[derive(Clone)]
@@ -112,8 +145,11 @@ pub(crate) struct ServerState {
     pub(crate) document_diagnostics_generation: HashMap<Url, u64>,
     pub(crate) semantic_tokens_generation: HashMap<Url, u64>,
     pub(crate) document_symbol_generation: HashMap<Url, u64>,
+    pub(crate) frontend_snapshot_cache: HashMap<Url, CachedFrontendSnapshot>,
     pub(crate) semantic_tokens_cache: HashMap<Url, CachedSemanticTokens>,
     pub(crate) document_symbol_cache: HashMap<Url, CachedDocumentSymbols>,
+    pub(crate) completion_cache: HashMap<Url, CachedCompletionItems>,
+    pub(crate) signature_help_cache: HashMap<Url, CachedSignatureHelp>,
     pub(crate) workspaces: HashMap<PathBuf, Arc<Mutex<WorkspaceState>>>,
     pub(crate) watched_files_dynamic_registration: bool,
     pub(crate) watched_files_registered: bool,

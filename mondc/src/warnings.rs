@@ -1052,6 +1052,40 @@ fn collect_unqualified_free_vars(
 }
 
 fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
+    fn collect_pattern_qualified_module_refs(pat: &ast::Pattern, out: &mut HashSet<String>) {
+        match pat {
+            ast::Pattern::Constructor(name, args, _) => {
+                if let Some((module, _)) = name.split_once('/') {
+                    out.insert(module.to_string());
+                }
+                for arg in args {
+                    collect_pattern_qualified_module_refs(arg, out);
+                }
+            }
+            ast::Pattern::Or(pats, _) => {
+                for p in pats {
+                    collect_pattern_qualified_module_refs(p, out);
+                }
+            }
+            ast::Pattern::Cons(head, tail, _) => {
+                collect_pattern_qualified_module_refs(head, out);
+                collect_pattern_qualified_module_refs(tail, out);
+            }
+            ast::Pattern::Record { name, fields, .. } => {
+                if let Some((module, _)) = name.split_once('/') {
+                    out.insert(module.to_string());
+                }
+                for (_, pat, _) in fields {
+                    collect_pattern_qualified_module_refs(pat, out);
+                }
+            }
+            ast::Pattern::Any(_)
+            | ast::Pattern::Variable(_, _)
+            | ast::Pattern::Literal(_, _)
+            | ast::Pattern::EmptyList(_) => {}
+        }
+    }
+
     use ast::Expr;
     match expr {
         Expr::Literal(_, _) => {}
@@ -1091,6 +1125,9 @@ fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
                 collect_qualified_module_refs(target, out);
             }
             for arm in arms {
+                for pat in &arm.patterns {
+                    collect_pattern_qualified_module_refs(pat, out);
+                }
                 if let Some(guard) = &arm.guard {
                     collect_qualified_module_refs(guard, out);
                 }
@@ -1100,7 +1137,10 @@ fn collect_qualified_module_refs(expr: &ast::Expr, out: &mut HashSet<String>) {
         Expr::FieldAccess { record, .. } => {
             collect_qualified_module_refs(record, out);
         }
-        Expr::RecordConstruct { fields, .. } => {
+        Expr::RecordConstruct { name, fields, .. } => {
+            if let Some((module, _)) = name.split_once('/') {
+                out.insert(module.to_string());
+            }
             for (_, value) in fields {
                 collect_qualified_module_refs(value, out);
             }
@@ -1878,6 +1918,11 @@ pub(crate) fn unused_unqualified_import_diagnostics(
                 }
             }
             ast::UnqualifiedImports::Specific(names) => {
+                // `(use module [A B])` still brings the module into qualified scope.
+                // If any `module/...` reference is present, treat the import as used.
+                if used_modules.contains(mod_name.as_str()) {
+                    continue;
+                }
                 let unused: Vec<String> = names
                     .iter()
                     .filter(|name| {
@@ -1919,6 +1964,11 @@ pub(crate) fn unused_unqualified_import_diagnostics(
                 }
             }
             ast::UnqualifiedImports::Wildcard => {
+                // Wildcard import is considered used when the module itself is used
+                // in qualified references (for example `module/value`).
+                if used_modules.contains(mod_name.as_str()) {
+                    continue;
+                }
                 let exports = module_exports
                     .get(mod_name.as_str())
                     .cloned()

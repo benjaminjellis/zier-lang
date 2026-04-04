@@ -183,6 +183,15 @@ fn collect_local_helper_erls(src_dir: &Path) -> eyre::Result<Vec<deps::HelperErl
     Ok(helper_erls)
 }
 
+fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
+    if let Ok(existing) = std::fs::read(path)
+        && existing == bytes
+    {
+        return Ok(());
+    }
+    std::fs::write(path, bytes).with_context(|| format!("could not write {}", path.display()))
+}
+
 pub(crate) struct ErlSources {
     pub erl_paths: Vec<PathBuf>,
     pub manifest: manifest::BahnManifest,
@@ -494,10 +503,6 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
 
     validate_bin_entrypoint(&project_type, &selected_module_sources)?;
 
-    let dependency_analysis = Arc::new(
-        mondc::build_project_analysis(&dependency_external_mods, &[])
-            .map_err(|err| eyre::eyre!(err))?,
-    );
     let dependency_compile_units: Vec<compile_flow::CompileUnit<'_>> = selected_dependency_mods
         .iter()
         .map(|module| compile_flow::CompileUnit {
@@ -508,7 +513,7 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
         .collect();
     let (dependency_outputs, dependency_had_error) = compile_flow::compile_units(
         &dependency_compile_units,
-        Arc::clone(&dependency_analysis),
+        Arc::clone(&analysis),
         true,
         compile_target,
     )
@@ -529,16 +534,14 @@ pub(crate) async fn generate_erl_sources_with_roots_for_target(
     // Copy any hand-written Erlang helpers bundled with dependencies.
     for helper in &loaded_dependencies.helper_erls {
         let dest = erl_dir.join(&helper.file_name);
-        std::fs::write(&dest, &helper.contents)
-            .with_context(|| format!("could not write {}", dest.display()))?;
+        write_bytes_if_changed(&dest, &helper.contents)?;
         erl_paths.push(dest);
     }
 
     // Copy any hand-written Erlang helpers in this project's src/ directory.
     for helper in &local_helper_erls {
         let dest = erl_dir.join(&helper.file_name);
-        std::fs::write(&dest, &helper.contents)
-            .with_context(|| format!("could not write {}", dest.display()))?;
+        write_bytes_if_changed(&dest, &helper.contents)?;
         erl_paths.push(dest);
     }
 
@@ -578,6 +581,41 @@ fn validate_bin_entrypoint(
     Ok(())
 }
 
+fn stale_erl_paths(erl_paths: &[PathBuf], ebin_dir: &Path) -> eyre::Result<Vec<PathBuf>> {
+    let mut stale = Vec::new();
+    for erl_path in erl_paths {
+        let erl_meta = std::fs::metadata(erl_path)
+            .with_context(|| format!("could not read metadata for {}", erl_path.display()))?;
+        let module_name = erl_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| eyre::eyre!("invalid Erlang module filename: {}", erl_path.display()))?;
+        let beam_path = ebin_dir.join(format!("{module_name}.beam"));
+        let beam_meta = match std::fs::metadata(&beam_path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                stale.push(erl_path.clone());
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("could not read metadata for {}", beam_path.display())
+                });
+            }
+        };
+        let erl_mtime = erl_meta
+            .modified()
+            .with_context(|| format!("could not read modified time for {}", erl_path.display()))?;
+        let beam_mtime = beam_meta
+            .modified()
+            .with_context(|| format!("could not read modified time for {}", beam_path.display()))?;
+        if erl_mtime > beam_mtime {
+            stale.push(erl_path.clone());
+        }
+    }
+    Ok(stale)
+}
+
 pub(crate) async fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
     let build_dir = project_dir.join(TARGET_DIR).join(DEBUG_BUILD_DIR);
     let erl_dir = build_dir.join(ERL_SOURCE_SUBDIR);
@@ -605,27 +643,28 @@ pub(crate) async fn build(project_dir: &Path, run: bool) -> eyre::Result<()> {
 
     crate::utils::verify_erlc_installed()?;
 
-    // Run erlc on all .erl files at once
-    let erlc = {
-        let ebin_dir = ebin_dir.clone();
-        let erl_paths = erl_paths.clone();
-        tokio::task::spawn_blocking(move || {
-            Command::new("erlc")
-                .arg("-o")
-                .arg(&ebin_dir)
-                .args(&erl_paths)
-                .output()
-                .context("could not run erlc")
-        })
-        .await
-        .map_err(|err| eyre::eyre!("failed to join erlc task: {err}"))??
-    };
+    let stale_paths = stale_erl_paths(&erl_paths, &ebin_dir)?;
+    if !stale_paths.is_empty() {
+        let erlc = {
+            let ebin_dir = ebin_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                Command::new("erlc")
+                    .arg("-o")
+                    .arg(&ebin_dir)
+                    .args(&stale_paths)
+                    .output()
+                    .context("could not run erlc")
+            })
+            .await
+            .map_err(|err| eyre::eyre!("failed to join erlc task: {err}"))??
+        };
 
-    if !erlc.status.success() {
-        return Err(eyre::eyre!(
-            "erlc failed:\n{}",
-            String::from_utf8_lossy(&erlc.stderr)
-        ));
+        if !erlc.status.success() {
+            return Err(eyre::eyre!(
+                "erlc failed:\n{}",
+                String::from_utf8_lossy(&erlc.stderr)
+            ));
+        }
     }
     if run {
         let main_module = module_aliases
@@ -734,6 +773,39 @@ mod tests {
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(future)
+    }
+
+    #[test]
+    fn stale_erl_paths_flags_missing_beam_outputs() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let ebin_dir = root.join("ebin");
+        std::fs::create_dir_all(&ebin_dir).expect("create ebin dir");
+        let erl_path = root.join("example.erl");
+        std::fs::write(&erl_path, "-module(example).\n").expect("write erl");
+
+        let stale =
+            stale_erl_paths(std::slice::from_ref(&erl_path), &ebin_dir).expect("stale erl paths");
+        assert_eq!(stale, vec![erl_path.clone()]);
+
+        cleanup_temp_root(&root);
+    }
+
+    #[test]
+    fn stale_erl_paths_skip_up_to_date_beams() {
+        let root = unique_temp_root();
+        std::fs::create_dir_all(&root).expect("create temp root");
+        let ebin_dir = root.join("ebin");
+        std::fs::create_dir_all(&ebin_dir).expect("create ebin dir");
+        let erl_path = root.join("example.erl");
+        std::fs::write(&erl_path, "-module(example).\n").expect("write erl");
+        std::fs::write(ebin_dir.join("example.beam"), "beam").expect("write beam");
+
+        let stale =
+            stale_erl_paths(std::slice::from_ref(&erl_path), &ebin_dir).expect("stale erl paths");
+        assert!(stale.is_empty(), "unexpected stale paths: {stale:?}");
+
+        cleanup_temp_root(&root);
     }
 
     fn run_ok(cmd: &mut Command) {

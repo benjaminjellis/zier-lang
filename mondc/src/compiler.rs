@@ -790,3 +790,50 @@ pub fn compile_with_imports(input: CompileWithImportsInput<'_>) -> Option<String
     session::emit_compile_report(&report, true);
     report.output
 }
+
+/// Runs a lightweight diagnostics pass for a single source file.
+///
+/// This pass intentionally avoids module-resolution and typechecking against
+/// full project state so editors can surface quick local warnings while
+/// background semantic diagnostics are still running.
+pub fn quick_diagnostics_report(source_path: &str, source: &str) -> session::CompileReport {
+    let mut sess = session::CompilerSession::default();
+    let mut diagnostics = Vec::new();
+
+    let hir = match run_lower_stage(&mut sess, source_path, source, &mut diagnostics) {
+        Ok(hir) => hir,
+        Err(report) => return report,
+    };
+
+    let file_id = hir.file_id;
+    let decls = hir.decls;
+    let files = hir.files;
+    let module_exports: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Keep quick diagnostics local-only and low-cost.
+    // We include collision checks plus local warnings, but skip expensive
+    // project-wide resolution/typechecking passes.
+    let _ = validate_declaration_collisions(
+        &mut sess,
+        &files,
+        &mut diagnostics,
+        file_id,
+        &decls,
+        &module_exports,
+    );
+    emit_warning_stage(
+        &mut sess,
+        &files,
+        &mut diagnostics,
+        file_id,
+        &decls,
+        &module_exports,
+        &[],
+    );
+
+    session::CompileReport {
+        output: None,
+        files,
+        diagnostics,
+    }
+}

@@ -19,7 +19,7 @@ mod warnings;
 pub use compiler::{
     CompileWithImportsInput, compile_with_imports, compile_with_imports_in_session,
     compile_with_imports_in_session_with_private_records, compile_with_imports_report,
-    compile_with_imports_report_with_private_records,
+    compile_with_imports_report_with_private_records, quick_diagnostics_report,
 };
 pub use pipeline::{
     CompilePipeline, CompileSession, CompileTarget, ModuleInput, PassContext, ResolvedModuleInput,

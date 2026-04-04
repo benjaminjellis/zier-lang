@@ -6,7 +6,7 @@ use crate::{
     compile_with_imports_report as compile_with_imports_report_api,
     compile_with_imports_report_with_private_records as compile_with_imports_report_with_private_records_api,
     exported_type_decls, infer_module_exports, infer_module_expr_types, lower, pub_reexports,
-    session, typecheck, warnings,
+    quick_diagnostics_report, session, typecheck, warnings,
 };
 
 const RESULT_STD_SRC: &str = r#"
@@ -2458,6 +2458,125 @@ fn unqualified_import_warnings_flag_unused_specific_and_wildcard() {
             .iter()
             .any(|m| m.contains("unused wildcard import from `option`")),
         "missing wildcard import warning: {messages:?}"
+    );
+}
+
+#[test]
+fn unqualified_import_warnings_skip_specific_when_module_is_used_qualified() {
+    let src = "(use std/socket [ListenSocket SocketReason])\n(let main {} socket/Badarg)";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut module_exports = HashMap::new();
+    module_exports.insert(
+        "socket".to_string(),
+        vec!["ListenSocket".to_string(), "SocketReason".to_string()],
+    );
+    let warnings =
+        warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn unqualified_import_warnings_skip_wildcard_when_module_is_used_qualified() {
+    let src = "(use std/result [*])\n(let main {} result/map)";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut module_exports = HashMap::new();
+    module_exports.insert("result".to_string(), vec!["map".to_string()]);
+    let warnings =
+        warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_only_import_used_in_pattern_is_not_flagged_unused() {
+    let src = "(use std/option)\n(let main {x} (match x option/None ~> 0 (option/Some y) ~> y))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut module_exports = HashMap::new();
+    module_exports.insert(
+        "option".to_string(),
+        vec!["Some".to_string(), "None".to_string()],
+    );
+    let warnings =
+        warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_only_import_used_in_record_pattern_is_not_flagged_unused() {
+    let src = "(use otp/actor)\n(let main {started} (match started (actor/Started :pid pid :data _) ~> pid _ ~> 0))";
+    let mut lowerer = lower::Lowerer::new();
+    let tokens = crate::lexer::Lexer::new(src).lex();
+    let file_id = lowerer.add_file("scan.mond".into(), src.into());
+    let sexprs = crate::sexpr::SExprParser::new(tokens, file_id)
+        .parse()
+        .expect("parse");
+    let decls = lowerer.lower_file(file_id, &sexprs);
+
+    let mut module_exports = HashMap::new();
+    module_exports.insert("actor".to_string(), vec![]);
+    let warnings =
+        warnings::unused_unqualified_import_diagnostics(&decls, file_id, &module_exports, &[]);
+    assert!(
+        warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        warnings
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn quick_diagnostics_report_surfaces_basic_unused_import_warning() {
+    let src = "(use std/result [Result])\n(let main {} ())";
+    let report = quick_diagnostics_report("main.mond", src);
+    let messages: Vec<String> = report.diagnostics.into_iter().map(|d| d.message).collect();
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("unused unqualified imports from `result`")),
+        "expected quick diagnostics warning, got {messages:?}"
     );
 }
 

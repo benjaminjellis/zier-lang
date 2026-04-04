@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::{CompletionItemKind, Position, Range, Url};
+use tower_lsp::lsp_types::{CompletionItemKind, DiagnosticSeverity, Position, Range, Url};
 
 use crate::{
     project::{
@@ -660,6 +660,31 @@ fn unqualified_completion_includes_local_functions_when_typecheck_fails() {
 }
 
 #[test]
+fn unqualified_completion_falls_back_when_local_name_parse_fails() {
+    let src_modules = BTreeMap::from([(
+        "main".to_string(),
+        ModuleSource {
+            name: "main".to_string(),
+            path: PathBuf::from("src/main.mond"),
+            source: "(let main {} (n".to_string(),
+        },
+    )]);
+    let project = test_project(BTreeMap::new(), src_modules.clone(), BTreeMap::new(), None);
+
+    let doc = project.src_modules.get("main").expect("main module");
+    let analysis = project.analyze_document(doc).expect("document analysis");
+    let offset = doc.source.len();
+    let items = project
+        .unqualified_completion_items(doc, &analysis, offset, "n")
+        .expect("completions");
+    assert!(
+        items.iter().any(|item| item.label == "not"),
+        "expected completion labels to include builtin `not`, got: {:?}",
+        items.into_iter().map(|item| item.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn unqualified_completion_includes_local_type_names() {
     let src_modules = BTreeMap::from([(
         "main".to_string(),
@@ -1133,6 +1158,28 @@ fn project_diagnostics_include_non_focused_module() {
             .iter()
             .any(|diag| diag.message.contains("unbound variable `unknown`")),
         "expected helper diagnostics, got {helper_diags:?}"
+    );
+}
+
+#[test]
+fn fast_diagnostics_filter_out_warning_level_flicker() {
+    let source = "(use std/result [Result])\n(let main {} ())";
+    let diagnostics = Project::fast_diagnostics_for_source(Path::new("src/main.mond"), source);
+    assert!(
+        diagnostics.is_empty(),
+        "fast diagnostics should suppress warning-only results, got: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn fast_diagnostics_keep_errors() {
+    let source = "(let main {}";
+    let diagnostics = Project::fast_diagnostics_for_source(Path::new("src/main.mond"), source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag.severity == Some(DiagnosticSeverity::ERROR)),
+        "expected at least one error diagnostic, got: {diagnostics:?}"
     );
 }
 

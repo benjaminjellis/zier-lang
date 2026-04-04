@@ -669,6 +669,23 @@ pub(crate) fn workspace_diagnostics_generation(
 }
 
 impl Project {
+    pub(crate) fn fast_diagnostics_for_source(
+        source_path: &Path,
+        source: &str,
+    ) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let report = mondc::quick_diagnostics_report(&source_path.to_string_lossy(), source);
+        report
+            .diagnostics
+            .iter()
+            // Fast diagnostics are intentionally single-file only; warning-level checks
+            // (notably import usage) can be temporarily inaccurate until full project
+            // analysis resolves dependencies/imports. Surface only errors here to avoid
+            // flicker, then replace with full diagnostics shortly after.
+            .filter(|diag| diag.severity == codespan_reporting::diagnostic::Severity::Error)
+            .map(|diag| diagnostic_to_lsp(source, diag))
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
         external_modules: BTreeMap<String, ModuleSource>,
@@ -1303,7 +1320,7 @@ impl Project {
         offset: usize,
         prefix: &str,
     ) -> std::result::Result<Vec<CompletionItem>, String> {
-        let local_names = local_names_at_offset(&doc.path, &doc.source, offset)?;
+        let local_names = local_names_at_offset(&doc.path, &doc.source, offset).unwrap_or_default();
         let mut items = Vec::new();
         let mut seen = HashSet::new();
         let local_top_levels = top_level_docs(&doc.path, &doc.source).unwrap_or_default();

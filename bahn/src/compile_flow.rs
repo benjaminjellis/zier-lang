@@ -257,6 +257,11 @@ pub(crate) fn write_erl_output(
     erl_source: &str,
 ) -> eyre::Result<PathBuf> {
     let erl_path = erl_dir.join(format!("{output_module_name}.erl"));
+    if let Ok(existing) = std::fs::read_to_string(&erl_path)
+        && existing == erl_source
+    {
+        return Ok(erl_path);
+    }
     std::fs::write(&erl_path, erl_source)
         .with_context(|| format!("could not write {}", erl_path.display()))?;
     Ok(erl_path)
